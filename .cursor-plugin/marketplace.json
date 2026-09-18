@@ -1,0 +1,19 @@
+{
+  "name": "beezi-internal",
+  "owner": {
+    "name": "Beezi"
+  },
+  "description": "Beezi's internal (dev/staging) Cursor plugin marketplace.",
+  "plugins": [
+    {
+      "name": "beezi-dev",
+      "source": "./plugins/beezi-dev",
+      "description": "Reports Cursor session analytics for Beezi task branches. — dev environment build.",
+      "version": "0.6.0-dev.5309",
+      "author": {
+        "name": "Beezi"
+      },
+      "category": "analytics"
+    }
+  ]
+}

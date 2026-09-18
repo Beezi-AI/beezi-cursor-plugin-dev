@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "beezi": {
+      "command": "node",
+      "args": [
+        "--no-warnings",
+        "${CURSOR_PLUGIN_ROOT}/scripts/mcp.mjs"
+      ],
+      "cwd": "${CURSOR_PLUGIN_ROOT}"
+    }
+  }
+}

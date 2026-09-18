@@ -1,0 +1,645 @@
+{
+  "what_this_is": [
+    "The acceptance matrix for POST /sessions/report and POST /sessions/timeline, transcribed from a",
+    "READ-ONLY source snapshot of the backend, plus the payloads this plugin actually serializes today.",
+    "A source snapshot is evidence of a SCHEMA. It is not evidence of what any environment deploys, and",
+    "nothing in `gates` below is closed by reading a file — every one of them needs a live check.",
+    "The payloads under `payloads` are generated, never hand-written: run the contract test with",
+    "BEEZI_CONTRACT_FIXTURE_WRITE=1 to re-serialize them through lib/checkpoint.mjs."
+  ],
+  "provenance": {
+    "backend_repo": "hb-ai-agent-portal (sibling checkout, read-only; no edits were made)",
+    "backend_commit": "871a78842f9b7c20808e23b7bc61765886ce85cb",
+    "deployment": "UNVERIFIED — no authenticated environment was reachable from this session",
+    "evidence": {
+      "report_dto": "api/src/application/cli-agent/dto/session-report.request.dto.ts:278-520",
+      "report_models_property": "api/src/application/cli-agent/dto/session-report.request.dto.ts:309-310 (models: Record<string, ICliAgentModelUsage>)",
+      "report_models_validator": "api/src/application/cli-agent/dto/session-report.request.dto.ts:139-166 (IsModelUsageRecord — `Array.isArray(value)` returns false, i.e. an array is REJECTED)",
+      "report_model_entry_dto": "api/src/application/cli-agent/dto/session-report.request.dto.ts:97-136",
+      "report_effort_record": "api/src/application/cli-agent/dto/session-report.request.dto.ts:32-92 (by_effort, key length <= 50)",
+      "report_operations_dto": "api/src/application/cli-agent/dto/session-report.request.dto.ts:227-277",
+      "report_code_changes_dto": "api/src/application/cli-agent/dto/session-report.request.dto.ts:169-184",
+      "timeline_dto": "api/src/application/cli-agent/dto/session-timeline.request.dto.ts:17-107",
+      "activity_state_enum": "api/src/domain/enums/cli-agent-activity-state.enum.ts:9-15 (working, planning, waiting_user, idle, break)",
+      "waiting_subtype_enum": "api/src/domain/enums/cli-agent-waiting-subtype.enum.ts:17-22 (plan_approval, question_answer, command_approval, next_instruction)",
+      "global_validation_pipe": "api/src/api/main.ts:144-148 (whitelist: true, forbidNonWhitelisted: true, transform: true) — an unknown TOP-LEVEL property 400s the whole request",
+      "report_route": "api/src/api/controllers/cli-agent.controller.ts:152-162",
+      "timeline_route": "api/src/api/controllers/cli-agent.controller.ts:193-203",
+      "agent_resolver": "api/src/infrastructure/auth/beezi-agent.ts:10-13,33-50 (BeeziAgent has claude-code and codex only; an unknown X-Beezi-Agent resolves to claude-code)",
+      "analytics_source_enum": "api/src/domain/enums/analytics-source.enum.ts (beezi_agent, claude_code, codex — no cursor)"
+    }
+  },
+  "report": {
+    "accepted_properties": [
+      "segmentId",
+      "sessionId",
+      "remote",
+      "branch",
+      "from_line",
+      "to_line",
+      "models",
+      "token_total",
+      "token_input",
+      "token_output",
+      "token_cache",
+      "duration_sec",
+      "session_name",
+      "billing_source",
+      "subscription_type",
+      "rate_limit_tier",
+      "subscription_plan",
+      "third_party_provider",
+      "timezone",
+      "started_at",
+      "ended_at",
+      "code_changes",
+      "operations",
+      "is_subagent",
+      "agent_id",
+      "agent_type",
+      "agent_name",
+      "spawn_depth",
+      "usage_five_hour_pct",
+      "usage_seven_day_pct",
+      "usage_fetched_at",
+      "usage_account_uuid",
+      "account_uuid",
+      "account_email",
+      "oauth_key_prefix",
+      "oauth_key_last4",
+      "oauth_key_length",
+      "claude_md_lines",
+      "project_instructions_status",
+      "context_peak_tokens",
+      "context_final_tokens",
+      "context_final_model",
+      "source",
+      "originator",
+      "cli_version",
+      "service_tier",
+      "thread_settings_model",
+      "time_to_first_token_ms",
+      "duration_ms",
+      "turn_aborted",
+      "model_context_window"
+    ],
+    "unknown_property_behavior": "400 BadRequest for the whole report (global pipe: whitelist + forbidNonWhitelisted)",
+    "properties": {
+      "segmentId": {
+        "type": "string",
+        "required": true,
+        "notEmpty": true,
+        "maxLength": 200
+      },
+      "sessionId": {
+        "type": "string",
+        "required": true,
+        "notEmpty": true,
+        "maxLength": 200
+      },
+      "remote": {
+        "type": "string",
+        "required": true,
+        "notEmpty": true,
+        "maxLength": 500
+      },
+      "branch": {
+        "type": "string",
+        "required": true,
+        "notEmpty": true,
+        "maxLength": 255
+      },
+      "from_line": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "to_line": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "models": {
+        "type": "modelUsageRecord",
+        "required": true
+      },
+      "token_total": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "token_input": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "token_output": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "token_cache": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "duration_sec": {
+        "type": "int",
+        "required": true,
+        "min": 0
+      },
+      "session_name": {
+        "type": "string",
+        "maxLength": 500
+      },
+      "billing_source": {
+        "type": "enum",
+        "values": [
+          "subscription",
+          "anthropic_api_key",
+          "openai_api_key",
+          "third_party",
+          "unknown"
+        ]
+      },
+      "subscription_type": {
+        "type": "string",
+        "maxLength": 50
+      },
+      "rate_limit_tier": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "subscription_plan": {
+        "type": "string",
+        "maxLength": 50
+      },
+      "third_party_provider": {
+        "type": "enum",
+        "values": [
+          "aws_bedrock",
+          "google_vertex",
+          "azure_foundry",
+          "gateway"
+        ]
+      },
+      "timezone": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "started_at": {
+        "type": "string"
+      },
+      "ended_at": {
+        "type": "string"
+      },
+      "code_changes": {
+        "type": "object"
+      },
+      "operations": {
+        "type": "object"
+      },
+      "is_subagent": {
+        "type": "boolean"
+      },
+      "agent_id": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "agent_type": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "agent_name": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "spawn_depth": {
+        "type": "int",
+        "min": 0
+      },
+      "usage_five_hour_pct": {
+        "type": "int",
+        "min": 0
+      },
+      "usage_seven_day_pct": {
+        "type": "int",
+        "min": 0
+      },
+      "usage_fetched_at": {
+        "type": "string"
+      },
+      "usage_account_uuid": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "account_uuid": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "account_email": {
+        "type": "string",
+        "maxLength": 320
+      },
+      "oauth_key_prefix": {
+        "type": "string",
+        "maxLength": 12
+      },
+      "oauth_key_last4": {
+        "type": "string",
+        "maxLength": 4
+      },
+      "oauth_key_length": {
+        "type": "int",
+        "min": 20
+      },
+      "claude_md_lines": {
+        "type": "int",
+        "min": 0
+      },
+      "project_instructions_status": {
+        "type": "enum",
+        "values": [
+          "present",
+          "missing",
+          "unknown"
+        ]
+      },
+      "context_peak_tokens": {
+        "type": "int",
+        "min": 0
+      },
+      "context_final_tokens": {
+        "type": "int",
+        "min": 0
+      },
+      "context_final_model": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "source": {
+        "type": "string",
+        "maxLength": 50
+      },
+      "originator": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "cli_version": {
+        "type": "string",
+        "maxLength": 50
+      },
+      "service_tier": {
+        "type": "string",
+        "maxLength": 50
+      },
+      "thread_settings_model": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "time_to_first_token_ms": {
+        "type": "int",
+        "min": 0
+      },
+      "duration_ms": {
+        "type": "int",
+        "min": 0
+      },
+      "turn_aborted": {
+        "type": "boolean"
+      },
+      "model_context_window": {
+        "type": "int",
+        "min": 0
+      }
+    },
+    "model_entry": {
+      "properties": {
+        "token_input": {
+          "type": "int",
+          "required": true,
+          "min": 0
+        },
+        "token_output": {
+          "type": "int",
+          "required": true,
+          "min": 0
+        },
+        "token_cache_read": {
+          "type": "int",
+          "required": true,
+          "min": 0
+        },
+        "token_cache_creation": {
+          "type": "int",
+          "required": true,
+          "min": 0
+        },
+        "requests": {
+          "type": "int",
+          "min": 0
+        },
+        "token_reasoning_output": {
+          "type": "int",
+          "min": 0
+        },
+        "by_effort": {
+          "type": "object"
+        }
+      },
+      "unknown_property_behavior": "accepted — the record's values are validated with validateSync() and no whitelist (session-report.request.dto.ts:152-159), so the Cursor-only `model`, `billing_pool` and `cost_usd` keys survive ingest"
+    }
+  },
+  "timeline": {
+    "accepted_properties": [
+      "sessionId",
+      "periods",
+      "subagents",
+      "plan_events",
+      "started_at",
+      "ended_at",
+      "generated_at"
+    ],
+    "properties": {
+      "sessionId": {
+        "type": "string",
+        "required": true,
+        "notEmpty": true,
+        "maxLength": 200
+      },
+      "periods": {
+        "type": "array",
+        "required": true,
+        "maxItems": 5000,
+        "itemSchema": "period"
+      },
+      "subagents": {
+        "type": "array",
+        "required": true,
+        "maxItems": 1000,
+        "itemSchema": "subagent"
+      },
+      "plan_events": {
+        "type": "array",
+        "maxItems": 1000,
+        "itemSchema": "plan_event"
+      },
+      "started_at": {
+        "type": "iso8601",
+        "required": true
+      },
+      "ended_at": {
+        "type": "iso8601",
+        "required": true
+      },
+      "generated_at": {
+        "type": "iso8601",
+        "required": true
+      }
+    },
+    "period": {
+      "properties": {
+        "state": {
+          "type": "string",
+          "required": true,
+          "notEmpty": true,
+          "maxLength": 50
+        },
+        "started_at": {
+          "type": "iso8601",
+          "required": true
+        },
+        "ended_at": {
+          "type": "iso8601",
+          "required": true
+        },
+        "waiting_subtype": {
+          "type": "string",
+          "maxLength": 50
+        }
+      }
+    },
+    "subagent": {
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "required": true,
+          "notEmpty": true,
+          "maxLength": 200
+        },
+        "agent_type": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "started_at": {
+          "type": "iso8601",
+          "required": true
+        },
+        "ended_at": {
+          "type": "iso8601",
+          "required": true
+        }
+      }
+    },
+    "plan_event": {
+      "properties": {
+        "type": {
+          "type": "string",
+          "required": true,
+          "notEmpty": true,
+          "maxLength": 50
+        },
+        "at": {
+          "type": "iso8601",
+          "required": true
+        }
+      }
+    },
+    "known_states": [
+      "working",
+      "planning",
+      "waiting_user",
+      "idle",
+      "break"
+    ],
+    "known_waiting_subtypes": [
+      "plan_approval",
+      "question_answer",
+      "command_approval",
+      "next_instruction"
+    ],
+    "state_is_bounded_string_not_enum": true
+  },
+  "gates": [
+    {
+      "id": "models-array-vs-record",
+      "status": "OPEN — blocks every Cursor report at this snapshot",
+      "what": "This plugin emits `models` as an ARRAY of (model, billing_pool) rows. The snapshot's DTO requires `Record<string, ICliAgentModelUsage>` and its validator rejects arrays outright, so every Cursor report would 400 and lose that segment's tokens, cost, code changes and operations together.",
+      "why_the_array_exists": "Cursor is the only agent whose ONE model in ONE segment can legitimately have two rows — the seat-covered part and the credits-paid part. A record keyed by model cannot hold both, and flattening to a model-only record would silently drop one billing pool.",
+      "closing_evidence": "A deployed backend that accepts a Cursor (model, billing_pool) shape — either a keyed record whose key carries the pool, or an array accepted alongside the existing record for old clients — demonstrated against the target environment with a real authenticated report."
+    },
+    {
+      "id": "cursor-agent-identity",
+      "status": "OPEN",
+      "what": "resolveBeeziAgent knows claude-code and codex only; an unknown X-Beezi-Agent (including `cursor`) resolves to claude-code, and AnalyticsSource has no cursor member. Cursor usage would be stored as Claude Code usage.",
+      "closing_evidence": "Backend support for a cursor agent/source/tool plus the identity routes this plugin calls (/me/cursor/...), verified against the deployed environment."
+    },
+    {
+      "id": "timeline-break-state",
+      "status": "SCHEMA-OK, DEPLOYMENT UNVERIFIED",
+      "what": "`state` is a bounded string (<=50) and `break` is already a member of CliAgentActivityState at this commit, excluded from activity-breakdown totals. So the schema accepts it; whether the DEPLOYED reader knows it is unverified.",
+      "client_position": "The client keeps `break` behind options.allowBreakState, default OFF. Nothing emits it today."
+    },
+    {
+      "id": "timeline-waiting-subtype",
+      "status": "SCHEMA-OK, NO PRODUCER",
+      "what": "`waiting_subtype` is an optional bounded string and `command_approval` is a known member. The Cursor client can only emit it from a caller-validated permission marker, and nothing on this host produces one yet.",
+      "closing_evidence": "A Cursor host signal that identifies a permission/approval wait, captured from a real install."
+    },
+    {
+      "id": "data-lane-proposed-fields",
+      "status": "SCHEMA-OK, EMISSION GATED",
+      "what": "The fields this lane derives already exist in the snapshot DTO: `claude_md_lines` + `project_instructions_status` for the rules reader, `context_peak_tokens` / `context_final_tokens` / `context_final_model` for the context metrics, and `models[].by_effort` for the effort buckets. There is NO `cursor_version` property at any level.",
+      "client_position": "None of them is emitted. The rules metric additionally needs agreement that a Cursor rules count may travel under the legacy `claude_md_lines` name, and the context metrics need the per-generation token semantics confirmed (see test/context-metrics-cursor.test.mjs).",
+      "closing_evidence": "Backend owner agreement on the Cursor meaning of `claude_md_lines`, a deployed route that stores the context fields for a Cursor source, and a DTO revision adding a host-version property if one is wanted."
+    }
+  ],
+  "payloads": {
+    "main": {
+      "segmentId": "conv-1:0-9",
+      "sessionId": "conv-1",
+      "remote": "https://example.com/acme/app.git",
+      "branch": "feature/task-42",
+      "from_line": 0,
+      "to_line": 9,
+      "models": [
+        {
+          "model": "claude-4.5-sonnet",
+          "billing_pool": "unknown",
+          "requests": 1,
+          "cost_usd": 0,
+          "token_input": 19570,
+          "token_output": 181,
+          "token_cache_read": 19152,
+          "token_cache_creation": 3
+        }
+      ],
+      "token_total": 38906,
+      "token_input": 19570,
+      "token_output": 181,
+      "token_cache": 19155,
+      "duration_sec": 6,
+      "billing_source": "subscription",
+      "session_name": null,
+      "timezone": "(machine timezone)",
+      "started_at": "2026-01-01T00:00:00.000Z",
+      "ended_at": "2026-01-01T00:10:06.000Z",
+      "code_changes": {
+        "files_changed": 1,
+        "lines_added": 12,
+        "lines_removed": 3,
+        "by_extension": {
+          ".ts": 1
+        }
+      },
+      "operations": {
+        "file": {
+          "count": 1,
+          "est_tokens": 100
+        },
+        "search": {
+          "count": 0,
+          "est_tokens": 0
+        },
+        "internet": {
+          "count": 0,
+          "est_tokens": 0
+        },
+        "mcp": {
+          "count": 0,
+          "est_tokens": 0,
+          "by_server": {}
+        },
+        "shell": {
+          "count": 0,
+          "est_tokens": 0
+        },
+        "skill": {
+          "count": 0,
+          "est_tokens": 0,
+          "by_skill": {}
+        },
+        "other": {
+          "count": 0,
+          "est_tokens": 0
+        },
+        "plugins": {}
+      }
+    },
+    "subagent": {
+      "segmentId": "conv-1:sa-1:0-9",
+      "sessionId": "conv-1",
+      "remote": "https://example.com/acme/app.git",
+      "branch": "feature/task-42",
+      "from_line": 0,
+      "to_line": 9,
+      "models": [
+        {
+          "model": "claude-4.5-sonnet",
+          "billing_pool": "unknown",
+          "requests": 0,
+          "token_input": 0,
+          "token_output": 0,
+          "token_cache_read": 0,
+          "token_cache_creation": 0
+        }
+      ],
+      "token_total": 0,
+      "token_input": 0,
+      "token_output": 0,
+      "token_cache": 0,
+      "duration_sec": 600,
+      "billing_source": "subscription",
+      "session_name": null,
+      "timezone": "(machine timezone)",
+      "started_at": "2026-01-01T00:00:05.000Z",
+      "ended_at": "2026-01-01T00:10:05.000Z",
+      "is_subagent": true,
+      "agent_id": "sa-1",
+      "agent_type": "general-purpose",
+      "agent_name": "audit the parser"
+    },
+    "timeline": {
+      "sessionId": "conv-1",
+      "periods": [
+        {
+          "state": "working",
+          "started_at": "2026-01-01T00:00:00.000Z",
+          "ended_at": "2026-01-01T00:00:05.000Z"
+        },
+        {
+          "state": "idle",
+          "started_at": "2026-01-01T00:00:05.000Z",
+          "ended_at": "2026-01-01T00:10:05.000Z"
+        },
+        {
+          "state": "working",
+          "started_at": "2026-01-01T00:10:05.000Z",
+          "ended_at": "2026-01-01T00:10:06.000Z"
+        }
+      ],
+      "plan_events": [],
+      "subagents": [
+        {
+          "agent_id": "sa-1",
+          "agent_type": "general-purpose",
+          "started_at": "2026-01-01T00:00:05.000Z",
+          "ended_at": "2026-01-01T00:10:05.000Z"
+        }
+      ],
+      "started_at": "2026-01-01T00:00:00.000Z",
+      "ended_at": "2026-01-01T00:10:06.000Z",
+      "generated_at": "1970-01-01T00:00:00.000Z"
+    }
+  }
+}

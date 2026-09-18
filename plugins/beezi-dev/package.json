@@ -1,0 +1,13 @@
+{
+  "name": "beezi",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "description": "Beezi analytics plugin for Cursor.",
+  "engines": {
+    "node": ">=13.2"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

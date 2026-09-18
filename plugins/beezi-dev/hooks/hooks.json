@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/session-start.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "afterShellExecution": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/checkpoint.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/tool-event.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/stop.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/report.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/stop-failure.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/file-edit.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/mcp-before.mjs\" --via plugin-hooks",
+        "timeout": 5
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/subagent-start.mjs\" --via plugin-hooks",
+        "timeout": 5
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/subagent-stop.mjs\" --via plugin-hooks",
+        "timeout": 10
+      }
+    ]
+  }
+}

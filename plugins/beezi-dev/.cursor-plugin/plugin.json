@@ -1,0 +1,16 @@
+{
+  "name": "beezi-dev",
+  "version": "0.6.0-dev.5309",
+  "description": "Reports Cursor session analytics for Beezi task branches. — dev environment build.",
+  "author": {
+    "name": "Beezi"
+  },
+  "keywords": [
+    "analytics",
+    "beezi",
+    "telemetry"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./mcp.json"
+}

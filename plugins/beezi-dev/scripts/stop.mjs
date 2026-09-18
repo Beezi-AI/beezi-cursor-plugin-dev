@@ -1,0 +1,78 @@
+import { installHookGuards, runHook } from '../lib/hook-runner.mjs';
+import { claimHookRun } from '../lib/hook-source.mjs';
+import { enterProjectDir } from '../lib/hook-cwd.mjs';
+import { captureHookStdin, dumpHookPayload } from '../lib/hook-dump.mjs';
+
+// FIRST STATEMENT — see lib/hook-runner.mjs. lib/checkpoint.mjs used to be a STATIC import here, so
+// a module anywhere in its ~25-module graph that threw while being evaluated took the whole hook
+// down before a single line of this file ran: no turn boundary, no generation, no checkpoint, and a
+// failed hook in Cursor's log at the end of every turn.
+installHookGuards({ name: 'stop' });
+
+// Capture, when it is switched on; two environment reads and a return otherwise. Above claimHookRun
+// so the record is of the run as Cursor started it. This is the payload the model and the turn's
+// token counts arrive on and nowhere else, so it is the one capture has most to confirm. See
+// lib/hook-dump.mjs.
+const stdin = captureHookStdin();
+dumpHookPayload(stdin == null ? undefined : stdin.raw);
+
+// Records which registry started this run, for the status surfaces. Always true — nothing is
+// arbitrated here any more; both registries stay installed, both fire, and the duplicate lines are
+// collapsed by the reader on the host's own event id (dedupeEvents in lib/delta-cursor.mjs).
+//
+// This hook is the worst place the old stand-down could have fired, and under `cursor-agent` it
+// fired here every time: no bundled hook runs in the CLI at all (Cursor staff, forum 163890), so a
+// launcher that stood down because an IDE session had been recorded took the turn's token counts,
+// the turn boundary and the checkpoint with it. See lib/hook-source.mjs.
+if (!claimHookRun()) process.exit(0);
+
+// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
+// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+enterProjectDir();
+
+runHook({
+  name: 'stop',
+  stdin,
+  load: () => Promise.all([
+    import('../lib/sidecar-events.mjs'),
+    import('../lib/sidecar.mjs'),
+    import('../lib/checkpoint.mjs'),
+  ]),
+  handle: (mods, ctx) => {
+    const [events, sidecar, engine] = mods;
+
+    // The turn's generation, with the model and the token counts Cursor puts on this payload and on
+    // no other event this plugin registers. Without it a turn that ran no tools — a plain question,
+    // the "Ping request" case — reaches the API as `models: {}` with zeroed tokens, because
+    // `postToolUse` (the only other producer of a `gen` line) never fired. Written before the
+    // boundary marker so the generation belongs to the turn that is ending, and before the
+    // checkpoint so it lands inside the segment that turn produced.
+    for (const event of events.eventsFromHookPayload(ctx.payload)) {
+      sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd(event, ctx.cwd));
+    }
+
+    // The turn boundary itself. Nothing else in the plugin writes one — `postToolUse` only ever
+    // derives gen/tool/shell/edit — so without this line `session-timeline-cursor` has no anchor
+    // that ends a turn and can never classify the gap that follows as `waiting_user`.
+    //
+    // Written BEFORE the checkpoint, deliberately:
+    //   - the checkpoint re-derives the whole-session timeline from the sidecar, so appending first
+    //     is what puts this boundary in the timeline THIS hook ships rather than the next one's —
+    //     and for the last turn of a session there is no next one;
+    //   - the delta window closes at the sidecar's current length, so appending first keeps the
+    //     boundary inside the segment that just ended. Appending after would carry it into the next
+    //     window and bill the user's think-time gap as that segment's duration;
+    //   - `runCheckpoint` may reject, be budget-truncated or be killed at the host's hook deadline,
+    //     and a boundary written after it would then be lost for good.
+    sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd({ ev: 'stop' }, ctx.cwd));
+
+    // Turn-end: emit the whole-session activity timeline alongside the segment checkpoint. The
+    // timeline rides on `stop` rather than on `afterAgentResponse` / `afterAgentThought`, which are
+    // staff-acknowledged not to fire in the `cursor-agent` CLI at all.
+    //
+    // The REMAINING budget, because this is the hook that flushes the queue: a backlog against a
+    // stalled API costs one per-request timeout per report, and the appends above have already spent
+    // part of the deadline. Whatever does not fit stays queued for the next turn.
+    return engine.runCheckpoint(ctx.input, {}, { emitTimeline: true, budgetMs: ctx.remainingMs() });
+  },
+});

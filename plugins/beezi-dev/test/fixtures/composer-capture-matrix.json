@@ -1,0 +1,111 @@
+{
+  "$comment": [
+    "TEMPLATE. Every `record` below is SYNTHETIC and must stay synthetic: this file is committed,",
+    "so a real composerData blob pasted in here publishes somebody's prompts, file paths and",
+    "repository names. The capture procedure is: run the sanitizer on a real Cursor install, fill",
+    "`observed` for each row from what it reports, and paste only the SHAPE back — key spelling,",
+    "field names, field types, and whether a field was present. Never a value.",
+    "",
+    "Task 08-C is blocked on this matrix plus a backend-approved partial-snapshot contract. Until",
+    "both exist, lib/history-index.mjs enumerates and counts and HISTORY_UPLOAD_ENABLED stays false."
+  ],
+  "version": 1,
+  "capturedFrom": {
+    "cursorVersion": null,
+    "platform": null,
+    "stateVscdbSchemaTables": null,
+    "capturedAt": null
+  },
+  "rows": [
+    {
+      "id": "key-format",
+      "question": "What exactly is the composerData key, and is the id after the colon the stable conversation id the hooks see?",
+      "observed": null,
+      "record": { "key": "composerData:00000000-0000-4000-8000-000000000000" }
+    },
+    {
+      "id": "stable-conversation-id",
+      "question": "Does the id in the key equal the conversation_id a hook payload carries for the same conversation?",
+      "observed": null,
+      "record": { "composerId": "00000000-0000-4000-8000-000000000000" }
+    },
+    {
+      "id": "timestamps",
+      "question": "Which fields carry creation and last-activity time, in what unit, and are they ever absent?",
+      "observed": null,
+      "record": { "createdAt": 0, "lastUpdatedAt": 0 }
+    },
+    {
+      "id": "missing-timestamps",
+      "question": "What does a record with no creation time look like? (A missing started_at blocks DB-only upload; it must never fall back to now.)",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "title",
+      "question": "Which field holds the title, and how long can it get? (Capped at 500 on the wire.)",
+      "observed": null,
+      "record": { "name": "" }
+    },
+    {
+      "id": "workspace-attribution",
+      "question": "Is there any workspace/folder attribution on the record, and is it a path or an id?",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "usage-subscription",
+      "question": "A conversation fully covered by the seat: is usageData absent, or present and empty?",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "usage-credits",
+      "question": "A conversation with usage-priced requests: the per-model shape, and which amount/cents spelling is in use.",
+      "observed": null,
+      "record": { "usageData": { "model-id": { "amount": 0, "costInCents": 0 } } }
+    },
+    {
+      "id": "usage-empty",
+      "question": "usageData present but an empty object — does that mean nothing priced, or not yet written?",
+      "observed": null,
+      "record": { "usageData": {} }
+    },
+    {
+      "id": "usage-malformed",
+      "question": "Any record where usageData is not an object of objects (array, string, null) — a format move in progress.",
+      "observed": null,
+      "record": { "usageData": null }
+    },
+    {
+      "id": "usage-monotonic",
+      "question": "Does usageData only ever grow within one conversation, and does it reset on anything (plan change, month roll)?",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "tokens",
+      "question": "Is there ANY authoritative total token count on the record? (Expected: no. A no is the finding.)",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "duration",
+      "question": "Is there any session duration on the record? (Expected: no.)",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "locked-db",
+      "question": "With Cursor running, does the read-only open fail and the snapshot copy succeed? Both must yield `unavailable`, never zero, when they do not.",
+      "observed": null,
+      "record": {}
+    },
+    {
+      "id": "changed-schema",
+      "question": "Which key/value tables exist on this build? A build with none of the known ones must read as unavailable.",
+      "observed": null,
+      "record": {}
+    }
+  ]
+}
