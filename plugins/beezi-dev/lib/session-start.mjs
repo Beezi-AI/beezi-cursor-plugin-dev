@@ -30,6 +30,17 @@ import {
 import { observationFromAccount as _observationFromAccount, reconcilePlan as _reconcilePlan } from './billing-capture.mjs';
 import { readCursorAccount as _readCursorAccount } from './cursor-account.mjs';
 import {
+  syncAccountIfNeeded as _syncAccountIfNeeded,
+  buildCheckInScope as _buildCheckInScope,
+  CheckInOutcome,
+  CheckInVia,
+} from './account-checkin.mjs';
+import { accountSyncStateFile as _accountSyncStateFile } from './account-sync.mjs';
+import {
+  readPendingCheckIn as _readPendingCheckIn,
+  clearPendingCheckIn as _clearPendingCheckIn,
+} from './stop-account-change.mjs';
+import {
   TrackingMode,
   isLiveTrackingAllowed as _isLiveTrackingAllowed,
   readTrackingState as _readTrackingState,
@@ -179,6 +190,21 @@ async function announceRepo(cwd, token, fetchImpl, gitImpl, { liveAllowed = true
 // copy of state.vscdb, and this whole function is inside Cursor's hard 10s kill.
 const PLAN_RECHECK_RESERVE_MS = 2000;
 
+// The account check-in's own allowance, and the reserve that has to be UNSPENT before it is even
+// attempted (plan §4 B3).
+//
+// Both numbers are spelled out here rather than inherited, for the reason the comment on
+// REVOKE_CHECK_TIMEOUT_MS below gives: this file has already been burned once by a call site that
+// took whatever default its callee happened to ship. The reserve is strictly larger than the
+// timeout, which is what makes the await below PROVABLY bounded — the hook cannot start a request
+// it does not have the budget to finish, and the request cannot outlive its own abort.
+//
+// NOT forced. The fingerprint gate plus the seven-day heartbeat is the intended steady state on a
+// hot path: an unchanged account reads one small state file and sends nothing. Forcing here would
+// POST on every single session start, which is the one thing a per-session path must not do.
+export const CHECKIN_TIMEOUT_MS = 1500;
+const CHECKIN_RESERVE_MS = 2500;
+
 // What this machine's analytics policy actually allows, in one sentence, or null when there is
 // nothing to add.
 //
@@ -264,6 +290,17 @@ export async function runSessionStart(input, deps = {}) {
   const reconcilePlan = deps.reconcilePlan == null ? _reconcilePlan : deps.reconcilePlan;
   const observationFromAccount = deps.observationFromAccount == null ? _observationFromAccount : deps.observationFromAccount;
   const readCursorAccount = deps.readCursorAccount == null ? _readCursorAccount : deps.readCursorAccount;
+  // The account check-in (plan §4 B3). Seamed like every other network caller in this hook so a
+  // test can assert the force flag, the scope and the budget gate without a socket.
+  const syncAccount = deps.syncAccount == null ? _syncAccountIfNeeded : deps.syncAccount;
+  // The `pendingCheckIn` marker the stop hook leaves behind when its own budget ran out (plan §4
+  // C3). That promise names TWO drainers — the next stop AND session start — and with only the
+  // first of them wired, a machine that keeps finishing its turns with a nearly-spent budget sits
+  // on an undelivered check-in indefinitely.
+  const buildCheckInScope = deps.buildCheckInScope == null ? _buildCheckInScope : deps.buildCheckInScope;
+  const accountSyncStateFile = deps.accountSyncStateFile == null ? _accountSyncStateFile : deps.accountSyncStateFile;
+  const readPendingCheckIn = deps.readPendingCheckIn == null ? _readPendingCheckIn : deps.readPendingCheckIn;
+  const clearPendingCheckIn = deps.clearPendingCheckIn == null ? _clearPendingCheckIn : deps.clearPendingCheckIn;
   // Reads Cursor's OWN state database. Seamed, and a test must always inject it: the default path
   // is the developer's real state.vscdb, which no suite may touch.
   const readExtensibility = deps.readExtensibility == null ? _readExtensibility : deps.readExtensibility;
@@ -411,6 +448,60 @@ export async function runSessionStart(input, deps = {}) {
         }
       } catch { /* a plan refresh must never break a session start */ }
     }
+
+    // Tell the portal which Cursor account this machine is on — the steady-state heartbeat for the
+    // whole feature, and the only path that runs without the user asking for anything.
+    //
+    // Unforced, so the normal case is one small state-file read and no request at all. The budget
+    // is re-measured HERE rather than reused from the plan gate above: the reconcile may have just
+    // spent up to PLAN_RECHECK_RESERVE_MS opening a WAL snapshot of state.vscdb, and deciding on a
+    // stale number is how a bounded call becomes an unbounded one.
+    //
+    // `config` is the record the reconcile above settled, handed over directly — no second read of
+    // billing.json, and no second `readCursorAccount()`, which on the snapshot path costs ~80 ms.
+    // `who` is this session's own probe, so the scope does not depend on the best-effort
+    // `recordWhoami` write having landed.
+    if (config != null && startedAt + HOOK_BUDGET_MS - now() > CHECKIN_RESERVE_MS) {
+      // Is an earlier run's check-in still owed? The marker lives INSIDE the heartbeat state file,
+      // which the scope names, so the scope is built from exactly the seams the check-in below
+      // will build its own from — a marker read beside a different file is a marker never drained.
+      //
+      // A scope that cannot be built is not an error here: it means no marker can exist for this
+      // machine either (the stop hook refuses to write one it cannot name), so the check-in simply
+      // runs unforced, the way it does on every ordinary session.
+      let pending = false;
+      let marker = null;
+      try {
+        const built = buildCheckInScope({ who, tracking: null });
+        if (built.ok === true) {
+          const file = accountSyncStateFile(built.scope);
+          if (readPendingCheckIn(file, built.scope, { now: now() }) === true) {
+            pending = true;
+            marker = { file, scope: built.scope };
+          }
+        }
+      } catch { pending = false; marker = null; }
+
+      try {
+        // FORCED only when a marker is due. A marker means an earlier run owed a send that never
+        // left the machine, so the hash gate is not what stands between the server and the truth —
+        // and on an ordinary start that gate plus the seven-day heartbeat is exactly the steady
+        // state this hot path wants. One call either way: draining is a reason to force the
+        // check-in that was going to happen anyway, never a second request.
+        const result = await syncAccount(
+          token,
+          { force: pending, via: CheckInVia.SESSION_START },
+          { record: config, who, tracking: null, fetchImpl, timeoutMs: CHECKIN_TIMEOUT_MS },
+        );
+        // Cleared on SENT and on nothing else. Every other answer — offline, a 400, a fence that
+        // moved — is a send still owed, and the marker is what remembers that; the stop hook's own
+        // backoff keeps an offline machine from retrying on every turn.
+        if (marker != null && result != null && result.outcome === CheckInOutcome.SENT) {
+          clearPendingCheckIn(marker.file, marker.scope, {});
+        }
+      } catch { /* an account check-in must never break a session start */ }
+    }
+
     if (isStale(config)) {
       const nudge = 'Beezi: subscription plan info is missing or stale — run the beezi-refresh skill to update your Cursor plan.';
       message = message ? `${message}\n${nudge}` : nudge;

@@ -1,7 +1,11 @@
 {
   "what_this_is": [
-    "The acceptance matrix for POST /sessions/report and POST /sessions/timeline, transcribed from a",
+    "The acceptance matrix for POST /sessions/report, POST /sessions/timeline and",
+    "POST /me/cli-agent/account, transcribed from a",
     "READ-ONLY source snapshot of the backend, plus the payloads this plugin actually serializes today.",
+    "The `report` and `timeline` sections are pinned to the `provenance.backend_commit` snapshot below.",
+    "The `me/cli-agent/account` section carries its OWN provenance block, because it was transcribed",
+    "from a LATER tree and part of it describes a target the backend has not merged yet — read it there.",
     "A source snapshot is evidence of a SCHEMA. It is not evidence of what any environment deploys, and",
     "nothing in `gates` below is closed by reading a file — every one of them needs a live check.",
     "The payloads under `payloads` are generated, never hand-written: run the contract test with",
@@ -25,8 +29,9 @@
       "global_validation_pipe": "api/src/api/main.ts:144-148 (whitelist: true, forbidNonWhitelisted: true, transform: true) — an unknown TOP-LEVEL property 400s the whole request",
       "report_route": "api/src/api/controllers/cli-agent.controller.ts:152-162",
       "timeline_route": "api/src/api/controllers/cli-agent.controller.ts:193-203",
-      "agent_resolver": "api/src/infrastructure/auth/beezi-agent.ts:10-13,33-50 (BeeziAgent has claude-code and codex only; an unknown X-Beezi-Agent resolves to claude-code)",
-      "analytics_source_enum": "api/src/domain/enums/analytics-source.enum.ts (beezi_agent, claude_code, codex — no cursor)"
+      "agent_resolver": "api/src/infrastructure/auth/beezi-agent.ts — AT THE PINNED SNAPSHOT 871a788, BeeziAgent had claude-code and codex only. THAT IS NO LONGER TRUE: at the portal working tree 62610eb4e576604f80879ac42011fb2b18dc034f the enum is `claude-code | codex | cursor` (beezi-agent.ts:10-14) and AGENT_BY_HEADER_VALUE maps 'cursor' to BeeziAgent.CURSOR (:24-29), so `X-Beezi-Agent: cursor` resolves to CURSOR. Only an ABSENT header falls back to claude-code silently, and a present-but-unrecognised value falls back with an `auth.beezi-agent.header.unrecognised` warn (:33-52). `cursor` is neither.",
+      "agent_resolver_mappers": "api/src/infrastructure/auth/beezi-agent.ts:57-69 at 62610eb — exhaustive Records: BeeziAgent.CURSOR maps to LinkedMachineTool.CURSOR and AnalyticsSource.CURSOR",
+      "analytics_source_enum": "api/src/domain/enums/analytics-source.enum.ts — at the pinned snapshot 871a788: beezi_agent, claude_code, codex, no cursor. At 62610eb AnalyticsSource.CURSOR exists and is what a `cursor` header resolves to."
     }
   },
   "report": {
@@ -235,7 +240,10 @@
       },
       "account_uuid": {
         "type": "string",
-        "maxLength": 64
+        "maxLength": 255,
+        "deployed_maxLength": 64,
+        "unverified_target": true,
+        "note": "255 is the §4 E5 TARGET and is in no commit; SessionReportRequestDto still says @MaxLength(64). E5 raises the bound on BOTH DTOs, so this rule and me/cli-agent/account's accountUuid move together — recording only one of them would make the report route look narrower than the check-in route for the same id. Ids are never truncated to fit, because a truncated id is a wrong id and mints a phantom subscription row. Until E5 DEPLOYS, lib/checkpoint.mjs also does not EMIT an id longer than deployed_maxLength: a @MaxLength violation fails the global ValidationPipe, which rejects the whole session report rather than the one field, so an SSO seat would lose all of its analytics instead of just its account column. It omits the id and falls through to email-anchored resolution. Retire that cap (WIRE_ACCOUNT_ID_MAX in lib/checkpoint.mjs) when deployed_maxLength here reads 255."
       },
       "account_email": {
         "type": "string",
@@ -470,6 +478,120 @@
     ],
     "state_is_bounded_string_not_enum": true
   },
+  "me/cli-agent/account": {
+    "what_this_is": [
+      "The acceptance matrix for the account CHECK-IN route, POST /api/me/cli-agent/account.",
+      "camelCase, unlike the snake_case session/usage ingest — that is the route's own convention,",
+      "not a typo. EVERY property is optional and an EMPTY BODY is a valid, meaningful call: it says",
+      "the agent could identify nothing. So `required` never appears at the top level here; it appears",
+      "only inside `credential`, where a reported key that omits its kind or prefix is a 400.",
+      "This section does NOT share the top-level provenance block. It has its own, below, because it",
+      "was transcribed from a later tree AND because two of its rules describe a TARGET the backend",
+      "has not merged yet. Read `provenance.deployment` before sending anything from it."
+    ],
+    "route": "POST /api/me/cli-agent/account — vendor-generic; the agent axis is the X-Beezi-Agent header, not the path",
+    "provenance": {
+      "backend_repo": "hb-ai-agent-portal (sibling checkout, read-only; no edits were made)",
+      "backend_commit": "62610eb4e576604f80879ac42011fb2b18dc034f — the portal WORKING TREE, NOT the 871a788 snapshot the `report` and `timeline` sections above are pinned to",
+      "deployment": "UNVERIFIED — no authenticated environment was reachable from this session, and this route is worse off than the two above: docs/gate-record.md records the whole Cursor API surface as source-proof-only, uncommitted on feature/cursor-provider-analytics and undeployed. Two rules below are UNVERIFIED in a second, stronger sense — they are in NO commit at all (see `unverified_target_rules`).",
+      "unverified_target_rules": [
+        "accountUuid.maxLength 255 — plan §4 E5. The DTO in the tree still says @MaxLength(64); the 255 here is the TARGET after the widening migration lands. `deployed_maxLength` records what is actually there today.",
+        "subscriptionStatus — plan §4 E3. This property exists in NO commit. Under the global forbidNonWhitelisted pipe, sending it to a server that has not deployed E3 400s the WHOLE check-in, so it must not be emitted before that migration and code release are verified per tenant."
+      ],
+      "evidence": {
+        "account_sync_dto": "api/src/application/cli-agent/dto/account-sync.request.dto.ts:69-100 (CliAgentAccountSyncRequestDto — accountUuid, email, subscriptionType, rateLimitTier, keys; all @IsOptional). Line numbers are a snapshot of the tree read at 62610eb and WILL shift when E3 inserts subscriptionStatus — re-resolve by symbol, not by line.",
+        "credential_report_dto": "api/src/application/cli-agent/dto/account-sync.request.dto.ts:19-40 (CliAgentCredentialReportDto — kind, prefix, last4, length)",
+        "credential_kind_enum": "api/src/domain/enums/cli-agent-credential-kind.enum.ts:4-12",
+        "account_route": "api/src/api/controllers/cli-agent.controller.ts:378-393 (@Post('me/cli-agent/account'), plain @ClerkOAuthBearer, HttpStatus.OK; source = analyticsSourceFor(resolveBeeziAgent(X-Beezi-Agent)))",
+        "global_validation_pipe": "api/src/api/main.ts:144-148 (whitelist: true, forbidNonWhitelisted: true, transform: true) — an unknown TOP-LEVEL property 400s the whole check-in",
+        "target_account_uuid_255": "NOT IN ANY COMMIT — docs/superpowers/specs/2026-09-21-cursor-subscription-tracking-plan.md §4 E5 (widen cli_agent_accounts.account_uuid and cli_agent_sessions.account_uuid to varchar(255) and raise @MaxLength(64) to 255 on BOTH DTOs, migration before code)",
+        "target_subscription_status": "NOT IN ANY COMMIT — docs/superpowers/specs/2026-09-21-cursor-subscription-tracking-plan.md §4 E3 (add subscription_status varchar(32) NULL to cli_agent_accounts and @IsOptional @IsString @MaxLength(32) subscriptionStatus to this DTO, migration shipped in its own release ahead of any code that writes it)"
+      }
+    },
+    "accepted_properties": [
+      "accountUuid",
+      "email",
+      "subscriptionType",
+      "rateLimitTier",
+      "subscriptionStatus",
+      "keys"
+    ],
+    "unknown_property_behavior": "400 BadRequest for the whole check-in (global pipe: whitelist + forbidNonWhitelisted). This is why a key-name drift is a silent total failure rather than a dropped field.",
+    "empty_body_is_valid": true,
+    "properties": {
+      "accountUuid": {
+        "type": "string",
+        "maxLength": 255,
+        "deployed_maxLength": 64,
+        "unverified_target": true,
+        "note": "255 is the §4 E5 TARGET and is in no commit; the tree still enforces 64. Ids are sent verbatim — never truncated to fit, because a truncated id is a wrong id and mints a phantom subscription row."
+      },
+      "email": {
+        "type": "string",
+        "maxLength": 320
+      },
+      "subscriptionType": {
+        "type": "string",
+        "maxLength": 50,
+        "note": "Lenient bounded string, normalized server-side. Carries the RAW plan text for the server's alias-discovery loop."
+      },
+      "rateLimitTier": {
+        "type": "string",
+        "maxLength": 100,
+        "note": "Declared by the DTO; Cursor has no equivalent, so this client omits it."
+      },
+      "subscriptionStatus": {
+        "type": "string",
+        "maxLength": 32,
+        "unverified_target": true,
+        "note": "§4 E3 TARGET, present in NO commit. Emitting it against an undeployed tenant 400s the entire check-in under forbidNonWhitelisted."
+      },
+      "keys": {
+        "type": "array",
+        "maxItems": 8,
+        "itemSchema": "credential",
+        "note": "Declared by the DTO; API-key fingerprinting is a Claude Code mechanism with no Cursor equivalent, so this client omits it."
+      }
+    },
+    "credential": {
+      "properties": {
+        "kind": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            "claude_oauth_token",
+            "anthropic_api_key",
+            "openai_api_key",
+            "aws_bedrock",
+            "google_vertex",
+            "azure_foundry",
+            "gateway_token"
+          ]
+        },
+        "prefix": {
+          "type": "string",
+          "required": true,
+          "maxLength": 32,
+          "note": "DELIBERATELY no notEmpty. `prefix` is @IsString @MaxLength(32) with no minimum, so '' passes server-side; `last4` is @Length(1, 8), which is why only IT carries notEmpty. Do not 'fix' this into symmetry — the asymmetry is the DTO."
+        },
+        "last4": {
+          "type": "string",
+          "required": true,
+          "notEmpty": true,
+          "maxLength": 8
+        },
+        "length": {
+          "type": "int",
+          "min": 0,
+          "max": 8192
+        }
+      },
+      "unknown_property_behavior": "400 — @ValidateNested with the global whitelist applies forbidNonWhitelisted to the nested objects too",
+      "validator_note": "`length`'s `max: 8192` is recorded from @Max(8192) but is NOT enforced by this fixture's validator: checkValue's `int` branch understands `min` only. Do not read a green run as proof an over-long length would be accepted.",
+      "service_clamp": "prefix and last4 are bounded generously here (32 / 8) and clamped hard by the service to 12 / 4 — validation states the wire contract, the service enforces the privacy rule, and neither trusts the other."
+    },
+    "client_position": "Nothing is sent yet. lib/account-sync.mjs still has ACCOUNT_CHECKIN_ENDPOINT = null, deps.enabled defaulting false, zero production callers, and a CHECKIN_PAYLOAD_FIELDS allowlist whose every name (environment, cursorAccountEmail, cursorAccountSource, plan, planSource, planObservedAt, billingSource) is outside accepted_properties above — today's payload would 400 in full. Plan §4 B2 rewrites it to the camelCase names above and owns the subset assertion against this section. `rateLimitTier` and `keys` stay omitted (Cursor has neither); `subscriptionStatus` is read locally by §4 A1 but stays OFF the wire until E3's migration and code release are verified per tenant — §6 puts step 2 (E3/E5) before step 4 (B2) for exactly that reason, and §5 records new-client/old-server as the unsafe direction."
+  },
   "gates": [
     {
       "id": "models-array-vs-record",
@@ -480,9 +602,9 @@
     },
     {
       "id": "cursor-agent-identity",
-      "status": "OPEN",
-      "what": "resolveBeeziAgent knows claude-code and codex only; an unknown X-Beezi-Agent (including `cursor`) resolves to claude-code, and AnalyticsSource has no cursor member. Cursor usage would be stored as Claude Code usage.",
-      "closing_evidence": "Backend support for a cursor agent/source/tool plus the identity routes this plugin calls (/me/cursor/...), verified against the deployed environment."
+      "status": "OPEN — SCHEMA-OK AT 62610eb, DEPLOYMENT UNVERIFIED",
+      "what": "CORRECTED. This entry used to claim that resolveBeeziAgent knows claude-code and codex only and that `cursor` therefore resolves to claude-code. That was true at the pinned snapshot 871a788 and is FALSE at the portal working tree 62610eb: `BeeziAgent.CURSOR = 'cursor'` exists, AGENT_BY_HEADER_VALUE maps the header value `cursor` to it, and machineToolFor/analyticsSourceFor carry it to LinkedMachineTool.CURSOR and AnalyticsSource.CURSOR. Only an ABSENT X-Beezi-Agent falls back to claude-code silently; a present-but-unrecognised value falls back with an `auth.beezi-agent.header.unrecognised` warn. `cursor` is recognised and is neither case. What remains OPEN is purely deployment: that tree is uncommitted/undeployed (see docs/gate-record.md), so no environment is proven to answer this way yet, and against an OLD deployment Cursor usage would still land as Claude Code.",
+      "closing_evidence": "A live authenticated request carrying `X-Beezi-Agent: cursor` against the target environment, shown to be stored with a cursor source/tool — plus the identity routes this plugin calls (/me/cursor/...). Source proof at 62610eb is not deployment proof."
     },
     {
       "id": "timeline-break-state",

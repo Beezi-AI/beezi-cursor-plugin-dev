@@ -2,21 +2,43 @@ import crypto from 'crypto';
 import path from 'path';
 import { beeziCursorHome } from './paths-cursor.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { accountScopeKey, accountScopeDigest } from './cost-reconcile.mjs';
 import { CURSOR_PLANS } from './cursor-account.mjs';
 import { BILLING_POOL } from './delta-cursor.mjs';
-import { BILLING_SCHEMA_VERSION, normalizeAccountEmail } from './billing-config.mjs';
+import { BILLING_SCHEMA_VERSION, normalizeAccountEmail, normalizeAccountIdentifier } from './billing-config.mjs';
+import { ENDPOINTS } from './config.mjs';
 
 // One authenticated account check-in client, serving AUTH-15 (machine/account identity) and
 // BILL-06 (billing-account facts) from a single implementation, plus the BILL-09 cost summary.
 //
-// ─── WHAT IS NOT HERE, ON PURPOSE ────────────────────────────────────────────────────────────
-// There is no route and no default-on path. The inspected backend snapshot has identity routes for
-// Claude Code and Codex and maps an unknown `cursor` agent header onto Claude Code, so a request
-// sent today would be attributed to the wrong tool; and nothing in it proves billing writeback
-// support. Until the deployed contract is confirmed, `ACCOUNT_CHECKIN_ENDPOINT` is null,
-// `deps.enabled` defaults to false, and this module posts nothing.
-export const ACCOUNT_CHECKIN_ENDPOINT = null;
+// ─── WHAT IS WIRED, AND WHAT IS STILL UNPROVEN ───────────────────────────────────────────────
+// The route IS known and IS set: `POST /api/me/cli-agent/account`, vendor-generic, with the tool
+// axis carried by the `X-Beezi-Agent: cursor` header `machineHeaders()` already sends. The older
+// claim in this header — that an unknown `cursor` header is folded onto Claude Code — was stale:
+// `BeeziAgent.CURSOR = 'cursor'` exists in the portal tree (62610eb) and resolves correctly; only
+// an ABSENT header falls back to Claude Code. The transcribed acceptance matrix, field by field,
+// lives in `test/fixtures/backend-contract.json` → `me/cli-agent/account`, and
+// `test/report-contract.test.mjs` asserts this module's allowlist is a subset of it.
+//
+// What remains unproven is DEPLOYMENT, not shape. `docs/gate-record.md` records the whole Cursor
+// API surface as source-proof-only, uncommitted on `feature/cursor-provider-analytics` and not
+// deployed to any environment this session could reach. So:
+//
+//   * `ACCOUNT_CHECKIN_ENDPOINT` is set and `deps.enabled` defaults to true, but this module still
+//     posts nothing on its own — Phase B3 owns the call sites and none exists yet.
+//   * `subscriptionStatus` is ON the allowlist and must NOT be POPULATED until plan §4 E3's
+//     migration and code release are verified per tenant. Under the server's global
+//     `forbidNonWhitelisted` pipe an undeployed property 400s the WHOLE check-in, so an early
+//     status field does not degrade the request, it destroys it. `buildCheckInPayload` therefore
+//     omits it unless a caller opts in.
+//
+// ─── WHITESPACE IN `subscriptionType` (plan §2 C9) ───────────────────────────────────────────
+// `SECRET_LIKE` rejects any value containing whitespace, so a raw Cursor tier such as
+// `"Teams Premium"` would fail the check-in CLIENT-SIDE and never reach the server's
+// alias-discovery loop. Whitespace runs in `subscriptionType` are collapsed to `_` BEFORE
+// validation, hashing and sending, so what is validated is exactly what is posted. Nothing is lost
+// for alias matching — the server's own `canonicalize` does `[-\s]+ → '_'` anyway — but the
+// discovery loop sees `Teams_Premium`, not the original spelling. That is the accepted trade.
+export const ACCOUNT_CHECKIN_ENDPOINT = ENDPOINTS.accountSync;
 
 export const CHECKIN_STATE_VERSION = 1;
 
@@ -43,19 +65,76 @@ export const CheckInOutcome = Object.freeze({
 // failure rather than a quietly dropped key, because the way secrets leak is one caller adding a
 // field that everything downstream happily forwards.
 //
-// Deliberately absent: API-key fingerprints and any environment-variable collection. Those are a
-// Claude Code mechanism with no Cursor equivalent and no reason to exist here.
+// Deliberately absent: API-key fingerprints (`keys`) and `rateLimitTier`. Both are declared by the
+// server DTO; `keys` is a Claude Code mechanism with no Cursor equivalent, and Cursor has no
+// rate-limit tier to report. Also absent, and load-bearing: `subscriptionId`. It is the
+// SUBSCRIPTION the seat belongs to, kept in billing.json as a local switch signal only, and there
+// is no server field that means it — sending it under `accountUuid` would collapse every member of
+// a Team plan onto the paying owner's row (plan §3.1).
+//
+// THESE NAMES ARE THE SERVER'S, NOT OURS. The route runs under a global
+// `ValidationPipe({whitelist: true, forbidNonWhitelisted: true})`, so a single name this DTO does
+// not declare 400s the entire check-in rather than dropping one field. The previous allowlist
+// (`environment`, `cursorAccountEmail`, `plan`, …) was wrong in every entry and would have failed
+// whole. See `test/fixtures/backend-contract.json` → `me/cli-agent/account.accepted_properties`.
 export const CHECKIN_PAYLOAD_FIELDS = Object.freeze([
-  'environment',
-  'cursorAccountEmail',
-  'cursorAccountSource',
-  'plan',
-  'planSource',
-  'planObservedAt',
-  'billingSource',
+  'accountUuid',
+  'email',
+  'subscriptionType',
+  'subscriptionStatus',
 ]);
 
 const SECRET_LIKE = /sk-|\s/;
+
+// The one field whose value may legitimately contain spaces (`"Teams Premium"`). Collapsing happens
+// here, once, on the object that is then validated, hashed AND posted — collapsing inside the
+// validator would validate one string and send another, and hash a third.
+export function normalizeCheckInPayload(payload) {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const type = payload.subscriptionType;
+  if (typeof type !== 'string') return payload;
+  const collapsed = type.trim().replace(/\s+/g, '_');
+  if (collapsed === type) return payload;
+  return { ...payload, subscriptionType: collapsed };
+}
+
+// Map the local facts onto the server's vocabulary. One place does this mapping so a call site
+// cannot invent a field name, and so the `subscriptionId` rule above has exactly one enforcement
+// point. Null/absent facts are OMITTED rather than sent as null: an empty body is a valid,
+// meaningful check-in ("this agent could identify nothing").
+//
+//   sources.anchor  — billing.json's `accountAnchor` {email, accountId, subscriptionId, source}
+//   sources.account — `readCursorAccount()`'s {plan, rawPlan, ..., status}; `rawPlan` is what the
+//                     server's alias-discovery loop needs, not the normalized plan.
+//   sources.record  — the billing.json record, for `subscriptionStatus` (spelled `status` on the
+//                     account object and `subscriptionStatus` on the record — not the same name).
+//   options.includeSubscriptionStatus — OFF by default; see the E3 deployment gate in the header.
+export function buildCheckInPayload(sources, options) {
+  const s = sources == null ? {} : sources;
+  const opts = options == null ? {} : options;
+  const anchor = s.anchor == null ? {} : s.anchor;
+  const account = s.account == null ? {} : s.account;
+  const record = s.record == null ? {} : s.record;
+  const payload = {};
+
+  const accountUuid = normalizeAccountIdentifier(anchor.accountId);
+  if (accountUuid !== null) payload.accountUuid = accountUuid;
+
+  const email = normalizeAccountEmail(anchor.email);
+  if (email !== null) payload.email = email;
+
+  const rawPlan = typeof account.rawPlan === 'string' && account.rawPlan.trim() !== '' ? account.rawPlan.trim() : null;
+  if (rawPlan !== null) payload.subscriptionType = rawPlan;
+
+  if (opts.includeSubscriptionStatus === true) {
+    const status = typeof record.subscriptionStatus === 'string' && record.subscriptionStatus.trim() !== ''
+      ? record.subscriptionStatus.trim()
+      : null;
+    if (status !== null) payload.subscriptionStatus = status;
+  }
+
+  return normalizeCheckInPayload(payload);
+}
 
 export function validateCheckInPayload(payload) {
   if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -88,22 +167,48 @@ export function accountSyncStateDir() {
   return path.join(beeziCursorHome(), 'account-sync');
 }
 
-// Scoped by environment + Beezi account + Cursor account, the same three facts the cost state uses.
-// A heartbeat carried across any of those would tell the server this machine had already reported
-// facts that belong to somebody else.
+// Scoped by environment + Beezi account, and DELIBERATELY NOT by the Cursor account (plan §2 C8).
+//
+// This is the flip-back guarantee and it is load-bearing. With the Cursor account in the key,
+// sub1 → sub2 → sub1 inside the seven-day heartbeat lands back on sub1's OWN state file, finds
+// `lastHash === hash`, and returns SKIPPED — the re-map to sub1 silently never happens. One file
+// per (environment, Beezi account) makes the state mean "the last identity this machine sent", so
+// any return to a previous tuple is itself a change and re-sends.
+//
+// The key is built here, from two named fields, rather than by reusing `accountScopeKey` from
+// lib/cost-reconcile.mjs with one field left out: call sites build ONE scope object for both
+// subsystems, and a shared helper would happily fold `cursorAccount` back into this key and
+// reinstate the exact bug this exists to kill. Two segments also means a key written here can
+// never collide with a three-segment cost-state key.
+//
+// UPGRADE NOTE: the digest is the FILENAME, so every state file written by the previous
+// three-segment scoping is orphaned by this change. The first check-in after upgrade reads
+// `state == null` → due → sends. One extra check-in per installed machine, once. Expected.
+export function checkInScopeKey(scope) {
+  const s = scope == null ? {} : scope;
+  return [
+    s.env == null ? '' : String(s.env),
+    s.beeziAccount == null ? '' : String(s.beeziAccount),
+  ].join('|');
+}
+
+export function checkInScopeDigest(scope) {
+  return crypto.createHash('sha256').update(checkInScopeKey(scope)).digest('hex').slice(0, 16);
+}
+
 export function accountSyncStateFile(scope) {
-  return path.join(accountSyncStateDir(), `${accountScopeDigest(scope)}.json`);
+  return path.join(accountSyncStateDir(), `${checkInScopeDigest(scope)}.json`);
 }
 
 function emptyState(scope) {
-  return { version: CHECKIN_STATE_VERSION, scope: accountScopeKey(scope), lastHash: null, lastSuccessAt: null };
+  return { version: CHECKIN_STATE_VERSION, scope: checkInScopeKey(scope), lastHash: null, lastSuccessAt: null };
 }
 
 export function readAccountSyncState(file, scope) {
   const raw = readJson(file);
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return emptyState(scope);
   if (raw.version !== CHECKIN_STATE_VERSION) return emptyState(scope);
-  if (raw.scope !== accountScopeKey(scope)) return emptyState(scope);
+  if (raw.scope !== checkInScopeKey(scope)) return emptyState(scope);
   return {
     version: CHECKIN_STATE_VERSION,
     scope: raw.scope,
@@ -115,7 +220,7 @@ export function readAccountSyncState(file, scope) {
 export function writeAccountSyncState(file, state, scope) {
   writeJsonSecure(file, {
     version: CHECKIN_STATE_VERSION,
-    scope: accountScopeKey(scope),
+    scope: checkInScopeKey(scope),
     lastHash: state == null ? null : state.lastHash,
     lastSuccessAt: state == null ? null : state.lastSuccessAt,
   });
@@ -230,10 +335,17 @@ export function summarizeChargedCost(segments) {
 //
 // Source precedence, in the order the tests enforce it:
 //   1. The response must name an account, and it must be the account we are CURRENTLY observing.
-//      An unknown account on either side is a refusal, never an assumed match.
-//   2. The plan must be in the local vocabulary. Storing an unmapped string here would put a tier
+//      An unknown account on either side is a refusal, never an assumed match. An `accountUuid` is
+//      preferred over the email whenever BOTH sides carry one: two people can share an address in
+//      a tenant, and only the uuid says the server answered about the row we asked about.
+//   2. The plan must carry SERVER AUTHORITY (plan §2 C10 / §4 E6). Only a plan a portal admin set
+//      by hand — `planSource === 'manual'` — may replace a local observation. Anything else is the
+//      server echoing back the plan this very check-in just reported, always with a newer
+//      timestamp, so the freshness rule below can never refuse it; accepting it makes billing.json
+//      oscillate against the next vscdb read forever.
+//   3. The plan must be in the local vocabulary. Storing an unmapped string here would put a tier
 //      with no seat rate into the record that prices the seat.
-//   3. The response must be strictly fresher than the local observation it would replace. A stale
+//   4. The response must be strictly fresher than the local observation it would replace. A stale
 //      server row must never overwrite a plan the user typed five minutes ago.
 export function planWriteback(response, context) {
   const ctx = context == null ? {} : context;
@@ -241,10 +353,26 @@ export function planWriteback(response, context) {
   if (response == null || typeof response !== 'object') return refuse('no-plan');
   if (typeof response.plan !== 'string' || response.plan === '') return refuse('no-plan');
 
-  const served = normalizeAccountEmail(response.account == null ? null : response.account.email);
-  const local = ctx.anchor == null ? null : normalizeAccountEmail(ctx.anchor.email);
-  if (served === null || local === null) return refuse('account-unknown');
-  if (served !== local) return refuse('account-mismatch');
+  const account = response.account == null ? {} : response.account;
+  const anchor = ctx.anchor == null ? {} : ctx.anchor;
+  const servedId = normalizeAccountIdentifier(account.accountUuid);
+  const localId = normalizeAccountIdentifier(anchor.accountId);
+  if (servedId !== null && localId !== null) {
+    // Both sides know an id: it decides, on its own, in both directions.
+    if (servedId !== localId) return refuse('account-mismatch');
+  } else {
+    const served = normalizeAccountEmail(account.email);
+    const local = normalizeAccountEmail(anchor.email);
+    if (served === null || local === null) return refuse('account-unknown');
+    if (served !== local) return refuse('account-mismatch');
+  }
+
+  // Written as two explicit refusals rather than one `!== 'manual'` comparison, on purpose. The
+  // ABSENT case is a distinct fact — an old server, or a tenant that has not received E6, sends no
+  // `planSource` at all — and it must be visible in the outcome, so that nobody later "simplifies"
+  // this into a truthy check and silently re-enables the oscillation.
+  if (typeof response.planSource !== 'string') return refuse('plan-source-unknown');
+  if (response.planSource !== 'manual') return refuse('plan-source-reported');
 
   if (!CURSOR_PLANS.includes(response.plan) || response.plan === 'unknown') return refuse('unsupported-plan');
 
@@ -262,9 +390,12 @@ export function planWriteback(response, context) {
       source: existing == null ? 'subscription' : existing.source,
       plan: response.plan,
       subscriptionType: response.plan,
-      // The server was asked about a plan, not about a rate-limit tier; a response that does not
-      // mention one is not evidence that the locally observed one is gone.
+      // The server was asked about a plan, not about a rate-limit tier or a Stripe subscription
+      // status; a response that does not mention one is not evidence that the locally observed one
+      // is gone. `subscriptionStatus` is a v3 record field and must survive a writeback — dropping
+      // it would silently discard the status the check-in itself just learned.
       rateLimitTier: existing == null ? null : existing.rateLimitTier,
+      subscriptionStatus: existing == null ? null : existing.subscriptionStatus,
       capturedAt: new Date(observedAt).toISOString(),
       identityCheckedAt: ctx.now == null ? null : new Date(ctx.now).toISOString(),
       migratedAt: existing == null ? null : existing.migratedAt,
@@ -288,10 +419,16 @@ function result(outcome, extra) {
 
 // Check this machine's billing account in with the server.
 //
-//   payload — allowlisted, non-secret facts only (CHECKIN_PAYLOAD_FIELDS).
+//   payload — allowlisted, non-secret facts only (CHECKIN_PAYLOAD_FIELDS), normally from
+//             `buildCheckInPayload`.
 //   auth    — `{ getToken(), authEpoch() }` (CONTRACTS §2), injected.
-//   deps    — `{ enabled=false, endpoint=ACCOUNT_CHECKIN_ENDPOINT, postJson, scope, now,
-//                existingBillingRecord, anchor }`.
+//   deps    — `{ enabled=true, endpoint=ACCOUNT_CHECKIN_ENDPOINT, postJson, scope, now,
+//                existingBillingRecord, anchor, force=false }`.
+//
+// `force` skips the due gate ONLY (plan §2 C7). It is for the moments where the caller already
+// knows something moved — a fresh link, an observed account switch — and waiting out a seven-day
+// heartbeat would leave the server holding the wrong subscription. It does not skip the schema
+// check, the scope check or the auth fence, because none of those is a rate limit.
 //
 // It returns `writeback` for the caller to apply; it never writes billing.json itself, so the one
 // module that owns that file stays the only one that can change a plan.
@@ -302,26 +439,34 @@ function result(outcome, extra) {
 export async function checkInAccount(payload, auth, deps) {
   const d = deps == null ? {} : deps;
   const now = d.now == null ? Date.now() : d.now;
-  if (d.enabled !== true) return result(CheckInOutcome.DISABLED);
+  // Default ON. The kill switch is still here and still explicit - a caller that has a reason to
+  // stay quiet passes `enabled: false` - but "nothing is sent" is now the call sites' job (B3),
+  // not a default this module hides behind.
+  if (d.enabled === false) return result(CheckInOutcome.DISABLED);
   const endpoint = d.endpoint === undefined ? ACCOUNT_CHECKIN_ENDPOINT : d.endpoint;
   if (endpoint == null) return result(CheckInOutcome.UNCONFIGURED);
 
-  const valid = validateCheckInPayload(payload);
+  // Normalize BEFORE validating, hashing or sending, so all three see one object (see
+  // `normalizeCheckInPayload`: a `"Teams Premium"` collapsed only for validation would be posted
+  // raw and hashed in a third form).
+  const sent = normalizeCheckInPayload(payload);
+  const valid = validateCheckInPayload(sent);
   if (!valid.ok) return result(CheckInOutcome.SCHEMA, { reason: valid.reason });
 
-  // The heartbeat is scoped by environment + Beezi account + Cursor account, and an incomplete
-  // scope is REFUSED rather than degraded. Filling a missing `beeziAccount` with null would key two
-  // Beezi accounts on one machine to the same file, which is the mis-attribution the scoping exists
-  // to prevent - and it would fail silently, as a check-in that looks successful.
+  // The heartbeat is scoped by environment + Beezi account, and an incomplete scope is REFUSED
+  // rather than degraded. Filling a missing `beeziAccount` with null would key two Beezi accounts
+  // on one machine to the same file, which is the mis-attribution the scoping exists to prevent -
+  // and it would fail silently, as a check-in that looks successful. The Cursor account is NOT part
+  // of the scope and its presence or absence is not checked: see `checkInScopeKey` for why keying
+  // on it breaks flip-back.
   const scope = d.scope;
-  if (scope == null || typeof scope !== 'object'
-    || scope.env == null || scope.beeziAccount == null || scope.cursorAccount == null) {
+  if (scope == null || typeof scope !== 'object' || scope.env == null || scope.beeziAccount == null) {
     return result(CheckInOutcome.SCHEMA, { reason: 'incomplete-scope' });
   }
   const file = accountSyncStateFile(scope);
   const state = readAccountSyncState(file, scope);
-  const hash = hashCheckInPayload(payload);
-  if (!isCheckInDue(state, hash, now)) return result(CheckInOutcome.SKIPPED);
+  const hash = hashCheckInPayload(sent);
+  if (d.force !== true && !isCheckInDue(state, hash, now)) return result(CheckInOutcome.SKIPPED);
 
   let fence;
   try {
@@ -347,7 +492,7 @@ export async function checkInAccount(payload, auth, deps) {
 
   let response;
   try {
-    response = await d.postJson(endpoint, payload, token);
+    response = await d.postJson(endpoint, sent, token);
   } catch {
     return result(CheckInOutcome.OFFLINE);
   }

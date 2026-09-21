@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   BILLING_SCHEMA_VERSION,
+  normalizeAccountAnchor,
   readBillingConfig,
   writeBillingConfig,
   isStale,
@@ -116,4 +117,45 @@ test('isStale — self-reported config with missing or unknown plan is still sta
   const now = Date.parse('2001-09-09T01:46:40.000Z');
   assert.equal(isStale({ source: 'subscription', selfReported: true, capturedAt: new Date(now).toISOString() }, now), true);
   assert.equal(isStale({ source: 'subscription', plan: 'unknown', selfReported: true, capturedAt: new Date(now).toISOString() }, now), true);
+});
+
+// ── v3: the account anchor carries an identity, not just an address ────────────────────────────
+
+test('an anchor accepts an id with no email, and an email with no id', () => {
+  // Both halves are real populations: a machine whose Cursor has cached no address still has a
+  // signed-in id, and every record written before v3 — plus every CLI-config machine — has only an
+  // address. Requiring both would throw away the stronger half of each.
+  const idOnly = normalizeAccountAnchor({ accountId: 'auth0|seat_1', source: 'state_vscdb' });
+  assert.equal(idOnly.accountId, 'auth0|seat_1');
+  assert.equal(idOnly.email, null);
+
+  const emailOnly = normalizeAccountAnchor({ email: 'Dev@Example.com', source: 'cli_config' });
+  assert.equal(emailOnly.email, 'dev@example.com');
+  assert.equal(emailOnly.accountId, null);
+
+  assert.equal(normalizeAccountAnchor({ accountId: 'auth0|seat_1' }), null, 'a source is still mandatory');
+});
+
+test('an anchor id is stored verbatim — never split, prefixed away or capped', () => {
+  const samlpId = `samlp|${new Array(101).join('c')}|${new Array(82).join('u')}@example.com`;
+  const anchor = normalizeAccountAnchor({ accountId: samlpId, subscriptionId: '  sub_a  ', source: 'state_vscdb' });
+  assert.equal(anchor.accountId, samlpId);
+  assert.equal(anchor.accountId.length, 200, 'a truncated id is a wrong id, and a wrong id is a phantom row');
+  assert.equal(anchor.subscriptionId, 'sub_a', 'trimmed, and nothing more');
+  assert.equal(normalizeAccountAnchor({ accountId: '   ', source: 'state_vscdb' }).accountId, null);
+  assert.equal(normalizeAccountAnchor({ accountId: 42, source: 'state_vscdb' }).accountId, null);
+});
+
+test('the record round-trips the v3 fields through disk', () => {
+  withTempHome(() => {
+    const cfg = {
+      version: BILLING_SCHEMA_VERSION,
+      source: 'subscription',
+      plan: 'pro',
+      subscriptionStatus: 'active',
+      accountAnchor: { email: 'dev@example.com', accountId: 'auth0|seat_1', subscriptionId: 'sub_a', source: 'state_vscdb' },
+    };
+    writeBillingConfig(cfg);
+    assert.deepEqual(readBillingConfig(), cfg);
+  });
 });

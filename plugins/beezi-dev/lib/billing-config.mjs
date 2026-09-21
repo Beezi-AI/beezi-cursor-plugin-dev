@@ -5,7 +5,7 @@ import { BillingSource, detectThirdPartyProvider, isPlanBearing } from './billin
 // THE schema version. One constant, exported, so a migration, a writer and a reader can never
 // disagree about which shape is current — the v1 record carried the literal `1` in three places
 // and nothing tied them together.
-export const BILLING_SCHEMA_VERSION = 2;
+export const BILLING_SCHEMA_VERSION = 3;
 
 // How long a plan/identity fact is trusted before it is worth looking again. One window, two
 // different questions asked of it — see isStale (nudge the user) and isDue (recheck cheaply).
@@ -41,12 +41,33 @@ export function normalizeAccountEmail(raw) {
   return trimmed;
 }
 
-// `{ email, source }` or null. A source is mandatory: an anchor without one cannot say which read
-// produced the email, and that is exactly the pairing the reconciler must never invent.
+// An id is stored VERBATIM — trimmed, required non-empty, and never capped or split. See the same
+// rule and its reasoning in lib/cursor-account.mjs: a truncated id is a wrong id, and a wrong id
+// points at a subscription that does not exist.
+export function normalizeAccountIdentifier(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+// `{ email, accountId, subscriptionId, source }` or null. A source is mandatory: an anchor without
+// one cannot say which read produced the identity, and that is exactly the pairing the reconciler
+// must never invent. Every OTHER field is independently optional — an anchor with an id and no
+// email is what a machine whose Cursor has not cached an address looks like, and an anchor with an
+// email and no id is what every pre-v3 record and every CLI-config machine looks like. Requiring
+// both would throw away the stronger half of each.
+//
+// `accountId` is this SEAT's identity and is the only one that may ever go on the wire.
+// `subscriptionId` is the subscription the seat belongs to, kept locally as a switch signal only.
 export function normalizeAccountAnchor(raw) {
   if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return null;
   if (typeof raw.source !== 'string' || raw.source.trim() === '') return null;
-  return { email: normalizeAccountEmail(raw.email), source: raw.source.trim() };
+  return {
+    email: normalizeAccountEmail(raw.email),
+    accountId: normalizeAccountIdentifier(raw.accountId),
+    subscriptionId: normalizeAccountIdentifier(raw.subscriptionId),
+    source: raw.source.trim(),
+  };
 }
 
 // ── migration ─────────────────────────────────────────────────────────────────────────────────
@@ -71,6 +92,11 @@ function normalizeRecord(raw, version) {
     identityCheckedAt: isoOrNull(raw.identityCheckedAt),
     migratedAt: isoOrNull(raw.migratedAt),
     accountAnchor: normalizeAccountAnchor(raw.accountAnchor),
+    // Stripe's own word for the state of the subscription (`active`, `past_due`, ...). Evidence
+    // only: nothing in this plugin gates on it, because a plan we can price must not become
+    // unpriceable just because a status string was unfamiliar. It exists so a cancelled seat that
+    // is still labelled `pro` is distinguishable from a paying one, later and deliberately.
+    subscriptionStatus: stringOrNull(raw.subscriptionStatus),
     // When the host was last LOOKED AT, whether or not the look produced anything. Distinct from
     // `capturedAt` (when a plan was observed) and `identityCheckedAt` (when an account was
     // confirmed): a machine that has no plan at all learns nothing from either of those, and
@@ -81,8 +107,8 @@ function normalizeRecord(raw, version) {
   };
 }
 
-// v1 -> v2, tolerantly. Returns `{ record, migrated }`; `migrated` is true only when the stored
-// shape actually changed, so a caller knows whether a write is owed.
+// Up to the current version, tolerantly. Returns `{ record, migrated }`; `migrated` is true only
+// when the stored shape actually changed, so a caller knows whether a write is owed.
 //
 // `capturedAt` is COPIED, never restamped. It is the only record of when the plan was observed,
 // and a schema rewrite observes nothing — a migration that refreshed it would make an old user's
@@ -110,8 +136,16 @@ export function migrateBillingRecord(raw, options) {
     return { record: normalizeRecord(raw, version), migrated: false };
   }
   const record = normalizeRecord(raw, BILLING_SCHEMA_VERSION);
-  record.identityCheckedAt = null;
-  record.lastPlanReadAttemptAt = null;
+  // v1 -> anything: a v1 record never checked an identity and never recorded a read attempt, so
+  // both stamps start null. This clause is SPECIFIC TO v1 and must stay that way — running a v2
+  // record through it would erase two stamps that record real events, which is the opposite of a
+  // migration. The v2 -> v3 step adds fields and touches nothing else: `normalizeRecord` has
+  // already filled `accountId`, `subscriptionId` and `subscriptionStatus` with null, because a v2
+  // record simply does not carry them.
+  if (version < 2) {
+    record.identityCheckedAt = null;
+    record.lastPlanReadAttemptAt = null;
+  }
   record.migratedAt = new Date(now).toISOString();
   return { record, migrated: true };
 }

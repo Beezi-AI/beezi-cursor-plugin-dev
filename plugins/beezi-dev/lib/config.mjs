@@ -43,6 +43,11 @@ export const ENDPOINTS = Object.freeze({
   reposStatus: "/repos/status",
   whoami: "/me/cursor/whoami",
   machine: "/me/cursor/machine",
+  // Account check-in (lib/account-sync.mjs). FROZEN and SHARED with the Claude Code and Codex
+  // plugins — the route is vendor-generic and the agent axis is the `X-Beezi-Agent: cursor`
+  // header machineHeaders() already sends, not the path. A `/me/cursor/account` spelling does
+  // not exist server-side and would 404 every check-in.
+  accountSync: "/me/cli-agent/account",
   // Self-diagnostics. The public route is deliberately unauthenticated — losing OAuth must not
   // also lose the evidence that OAuth broke — and the installation route is the authenticated
   // identity binding. Neither is agent-scoped: the wire vocabulary is shared with the other

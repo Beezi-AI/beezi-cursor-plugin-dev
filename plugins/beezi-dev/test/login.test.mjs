@@ -259,3 +259,92 @@ test('an already-linked machine reasserts the binding too', async (t) => {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].token, 'existing-at');
 });
+
+// ── the account check-in (plan §4 B3) ─────────────────────────────────────────────────────────
+
+test('a fresh link checks the account in, FORCED, with the whoami it just made', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const result = await performLogin({
+    deps: loginDeps({
+      whoami: async () => ({ valid: true, name: 'Dev Eloper', email: 'dev@example.com' }),
+      syncAccountIfNeeded: async (token, options, deps) => { calls.push({ token, options, deps }); return null; },
+    }),
+  });
+  assert.equal(result.type, 'linked');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].token, 'at', 'the token this flow just exchanged, not a re-resolved one');
+  // A fresh login may inherit the PREVIOUS identity's cached fingerprint, and a re-login as the
+  // same Beezi account lands on that account's own state file with an unchanged hash. Forcing is
+  // the whole reason this call site exists rather than leaving it to the session-start heartbeat.
+  assert.equal(calls[0].options.force, true);
+  assert.equal(calls[0].options.via, 'login');
+  // The probe is handed over directly: recordWhoami is best-effort at this call site, so a cache
+  // write that silently failed must not be what decides whether the scope can be built.
+  assert.equal(calls[0].deps.who.email, 'dev@example.com');
+  assert.equal(calls[0].deps.tracking, null);
+});
+
+test('an already-linked machine checks in too — that is the branch a stuck user lands on', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const result = await performLogin({
+    deps: loginDeps({
+      getCredentials: async () => ({ client_id: 'client-123', access_token: 'existing-at' }),
+      linkStatus: async () => ({
+        state: 'linked', account: 'Dev Eloper', apiBase: 'https://api.test',
+        who: { valid: true, email: 'dev@example.com' },
+      }),
+      syncAccountIfNeeded: async (token, options, deps) => { calls.push({ token, options, deps }); return null; },
+    }),
+  });
+  assert.equal(result.type, 'already-linked');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].token, 'existing-at');
+  assert.equal(calls[0].options.force, true);
+  assert.equal(calls[0].deps.who.email, 'dev@example.com');
+});
+
+test('a whoami that did not answer still links, and asks for no probe-derived scope', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const result = await performLogin({
+    deps: loginDeps({
+      whoami: async () => null,
+      syncAccountIfNeeded: async (token, options, deps) => { calls.push(deps); return null; },
+    }),
+  });
+  assert.equal(result.type, 'linked');
+  assert.equal(calls.length, 1);
+  // null, not an invalid object: the helper then falls back to the cached account key, which is the
+  // only thing a machine with no fresh probe could honestly claim.
+  assert.equal(calls[0].who, null);
+});
+
+test('a check-in that throws or rejects never fails a sign-in', async (t) => {
+  for (const sync of [
+    () => { throw new Error('threw synchronously'); },
+    () => Promise.reject(new Error('rejected')),
+    async () => { throw new Error('rejected late'); },
+  ]) {
+    tmpHome(t);
+    const result = await performLogin({ deps: loginDeps({ syncAccountIfNeeded: sync }) });
+    assert.equal(result.type, 'linked', 'the sign-in outcome is unchanged');
+    assert.equal(result.account, 'Dev Eloper');
+  }
+});
+
+test('a check-in that throws never fails the already-linked branch either', async (t) => {
+  tmpHome(t);
+  const result = await performLogin({
+    deps: loginDeps({
+      getCredentials: async () => ({ client_id: 'client-123', access_token: 'existing-at' }),
+      linkStatus: async () => ({
+        state: 'linked', account: 'Dev Eloper', apiBase: 'https://api.test', who: { valid: true },
+      }),
+      syncAccountIfNeeded: () => { throw new Error('boom'); },
+    }),
+  });
+  assert.equal(result.type, 'already-linked');
+  assert.equal(result.account, 'Dev Eloper');
+});

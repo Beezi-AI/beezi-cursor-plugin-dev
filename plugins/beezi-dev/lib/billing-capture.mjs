@@ -7,6 +7,7 @@ import {
   migrateBillingRecord,
   normalizeAccountAnchor,
   normalizeAccountEmail,
+  normalizeAccountIdentifier,
 } from './billing-config.mjs';
 import { UserError } from './friendly-error.mjs';
 
@@ -92,13 +93,22 @@ const SELF_REPORTED_PLANS = Object.freeze([
   'free', 'pro', 'pro_plus', 'ultra', 'team', 'team_premium', 'enterprise',
 ]);
 
-function observation(plan, rawPlan, rateLimitTier, source, email, via) {
+// `identity` is `{ accountId, subscriptionId, status }` and is optional: only the deterministic
+// state.vscdb read can supply one. Its ids go through `normalizeAccountIdentifier`, NOT through
+// `safeField` above — `safeField` caps at 64 characters, and an SSO `samlp|<connection>|<nameId>`
+// id is routinely longer than that. Truncating it, or dropping it, is how a Team/SSO seat becomes
+// permanently email-only.
+function observation(plan, rawPlan, rateLimitTier, source, email, via, identity) {
+  const id = identity == null ? {} : identity;
   return {
     plan: plan == null || plan === '' ? 'unknown' : plan,
     rawPlan,
     rateLimitTier,
     source,
     email: normalizeAccountEmail(email),
+    accountId: normalizeAccountIdentifier(id.accountId),
+    subscriptionId: normalizeAccountIdentifier(id.subscriptionId),
+    status: typeof id.status === 'string' && id.status !== '' ? id.status : null,
     via: via == null ? null : via,
   };
 }
@@ -123,8 +133,10 @@ export function observationFromArgs(args) {
   );
 }
 
-// The typed observation for the deterministic path. `readCursorAccount` already returns exactly
-// one self-contained `{ plan, rawPlan, source, email }` tuple, so nothing is paired here either.
+// The typed observation for the deterministic path. `readCursorAccount` already returns exactly one
+// self-contained `{ plan, rawPlan, source, email, accountId, subscriptionId, status }` tuple, so
+// nothing is paired here either — the identity travels with the plan it was read beside, or not at
+// all.
 export function observationFromAccount(account, via) {
   if (account == null || typeof account !== 'object') return null;
   const rawPlan = safeHostField(account.rawPlan);
@@ -132,6 +144,7 @@ export function observationFromAccount(account, via) {
     account.plan, rawPlan == null ? account.plan : rawPlan, null,
     typeof account.source === 'string' ? account.source : AccountSource.STATE_VSCDB,
     account.email, via == null ? null : safeField(via),
+    { accountId: account.accountId, subscriptionId: account.subscriptionId, status: account.status },
   );
 }
 
@@ -143,11 +156,29 @@ export const IdentityMatch = Object.freeze({
   UNKNOWN: 'unknown',
 });
 
+// ID FIRST, then email. The account id is Cursor's own opaque identity for this seat and does not
+// move when a user renames their address, so where both sides have one it is the only thing worth
+// asking. Email is the fallback for the population that has no id: every pre-v3 record, every
+// CLI-config machine, and any seat whose per-seat key was absent.
+//
 // A missing identity on EITHER side is `unknown` — not a match, and not a switch. Treating it as a
 // match would let an old user's protected tier survive a hand-over; treating it as a switch would
 // throw away a perfectly good plan every time Cursor happens not to cache an address.
+//
+// A changed `subscriptionId` under an unchanged `accountId` is a SWITCH, because that is one seat
+// moving between subscriptions and is precisely the event this whole feature exists to notice. It
+// counts only when BOTH sides carry one: `null -> something` is this machine LEARNING the id for
+// the first time, not the seat moving, and calling that a switch would make the first run after
+// every upgrade destroy a stored plan it had no reason to doubt.
 export function compareAnchors(observed, existing) {
   if (observed == null || existing == null) return IdentityMatch.UNKNOWN;
+  if (observed.accountId && existing.accountId) {
+    if (observed.accountId !== existing.accountId) return IdentityMatch.SWITCH;
+    if (observed.subscriptionId && existing.subscriptionId
+      && observed.subscriptionId !== existing.subscriptionId) return IdentityMatch.SWITCH;
+    // Same seat: a differing email is the user having renamed their address, never a hand-over.
+    return IdentityMatch.MATCH;
+  }
   if (!observed.email || !existing.email) return IdentityMatch.UNKNOWN;
   return observed.email === existing.email ? IdentityMatch.MATCH : IdentityMatch.SWITCH;
 }
@@ -214,6 +245,10 @@ function recordFromObservation(obs, anchor, prior, nowIso) {
     lastPlanReadAttemptAt: nowIso,
     migratedAt: prior == null ? null : prior.migratedAt,
     accountAnchor: anchor,
+    // Read beside the plan, from the same source, in the same pass. A source that observes no
+    // status says null rather than inheriting the previous one: unlike the rate-limit tier, a
+    // status is a statement about RIGHT NOW, and a stale `active` is worse than no answer.
+    subscriptionStatus: obs.status,
     capturedBy: obs.via == null ? 'manual' : obs.via,
     selfReported: obs.source === AccountSource.SELF_REPORT,
   };
@@ -233,6 +268,8 @@ function blankedForSwitch(prior, anchor, nowIso) {
     lastPlanReadAttemptAt: nowIso,
     migratedAt: prior.migratedAt,
     accountAnchor: anchor,
+    // The old account's status is as dead as its tier.
+    subscriptionStatus: null,
     capturedBy: 'account-switch',
     selfReported: false,
   };
@@ -252,14 +289,52 @@ function blankRecord() {
     lastPlanReadAttemptAt: null,
     migratedAt: null,
     accountAnchor: null,
+    subscriptionStatus: null,
     capturedBy: 'manual',
     selfReported: false,
   };
 }
 
+// The human-facing name for an anchor, for change entries only — never for comparison. Email
+// first because that is the word a user recognizes; the id is the fallback for a seat whose Cursor
+// has cached no address.
+function anchorLabel(anchor) {
+  if (anchor == null) return null;
+  if (anchor.email != null) return anchor.email;
+  return anchor.accountId;
+}
+
+// `observed`, with each field it could not see taken from `stored`. ONLY safe for two anchors
+// already known to describe the same account — see the call site. `source` is never backfilled:
+// it names which read produced this observation and is a fact about the read, not about the
+// account. A field the observation DID see always wins, including a changed email.
+function filledFrom(observed, stored) {
+  if (observed == null) return stored;
+  if (stored == null) return observed;
+  return {
+    email: observed.email == null ? stored.email : observed.email,
+    accountId: observed.accountId == null ? stored.accountId : observed.accountId,
+    subscriptionId: observed.subscriptionId == null ? stored.subscriptionId : observed.subscriptionId,
+    source: observed.source,
+  };
+}
+
+// Does this anchor say ANYTHING about who the account is? An anchor that carries only a source is
+// a record of having looked, not an identity.
+function anchorIdentifies(anchor) {
+  return anchor != null && (anchor.email != null || anchor.accountId != null);
+}
+
+// Every field, ids included. This drives `persist` in the KEPT branch, so an omission here is not
+// a cosmetic one: an anchor that has just LEARNED its accountId while the email stayed the same
+// would compare equal, report "nothing changed", and the id would be computed and then thrown away
+// unwritten — on every run, forever.
 function anchorsEqual(a, b) {
   if (a == null || b == null) return a == null && b == null;
-  return a.email === b.email && a.source === b.source;
+  return a.email === b.email
+    && a.accountId === b.accountId
+    && a.subscriptionId === b.subscriptionId
+    && a.source === b.source;
 }
 
 // One reusable reconcile service. Pure: it reads nothing and writes nothing, so login, the refresh
@@ -318,14 +393,31 @@ export function reconcilePlan(observationInput, existing, options) {
   }
 
   const obs = observationInput;
-  const observedAnchor = normalizeAccountAnchor({ email: obs.email, source: obs.source });
+  const observedAnchor = normalizeAccountAnchor({
+    email: obs.email, accountId: obs.accountId, subscriptionId: obs.subscriptionId, source: obs.source,
+  });
   const identity = compareAnchors(observedAnchor, prior == null ? null : prior.accountAnchor);
+  // A read that could not SEE an identifier is not a read that says the identifier is gone. Cursor
+  // can withhold one for entirely uninteresting reasons — a locked row, a partial WAL snapshot, a
+  // sign-out and back in — and writing the blank through would drop a known accountId, send the
+  // next check-in with no id, and mint a fresh email-only provisional row on the server. The same
+  // reasoning already governs `rateLimitTier` inside recordFromObservation.
+  //
+  // Gated on MATCH, and that gate is the whole safety of it: backfilling from the previous anchor
+  // is only sound when the previous anchor describes the SAME account. On a switch the old seat's
+  // id must never ride along onto the new one.
+  const anchor = identity === IdentityMatch.MATCH
+    ? filledFrom(observedAnchor, prior.accountAnchor)
+    : observedAnchor;
   const priorKnown = prior != null && known(prior.plan);
   const due = force || prior == null || isDue(prior, now, RECHECK_MS);
 
   // ── a confirmed switch to a different account ──────────────────────────────────────────────
   if (identity === IdentityMatch.SWITCH) {
-    changes.push(change(ChangeKind.CHANGED, 'accountAnchor', prior.accountAnchor.email, observedAnchor.email));
+    // Name the identity that actually moved. On an id-driven switch both emails can be null, and
+    // reporting `null -> null` would describe the one event a user most needs to understand as
+    // nothing at all.
+    changes.push(change(ChangeKind.CHANGED, 'accountAnchor', anchorLabel(prior.accountAnchor), anchorLabel(observedAnchor)));
     if (known(obs.plan)) {
       changes.push(change(ChangeKind.CHANGED, 'plan', prior.plan, obs.plan));
       return {
@@ -348,12 +440,12 @@ export function reconcilePlan(observationInput, existing, options) {
 
   // ── same account, or an account we cannot identify ─────────────────────────────────────────
   if (known(obs.plan)) {
-    const anchorChanged = !anchorsEqual(observedAnchor, prior == null ? null : prior.accountAnchor);
+    const anchorChanged = !anchorsEqual(anchor, prior == null ? null : prior.accountAnchor);
     if (!priorKnown) {
       changes.push(change(ChangeKind.FILLED, 'plan', prior == null ? null : prior.plan, obs.plan));
       return {
         outcome: ReconcileOutcome.CHANGED,
-        record: recordFromObservation(obs, observedAnchor, prior, nowIso),
+        record: recordFromObservation(obs, anchor, prior, nowIso),
         changes,
         persist: true,
       };
@@ -362,7 +454,7 @@ export function reconcilePlan(observationInput, existing, options) {
       changes.push(change(ChangeKind.CHANGED, 'plan', prior.plan, obs.plan));
       return {
         outcome: ReconcileOutcome.CHANGED,
-        record: recordFromObservation(obs, observedAnchor, prior, nowIso),
+        record: recordFromObservation(obs, anchor, prior, nowIso),
         changes,
         persist: true,
       };
@@ -373,11 +465,11 @@ export function reconcilePlan(observationInput, existing, options) {
       changes.push(change(ChangeKind.IDENTITY_CHECKED, 'identityCheckedAt', prior.identityCheckedAt, nowIso));
     }
     if (anchorChanged) {
-      changes.push(change(ChangeKind.FILLED, 'accountAnchor', prior.accountAnchor == null ? null : prior.accountAnchor.email, observedAnchor == null ? null : observedAnchor.email));
+      changes.push(change(ChangeKind.FILLED, 'accountAnchor', anchorLabel(prior.accountAnchor), anchorLabel(anchor)));
     }
     return {
       outcome: ReconcileOutcome.KEPT,
-      record: recordFromObservation(obs, observedAnchor, prior, nowIso),
+      record: recordFromObservation(obs, anchor, prior, nowIso),
       changes,
       persist: due || anchorChanged || migration.migrated,
     };
@@ -393,7 +485,9 @@ export function reconcilePlan(observationInput, existing, options) {
       identityCheckedAt: identity === IdentityMatch.MATCH ? nowIso : prior.identityCheckedAt,
       // The read stamp moves either way: we did look, and that is all it records.
       lastPlanReadAttemptAt: nowIso,
-      accountAnchor: observedAnchor == null || observedAnchor.email == null ? prior.accountAnchor : observedAnchor,
+      // An observation that learned an ACCOUNT ID but no email is still a better anchor than the
+      // stored one; testing the email alone would discard the stronger identity of the two.
+      accountAnchor: anchorIdentifies(anchor) ? anchor : prior.accountAnchor,
     };
     changes.push(change(ChangeKind.PRESERVED, 'plan', prior.plan, prior.plan));
     const anchorLearned = !anchorsEqual(kept.accountAnchor, prior.accountAnchor);

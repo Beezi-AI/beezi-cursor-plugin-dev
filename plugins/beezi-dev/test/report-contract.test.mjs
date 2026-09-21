@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { computeSessionTimeline } from '../lib/session-timeline-cursor.mjs';
 import { queueDir } from '../lib/paths-cursor.mjs';
+import { CHECKIN_PAYLOAD_FIELDS } from '../lib/account-sync.mjs';
 
 // M03.1 — the versioned wire contract, and the gates that are still open against it.
 //
@@ -264,10 +265,21 @@ test('GATED: models is an array here and a Record on the backend — every Curso
   assert.ok(pools.every((pool) => ['subscription', 'credits', 'unknown'].includes(pool)));
 });
 
-test('GATED: the backend has no cursor agent, so these reports would be stored as Claude Code', () => {
+test('GATED: the cursor agent exists in the portal tree but on no proven deployment', () => {
+  // The fixture used to claim `cursor` resolved to claude-code. That was true at the PINNED
+  // snapshot 871a788 and is false at the portal working tree 62610eb, where BeeziAgent.CURSOR
+  // exists and AGENT_BY_HEADER_VALUE maps the header value to it. The gate stays OPEN because
+  // source proof is not deployment proof — which is the whole point of this file.
   const gate = fixture.gates.find((g) => g.id === 'cursor-agent-identity');
   assert.ok(gate && gate.status.startsWith('OPEN'));
   assert.ok(gate.closing_evidence.length > 0);
+  assert.match(gate.what, /BeeziAgent\.CURSOR/, 'the corrected claim must stay recorded');
+  assert.match(gate.status, /DEPLOYMENT UNVERIFIED/, 'what is still open here is deployment, not schema');
+  assert.match(
+    fixture.provenance.evidence.agent_resolver,
+    /auth\.beezi-agent\.header\.unrecognised/,
+    'only an absent or genuinely unrecognised header falls back to claude-code',
+  );
 });
 
 test('GATED: break and waiting_subtype are schema-legal but unproven on the deployment', () => {
@@ -351,8 +363,94 @@ test('a timeline timestamp that is not ISO-8601 is rejected', () => {
   assert.ok(validate(payload, fixture.timeline).includes('payload.generated_at: must be an ISO-8601 timestamp'));
 });
 
+// ---------------------------------------------------------------------------
+// The account check-in route — the fixture side of it only
+// ---------------------------------------------------------------------------
+//
+// Plan §4 B2a. This asserts the fixture RECORDS the route correctly AND that
+// lib/account-sync.mjs's CHECKIN_PAYLOAD_FIELDS is a subset of it. The subset assertion was held
+// back while the allowlist still carried the old, wrong names; B2 rewrote it to the server's
+// vocabulary and the assertion now lives at the bottom of this file.
+
+const ACCOUNT = fixture['me/cli-agent/account'];
+
+test('the fixture records the account check-in route, with its own provenance', () => {
+  assert.ok(ACCOUNT, 'a contract test for the check-in payload would otherwise assert against nothing');
+  // Its own block, not the top-level one: this section came from a LATER tree than the pinned
+  // snapshot, and saying so is the only thing that keeps both claims honest.
+  assert.notEqual(ACCOUNT.provenance.backend_commit, fixture.provenance.backend_commit);
+  assert.ok(ACCOUNT.provenance.deployment.startsWith('UNVERIFIED'));
+  assert.deepEqual(ACCOUNT.accepted_properties, [
+    'accountUuid',
+    'email',
+    'subscriptionType',
+    'rateLimitTier',
+    'subscriptionStatus',
+    'keys',
+  ]);
+  // An empty body is a valid call, so nothing at the top level may be required.
+  for (const [key, rule] of Object.entries(ACCOUNT.properties)) {
+    assert.equal(rule.required, undefined, `${key} must stay optional`);
+  }
+});
+
+test('the two properties the backend has not merged yet are marked as targets, not as fact', () => {
+  // accountUuid's 255 bound (plan E5) and subscriptionStatus (plan E3) are in NO commit. Under
+  // forbidNonWhitelisted, emitting subscriptionStatus against an undeployed tenant 400s the whole
+  // check-in — so the marker is load-bearing, not decoration.
+  const targets = Object.entries(ACCOUNT.properties)
+    .filter(([, rule]) => rule.unverified_target === true)
+    .map(([key]) => key);
+  assert.deepEqual(targets.sort(), ['accountUuid', 'subscriptionStatus']);
+  assert.equal(ACCOUNT.properties.accountUuid.maxLength, 255);
+  assert.equal(ACCOUNT.properties.accountUuid.deployed_maxLength, 64, 'what the tree enforces today');
+  assert.equal(ACCOUNT.properties.subscriptionStatus.maxLength, 32);
+  assert.equal(ACCOUNT.provenance.unverified_target_rules.length, 2);
+});
+
+test('the account section validates payloads with the same validator as the report section', () => {
+  // An empty body is valid, a known field is valid, an unknown field is a whole-request 400.
+  assert.deepEqual(validate({}, ACCOUNT, 'checkin'), []);
+  assert.deepEqual(
+    validate({ accountUuid: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T', email: 'a@b.com', subscriptionType: 'pro' }, ACCOUNT, 'checkin'),
+    [],
+  );
+  assert.ok(validate({ plan: 'pro' }, ACCOUNT, 'checkin').includes('checkin: unknown property plan'));
+  assert.ok(
+    validate({ accountUuid: 'x'.repeat(256) }, ACCOUNT, 'checkin').includes('checkin.accountUuid: longer than 255'),
+  );
+  // The nested credential schema resolves through itemSchema, and its fields ARE required.
+  const errors = validate({ keys: [{ kind: 'anthropic_api_key', prefix: 'sk-ant' }] }, ACCOUNT, 'checkin');
+  assert.ok(errors.includes('checkin.keys[0]: missing required property last4'));
+  assert.ok(
+    validate({ keys: [{ kind: 'nope', prefix: 'p', last4: 'abcd' }] }, ACCOUNT, 'checkin')
+      .some((e) => e.startsWith('checkin.keys[0].kind: must be one of')),
+  );
+});
+
 test('the fixture still names the backend commit it was transcribed from', () => {
   assert.equal(fixture.provenance.backend_commit, '871a78842f9b7c20808e23b7bc61765886ce85cb');
   assert.ok(fixture.provenance.deployment.startsWith('UNVERIFIED'));
   assert.ok(Object.keys(fixture.provenance.evidence).length >= 10);
+});
+
+// The subset assertion the fixture exists for (plan §4 B2a). The check-in route runs under the
+// server's global `ValidationPipe({whitelist: true, forbidNonWhitelisted: true})`, so ONE name the
+// DTO does not declare is not a dropped field — it is a 400 for the whole check-in, which
+// `checkInAccount` records as a silent FAILED. A key-name drift must therefore be caught here, in
+// CI, and never on a user's machine.
+test('every field the check-in client may send is one the recorded DTO accepts', () => {
+  const accepted = new Set(ACCOUNT.accepted_properties);
+  for (const field of CHECKIN_PAYLOAD_FIELDS) {
+    assert.ok(accepted.has(field), `${field} is not accepted by POST /api/me/cli-agent/account`);
+  }
+  // And the allowlist is a strict SUBSET: `rateLimitTier` and `keys` are declared server-side but
+  // have no Cursor equivalent, so this client never sends them.
+  assert.equal(CHECKIN_PAYLOAD_FIELDS.includes('rateLimitTier'), false);
+  assert.equal(CHECKIN_PAYLOAD_FIELDS.includes('keys'), false);
+  // A payload built from the allowlist validates against the recorded matrix with the same
+  // validator every other section uses.
+  const payload = {};
+  for (const field of CHECKIN_PAYLOAD_FIELDS) payload[field] = 'x';
+  assert.deepEqual(validate(payload, ACCOUNT, 'checkin'), []);
 });

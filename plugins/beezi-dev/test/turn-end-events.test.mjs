@@ -34,12 +34,17 @@ function tmpHome(t) {
 // BEEZI_API_URL points at a closed port on purpose: the checkpoint these hooks run is gated on this
 // machine's own credentials, and a developer who has actually linked Cursor must not have a test run
 // reach the real Beezi API.
-function runHook(script, payload, home) {
+function runHook(script, payload, home, extraEnv) {
   const result = spawnSync(process.execPath, [script], {
     input: JSON.stringify(payload),
     encoding: 'utf-8',
     timeout: 60_000,
-    env: { ...process.env, BEEZI_CURSOR_HOME: home, BEEZI_API_URL: 'http://127.0.0.1:9/api' },
+    env: {
+      ...process.env,
+      BEEZI_CURSOR_HOME: home,
+      BEEZI_API_URL: 'http://127.0.0.1:9/api',
+      ...(extraEnv == null ? {} : extraEnv),
+    },
   });
   assert.equal(result.error, undefined, `${script}: ${result.error?.message}`);
   // A hook that exits non-zero is reported by Cursor as a failed hook, whatever it managed to write.
@@ -108,6 +113,71 @@ test('the closing boundary extends the session span past the last tool call', (t
   // Without the boundary the session looks like it ended at its last tool call, which under-reports
   // every session whose final turn answered without touching a tool.
   assert.equal(computeSessionTimeline(id).ended_at, new Date(boundary.ts).toISOString());
+});
+
+// ── the stop hook's account check (plan §4 Phase C) ─────────────────────────────────────────────
+//
+// The decision logic is unit-tested in test/stop-account-change.test.mjs, which can move the hook
+// budget and inject a transport. What can only be proved by running the script the way Cursor runs
+// it is the part that actually threatens the user: that reading Cursor's own database on every stop
+// cannot cost them the turn boundary or the checkpoint. Both of the hostile host states below are
+// real — a `cursor-agent`-only machine has no IDE globalStorage at all, and a state.vscdb caught
+// mid-write is not a database.
+//
+// `globalStorageDir()` is relocatable through APPDATA on Windows and XDG_CONFIG_HOME elsewhere;
+// macOS resolves under ~/Library with no override, where the directory simply does not exist on a
+// machine without Cursor — the same ENOENT, by a different route.
+function hostEnv(dir) {
+  return { APPDATA: dir, XDG_CONFIG_HOME: dir };
+}
+
+test('the stop hook completes when Cursor has no globalStorage at all', (t) => {
+  const home = tmpHome(t);
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-no-cursor-'));
+  t.after(() => fs.rmSync(empty, { recursive: true, force: true }));
+
+  runHook(SCRIPTS.stop, { conversation_id: 'conv-no-host', cwd: home }, home, hostEnv(empty));
+
+  // The boundary is written BEFORE the account check and the checkpoint runs after it, so its
+  // presence is the proof that the account read neither threw out of the handler nor exited early.
+  assert.deepEqual(readLines('conv-no-host').map((l) => l.ev), ['stop']);
+  // Nothing was observed, so nothing may have been written about a plan.
+  assert.equal(fs.existsSync(path.join(home, 'billing.json')), false);
+});
+
+test('the stop hook completes when state.vscdb is not a database', (t) => {
+  const home = tmpHome(t);
+  const broken = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-broken-vscdb-'));
+  t.after(() => fs.rmSync(broken, { recursive: true, force: true }));
+  const storage = path.join(broken, 'Cursor', 'User', 'globalStorage');
+  fs.mkdirSync(storage, { recursive: true });
+  fs.writeFileSync(path.join(storage, 'state.vscdb'), 'not a sqlite file at all');
+
+  // The live payload carries `user_email`, and this is the one place it reaches the real script.
+  runHook(
+    SCRIPTS.stop,
+    { conversation_id: 'conv-broken-host', cwd: home, user_email: 'intruder@example.net' },
+    home,
+    hostEnv(broken),
+  );
+
+  assert.deepEqual(readLines('conv-broken-host').map((l) => l.ev), ['stop']);
+  // The refusal in lib/hook-input-cursor.mjs covers the normalizer; this covers the whole process.
+  // Nothing the stop hook writes may carry the address the host put on the payload.
+  const walk = (dir, out) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full, out);
+      else out.push(full);
+    }
+    return out;
+  };
+  for (const file of walk(home, [])) {
+    assert.equal(
+      fs.readFileSync(file, 'utf-8').includes('example.net'), false,
+      `${file} carries the payload email`,
+    );
+  }
 });
 
 test('a payload with no conversation id writes no boundary', (t) => {

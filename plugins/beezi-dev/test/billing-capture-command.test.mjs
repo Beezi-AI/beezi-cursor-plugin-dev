@@ -72,13 +72,13 @@ test('command: --from-cursor captures the plan and the account email determinist
   assert.equal(run1.result.material, true);
 
   const cfg = stored(box);
-  assert.equal(cfg.version, 2);
+  assert.equal(cfg.version, 3);
   assert.equal(cfg.plan, 'pro');
   assert.equal(cfg.selfReported, false);
   assert.equal(cfg.capturedBy, 'login');
   // The account email used to be dropped on the way into the config; without it no later run can
   // tell an account switch from a plan change.
-  assert.deepEqual(cfg.accountAnchor, { email: 'dev@example.com', source: 'cli_config' });
+  assert.deepEqual(cfg.accountAnchor, { email: 'dev@example.com', accountId: null, subscriptionId: null, source: 'cli_config' });
   assert.equal('credentialsExpiresAt' in cfg, false);
   assert.match(run1.stdout, /Beezi billing captured/);
 });
@@ -170,7 +170,7 @@ test('command: --plan corrects a stored tier without relinking and reports the c
   const cfg = stored(box);
   assert.equal(cfg.plan, 'team_premium');
   assert.equal(cfg.selfReported, true);
-  assert.deepEqual(cfg.accountAnchor, { email: 'dev@example.com', source: 'self_report' });
+  assert.deepEqual(cfg.accountAnchor, { email: 'dev@example.com', accountId: null, subscriptionId: null, source: 'self_report' });
 });
 
 test('command: an invalid manual plan is refused and nothing is written', (t) => {
@@ -220,7 +220,7 @@ test('command: a confirmed account switch clears the previous tier instead of in
   const cfg = stored(box);
   assert.equal(cfg.plan, null, 'an old user tier cannot stay on the machine indefinitely');
   assert.equal(cfg.capturedAt, null);
-  assert.deepEqual(cfg.accountAnchor, { email: 'new@example.com', source: 'cli_config' });
+  assert.deepEqual(cfg.accountAnchor, { email: 'new@example.com', accountId: null, subscriptionId: null, source: 'cli_config' });
   assert.match(res.stdout, /different Cursor account/);
 });
 
@@ -310,4 +310,48 @@ test('beezi-refresh offers exactly the seven tiers the script accepts, and no ot
   }
   assert.equal(body.includes('--email'), true);
   assert.match(body, /Never pass `--email`/);
+});
+
+// ── plan §4 B3: the account check-in rides this command, and changes nothing about it ─────────
+
+test('the machine-readable line is still the LAST thing the command prints', (t) => {
+  // The check-in was added AFTER this line on purpose. It is the contract the beezi-refresh skill
+  // parses, and a check-in that could delay it, interleave with it or append to it would break a
+  // skill that reads "the last line".
+  const box = sandbox(t);
+  writeCliConfig(box, { membershipType: 'pro', email: 'seat@example.com' });
+  const run1 = run(box, ['--from-cursor', '--force', '--via', 'refresh']);
+  assert.equal(run1.status, 0);
+  const lines = run1.stdout.split(/\r?\n/).filter((l) => l.trim() !== '');
+  assert.equal(lines.length > 0, true);
+  assert.equal(lines[lines.length - 1].indexOf(RESULT_PREFIX), 0, 'something printed after the contract line');
+  assert.notEqual(run1.result, null);
+  assert.equal(typeof run1.result.outcome, 'string');
+  assert.equal(typeof run1.result.written, 'boolean');
+});
+
+test('an unlinked machine runs the whole command and exits cleanly', (t) => {
+  // The sandbox has no credentials and no tracking cache, which is the state of every machine that
+  // captures a plan before it signs in. The check-in must find nothing to do, print nothing, hold
+  // no socket open and leave the exit status alone.
+  const box = sandbox(t);
+  writeCliConfig(box, { membershipType: 'pro', email: 'seat@example.com' });
+  const res = run(box, ['--from-cursor', '--force', '--via', 'refresh']);
+  assert.equal(res.status, 0, res.stderr);
+  // Node's SQLite experimental warning is the only thing allowed on stderr; a check-in must not
+  // add a line of its own.
+  assert.doesNotMatch(res.stderr, /✗|Error|check-in/i);
+  assert.equal(res.result.outcome, 'changed');
+  assert.equal(stored(box).plan, 'pro');
+  // Nothing about the check-in reaches the user's terminal.
+  assert.doesNotMatch(res.stdout, /check-in|checkin|account-sync/i);
+});
+
+test('the manual --plan path still writes and reports exactly as before', (t) => {
+  const box = sandbox(t);
+  const res = run(box, ['--plan', 'ultra', '--via', 'refresh']);
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.result.outcome, 'changed');
+  assert.equal(res.result.plan, 'ultra');
+  assert.equal(stored(box).plan, 'ultra');
 });

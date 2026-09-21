@@ -13,8 +13,24 @@ import * as hostPaths from './paths-cursor.mjs';
 // (the server turns unmapped plan strings into the discovery query for tiers that shipped after we
 // did) while the next source gets a chance to produce a mapped one.
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine.
-// The exact strings `cursorAuth/stripeMembershipType` emits are a P0 read. This table is one line
+// VERIFIED 2026-09-21 on a real machine — %APPDATA%\Cursor\User\globalStorage\state.vscdb,
+// table ItemTable:
+//
+//   cursorAuth/cachedEmail              => "uliana.gerek@gmail.com"
+//   cursorAuth/stripeMembershipType     => "pro"
+//   cursorAuth/stripeMembershipAuthId   => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
+//   cursorAuth/stripeSubscriptionStatus => "active"
+//   cursorAuth/cachedSignUpType         => "Auth_0"
+//   cursorAuth/cachedScopedProfile      => "{\"displayName\":\"Uliana Herek\"}"
+//   glass.lastSignedInAuthId            => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
+//   adminSettings.cachedAuthId          => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
+//
+// That machine is a PERSONAL `pro` seat, where all three id keys agree. Team-plan divergence —
+// where `stripeMembershipAuthId` is plausibly the paying OWNER while the other two name this seat
+// — is reasoned, not observed, and is still treated as real: see ACCOUNT_ID_KEYS for why guessing
+// the other way is unrecoverable.
+//
+// This table is one line
 // per accepted string so a newly observed value is a one-line addition. Matching is
 // case-insensitive and punctuation-normalized; anything absent maps to 'unknown' and NEVER to a
 // paid tier, because a wrong seat rate is charged silently for every seat, every month.
@@ -75,9 +91,29 @@ export function normalizeCursorPlan(raw) {
   return mapped == null ? 'unknown' : mapped;
 }
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// Verified above, 2026-09-21. These four share one prefix, so one database open answers them all
+// — see readVscdbCandidate.
+const CURSOR_AUTH_PREFIX = 'cursorAuth/';
 const MEMBERSHIP_KEY = 'cursorAuth/stripeMembershipType';
 const EMAIL_KEY = 'cursorAuth/cachedEmail';
+// LOCAL ONLY, and never the account id. On a Team plan this is plausibly the PAYING OWNER's
+// identity rather than this seat's, so it is kept in billing.json purely as a subscription-switch
+// signal — it does not go on the wire until there is a server field that means "the subscription
+// this seat belongs to".
+const MEMBERSHIP_ID_KEY = 'cursorAuth/stripeMembershipAuthId';
+const STATUS_KEY = 'cursorAuth/stripeSubscriptionStatus';
+
+// THE ACCOUNT-ID CHAIN, IN FULL. Two elements, written as a frozen literal rather than an `a || b`
+// fallback expression so there is no third slot for anyone to append MEMBERSHIP_ID_KEY into later.
+//
+// Both entries are PER-SEAT identities; the membership id is deliberately absent. On a Team machine
+// whose keys diverge, a seat whose signed-in key happened to be missing would fall through to the
+// owner's id, and every member would then upsert the same `account_uuid`. The server's
+// late-arriving-id merge DELETES the row it absorbs, and no endpoint undoes it — one such check-in
+// collapses a whole team into a single account, permanently. When neither key answers, the account
+// id stays null and the field is omitted downstream: that costs an email-only provisional row,
+// which the next good check-in absorbs cleanly. Absent is cheap; shared is unrecoverable.
+const ACCOUNT_ID_KEYS = Object.freeze(['glass.lastSignedInAuthId', 'adminSettings.cachedAuthId']);
 
 // state.vscdb values are stored as JSON, but a bare string has been observed too; accept both.
 function unwrapScalar(value) {
@@ -92,6 +128,34 @@ function unwrapScalar(value) {
   } catch {
     return trimmed;
   }
+}
+
+// An account or subscription identifier, VERBATIM. Trimmed, required non-empty, and nothing else:
+// no splitting on `|`, no stripping of the `auth0|` / `samlp|` provider prefix, and above all NO
+// LENGTH CAP. A truncated id is a wrong id, and a wrong id mints a phantom subscription row that
+// never reconciles with the real one. Auth0 enterprise connections mint
+// `samlp|<connection>|<nameId>` where the nameId is usually an email address, which runs well past
+// the 64 characters the server column holds today; the answer to that is widening the column, not
+// capping what we read. This is also why ids never travel through billing-capture's `safeField`,
+// whose 64-character ceiling would silently drop exactly the SSO seats this feature targets.
+function identifierOrNull(value) {
+  const unwrapped = unwrapScalar(value);
+  if (typeof unwrapped !== 'string') return null;
+  const trimmed = unwrapped.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+// Stripe's subscription status, bounded to one lowercase token. It is EVIDENCE, never a gate: a
+// status we have never seen — or one Stripe adds next year — normalizes to null and the plan
+// resolves exactly as it would have. Suppressing a plan because its status word was unfamiliar
+// would price a paying seat at zero on the strength of a spelling.
+const STATUS_TOKEN = /^[a-z_]{1,32}$/;
+
+function statusOrNull(value) {
+  const unwrapped = unwrapScalar(value);
+  if (typeof unwrapped !== 'string') return null;
+  const token = unwrapped.trim().toLowerCase();
+  return STATUS_TOKEN.test(token) ? token : null;
 }
 
 // Default paths come from lib/paths-cursor.mjs, imported statically. This was a top-level
@@ -110,25 +174,41 @@ function hostPath(fnName) {
   }
 }
 
+// The raw stored value for one exact key out of a readKeys result, or null. A null/absent result
+// set and a key that is simply not there are the same answer here: nothing to unwrap.
+function valueAt(rows, key) {
+  if (!Array.isArray(rows)) return null;
+  const hit = rows.find((r) => r.key === key);
+  return hit ? hit.value : null;
+}
+
 function readVscdbCandidate(deps) {
   const dbFile = deps.stateVscdbFile !== undefined ? deps.stateVscdbFile : hostPath('stateVscdbFile');
   if (!dbFile) return null;
   const read = deps.readKeys == null ? ((file, prefix) => readKeys(file, prefix, deps)) : deps.readKeys;
 
-  const rows = read(dbFile, MEMBERSHIP_KEY);
-  if (!Array.isArray(rows)) return null; // null = could not look at all
-  const membership = rows.find((r) => r.key === MEMBERSHIP_KEY);
-  const raw = membership ? unwrapScalar(membership.value) : null;
+  // Every readKeys call OPENS the database, and can fall through to copying it when Cursor holds a
+  // lock, so the four cursorAuth/ keys are fetched as ONE prefix scan. Only the id keys, which sit
+  // under different prefixes, cost an open of their own — and the second one only when the first
+  // came back empty.
+  const authRows = read(dbFile, CURSOR_AUTH_PREFIX);
+  if (!Array.isArray(authRows)) return null; // null = could not look at all
+  const raw = unwrapScalar(valueAt(authRows, MEMBERSHIP_KEY));
   if (raw === null) return null;
 
-  let email = null;
-  const emailRows = read(dbFile, EMAIL_KEY);
-  if (Array.isArray(emailRows)) {
-    const hit = emailRows.find((r) => r.key === EMAIL_KEY);
-    email = hit ? unwrapScalar(hit.value) : null;
+  const email = unwrapScalar(valueAt(authRows, EMAIL_KEY));
+  const subscriptionId = identifierOrNull(valueAt(authRows, MEMBERSHIP_ID_KEY));
+  const status = statusOrNull(valueAt(authRows, STATUS_KEY));
+
+  // First key that answers wins; when neither does, the id stays null. The loop IS the whole
+  // chain — there is nothing after it, by design (see ACCOUNT_ID_KEYS).
+  let accountId = null;
+  for (const key of ACCOUNT_ID_KEYS) {
+    accountId = identifierOrNull(valueAt(read(dbFile, key), key));
+    if (accountId !== null) break;
   }
 
-  return { rawPlan: raw, source: AccountSource.STATE_VSCDB, email };
+  return { rawPlan: raw, source: AccountSource.STATE_VSCDB, email, accountId, subscriptionId, status };
 }
 
 // TODO(P0): unverified — Cursor not installed on the authoring machine.
@@ -170,18 +250,24 @@ function readCliCandidate(deps) {
       break;
     }
   }
-  return { rawPlan: raw, source: AccountSource.CLI_CONFIG, email };
+  // The CLI config has never been observed to carry an identity of any kind, and the three
+  // identity fields are explicitly null rather than absent so a caller reading them never has to
+  // distinguish "this source cannot answer" from "this source was not consulted".
+  return { rawPlan: raw, source: AccountSource.CLI_CONFIG, email, accountId: null, subscriptionId: null, status: null };
 }
 
 function selfReportCandidate(deps) {
   const raw = deps.selfReportedPlan;
   if (typeof raw !== 'string' || raw.trim() === '') return null;
-  return { rawPlan: raw.trim(), source: AccountSource.SELF_REPORT, email: null };
+  // A user typing their tier tells us nothing about who they are; every identity field is null.
+  return { rawPlan: raw.trim(), source: AccountSource.SELF_REPORT, email: null, accountId: null, subscriptionId: null, status: null };
 }
 
-// { plan, rawPlan, source, email } for the highest-authority source that produced a value, or null
-// when no source did. `plan` is always one of CURSOR_PLANS; `rawPlan` keeps the original string even
-// when it did not map, so an unrecognized tier is discoverable server-side instead of vanishing.
+// { plan, rawPlan, source, email, accountId, subscriptionId, status } for the highest-authority
+// source that produced a value, or null when no source did. `plan` is always one of CURSOR_PLANS;
+// `rawPlan` keeps the original string even when it did not map, so an unrecognized tier is
+// discoverable server-side instead of vanishing. The three identity fields are always present and
+// are null for every source but state.vscdb, which is the only one that holds an identity at all.
 export function readCursorAccount(deps = {}) {
   const candidates = [];
   for (const read of [readVscdbCandidate, readCliCandidate, selfReportCandidate]) {

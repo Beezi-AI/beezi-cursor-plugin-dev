@@ -25,6 +25,7 @@ import { runLoginPreflight, describePreflightBlock } from './login-preflight.mjs
 // consent-gated on the far side: with correlation off — the default — it is a single small file
 // read that answers `no-consent` before any network call, so an opted-out machine pays nothing.
 import { bindInstallation } from './telemetry.mjs';
+import { syncAccountIfNeeded, CheckInVia } from './account-checkin.mjs';
 
 // The browser PKCE flow that links this machine. It lives in lib because two very different
 // callers need it: the CLI script, which prints as it goes, and the MCP bridge's `beezi_login`
@@ -190,6 +191,35 @@ function ensureReporting(d) {
   try { d.ensureInstalled(); } catch { /* best-effort */ }
 }
 
+// Tell the portal which Cursor account and plan this machine is on, now that there is a token
+// (plan §4 B3).
+//
+// FORCED. A login is the one moment at which the machine's BEEZI identity may have changed while
+// its CURSOR identity did not, and the check-in's fingerprint knows nothing about the first: a
+// fresh sign-in re-scopes the heartbeat state file, but a re-login as the SAME Beezi account lands
+// on the previous identity's state file, finds an unchanged hash, and answers SKIPPED. That is
+// precisely the case the force flag exists for — and re-running the login skill is what a user does
+// when analytics are not arriving, so this is the run that must actually send.
+//
+// `who` is handed over rather than left to the tracking cache: `recordWhoami` is best-effort at
+// both call sites below, so a cache write that silently failed would otherwise leave the scope
+// unbuildable and the check-in unsent on the very run that had a fresh, valid answer in hand.
+//
+// Bounded and silent, exactly like `bindDiagnostics` above it: a sign-in that has already stored
+// credentials must never be reported as failed — or delayed past its own budget — because an
+// OPTIONAL check-in did not answer. `syncAccountIfNeeded` never throws; the wrapper is belt to its
+// braces and costs nothing.
+async function checkInAccount(d, token, who) {
+  if (typeof token !== 'string' || token === '') return;
+  try {
+    await d.syncAccountIfNeeded(
+      token,
+      { force: true, via: CheckInVia.LOGIN },
+      { who: who == null || who.valid !== true ? null : who, tracking: null },
+    );
+  } catch { /* telemetry may never change an authentication outcome */ }
+}
+
 // Link this machine, or report that it already is.
 //
 // `onStep` receives progress events instead of them being printed: `{ type: 'already-linked',
@@ -199,7 +229,7 @@ export async function performLogin({ onStep = () => {}, deps = {} } = {}) {
   const d = {
     discover, registerClient, exchangeCode, startLoopback, whoami, linkStatus,
     getCredentials, setCredentials, openBrowser, pkcePair,
-    ensureInstalled, runLoginPreflight, bindInstallation,
+    ensureInstalled, runLoginPreflight, bindInstallation, syncAccountIfNeeded,
     ...deps,
   };
   const base = apiBase();
@@ -222,6 +252,10 @@ export async function performLogin({ onStep = () => {}, deps = {} } = {}) {
       // The login flow continues into plan capture and the history backfill even when already
       // linked — refresh the cached tracking policy so those steps act on current state.
       try { recordWhoami(status.who, existing.client_id); } catch { /* best-effort */ }
+      // The already-linked branch checks in too, for the same reason it re-binds diagnostics and
+      // re-installs the hooks: this is the branch a user lands on when they re-run login to fix a
+      // machine that is linked and reporting nothing.
+      await checkInAccount(d, existing.access_token, status.who);
       const result = { type: 'already-linked', account: status.account, apiBase: status.apiBase };
       onStep(result);
       return result;
@@ -356,6 +390,7 @@ export async function performLogin({ onStep = () => {}, deps = {} } = {}) {
   // not merely authenticated. See ensureReporting.
   ensureReporting(d);
   await bindDiagnostics(d, tokens.access_token);
+  await checkInAccount(d, tokens.access_token, who);
   // apiBase travels with every outcome, not just the already-linked one: a machine signed in
   // against the wrong BEEZI_API_URL is exactly the case this field exists to make visible.
   const account = who == null ? null : (who.name || who.email || null);

@@ -37,9 +37,10 @@ runHook({
     import('../lib/sidecar-events.mjs'),
     import('../lib/sidecar.mjs'),
     import('../lib/checkpoint.mjs'),
+    import('../lib/stop-account-change.mjs'),
   ]),
-  handle: (mods, ctx) => {
-    const [events, sidecar, engine] = mods;
+  handle: async (mods, ctx) => {
+    const [events, sidecar, engine, account] = mods;
 
     // The turn's generation, with the model and the token counts Cursor puts on this payload and on
     // no other event this plugin registers. Without it a turn that ran no tools — a plain question,
@@ -65,6 +66,22 @@ runHook({
     //   - `runCheckpoint` may reject, be budget-truncated or be killed at the host's hook deadline,
     //     and a boundary written after it would then be lost for good.
     sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd({ ev: 'stop' }, ctx.cwd));
+
+    // Cursor subscription change detection (plan §4 Phase C). Reads Cursor's own account tuple out
+    // of state.vscdb, compares it against billing.json's anchor and, when something moved,
+    // reconciles the record and sends one forced, inline, budget-bounded check-in. The steady state
+    // — nothing moved — is a single small read and no writes at all. See lib/stop-account-change.mjs
+    // for why this is a plain read rather than an mtime tripwire, why the check-in is not queued,
+    // and what happens to `ctx.payload.user_email` (nothing that outlives one comparison).
+    //
+    // AFTER the boundary append and BEFORE the checkpoint, and wrapped in a try/catch of its own.
+    // `runStopAccountCheck` already contains every failure internally, so this is the second fence
+    // rather than the first: an await that threw out of `handle` would reach runHook's catch as
+    // `hook_crash` and the checkpoint — the thing the user is actually here for — would never run.
+    // A subscription reading one turn late is a cost nobody notices; a lost turn of analytics is.
+    try {
+      await account.runStopAccountCheck(ctx);
+    } catch { /* the user's checkpoint is not forfeit to an account read */ }
 
     // Turn-end: emit the whole-session activity timeline alongside the segment checkpoint. The
     // timeline rides on `stop` rather than on `afterAgentResponse` / `afterAgentThought`, which are

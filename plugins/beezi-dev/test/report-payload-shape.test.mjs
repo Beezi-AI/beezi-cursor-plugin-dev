@@ -22,6 +22,11 @@ const DTO_PROPERTIES = new Set([
   'session_name', 'billing_source', 'subscription_type', 'rate_limit_tier', 'subscription_plan',
   'third_party_provider', 'timezone', 'started_at', 'ended_at', 'code_changes', 'operations',
   'is_subagent', 'agent_id', 'agent_type', 'agent_name', 'spawn_depth',
+  // Plan §4 D. The session→subscription identity pair. Both were already declared on
+  // SessionReportRequestDto before this client emitted either, which is what makes filling them a
+  // client-only change to a frozen route. `account_uuid` is the SEAT id; the subscription id the
+  // anchor also holds has no wire field and must never appear here.
+  'account_uuid', 'account_email',
 ]);
 
 // Every field the DTO marks @IsInt() @Min(0). A float or a NaN is a 400 exactly like an unknown key.

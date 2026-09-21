@@ -26,7 +26,9 @@ import { computeSessionTimeline, postSessionTimeline } from './session-timeline-
 import { cursorVersionAt } from './sidecar-events.mjs';
 import { planAttributionRuns } from './attribution-cursor.mjs';
 import { detectBillingSource } from './billing.mjs';
-import { readBillingConfig, subscriptionReportFields, thirdPartyReportFields } from './billing-config.mjs';
+import {
+  readBillingConfig, subscriptionReportFields, thirdPartyReportFields, normalizeAccountAnchor,
+} from './billing-config.mjs';
 import { resolveSessionName } from './session-name-cursor.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
@@ -319,6 +321,77 @@ function modelsFrom(entries) {
 // Enforced here rather than trusted: an over-long string is a validation failure, and a validation
 // failure takes the WHOLE report with it, not the field.
 const MAX_AGENT_NAME_CHARS = 200;
+
+// ── who this session belongs to (plan §4 D) ───────────────────────────────────────────────────
+//
+// The two identity keys the backend resolves a session to a subscription row with:
+//
+//     account_uuid   <- accountAnchor.accountId    (this SEAT's signed-in Cursor identity)
+//     account_email  <- accountAnchor.email
+//
+// Both are already declared on `SessionReportRequestDto`, so the frozen /sessions/report route does
+// not change — this only starts filling two columns that were always there and always null.
+//
+// WHY THIS IS NOT PART OF `subscriptionReportFields`. That helper takes `billingSource` as its first
+// argument and returns `{}` for a source `isPlanBearing` rejects, because WHICH PLAN THE SEAT IS ON
+// is a fact about who pays. WHICH SEAT THIS IS is not: the account is the same account whether the
+// window was covered by the seat's included allowance or by on-demand credits, and it would still be
+// the same account on a source that pays for no plan at all. Folding these two keys into a
+// plan-bearing gate would mean "we spent credits this window" silently also meant "we will not say
+// whose session this was", which is exactly the resolution the server needs most.
+//
+// Measured, so the argument above is not only reasoning: `detectBillingSource` in lib/billing.mjs can
+// only ever return SUBSCRIPTION or CURSOR_CREDITS for Cursor, and `PLAN_BEARING` contains both — so
+// on THIS fork there is no source today that would discriminate the two helpers. The separation is
+// held on the coupling argument and on the sibling forks, where THIRD_PARTY and OPENAI_API_KEY are
+// reachable and are precisely the sources that would drop an identity they still have.
+//
+// The anchor is read through `normalizeAccountAnchor` rather than off the raw JSON: billing.json is
+// a file on disk that a rolled-back client, a half-finished write or a hand edit can leave in any
+// shape, and an anchor whose `source` is missing cannot say which read produced the identity — that
+// is the pairing the reconciler must never invent, and it must not be invented on the wire either.
+//
+// Ids are never TRUNCATED. An Auth0 enterprise connection mints `samlp|<connection>|<nameId>` well
+// past 64 chars, and a truncated id is not a shorter id, it is a WRONG id that mints a phantom
+// subscription row nothing will ever match again. Contrast `agent_name` above, which IS capped —
+// free text losing its tail costs a prettier label.
+//
+// But an over-length id is OMITTED rather than emitted, until the widening migration (plan §4 E5)
+// is deployed. The deployed DTO still declares `@MaxLength(64)` on `account_uuid`, and a length
+// violation is not a field-level failure: the global ValidationPipe rejects the WHOLE request, so
+// one SSO seat would lose every session report it ever sends — all its tokens, cost, timeline and
+// repo attribution — not merely its account column. "Rejected loudly" is only recoverable when the
+// rejection is small; this one is total, and it lands on Team/SSO seats, which is exactly the
+// population E5 exists to serve.
+//
+// Omission is not mis-attribution. A report with no `account_uuid` falls through to the server's
+// email-anchored resolution and lands on a provisional row, which the next check-in that carries a
+// short-enough id absorbs — sessions, credentials and links relinked, provisional row deleted. So
+// the degraded path is "attributed a little later", never "attributed to the wrong subscription".
+//
+// Delete this cap when E5 is deployed and the fixture's `deployed_maxLength` for `account_uuid`
+// reads 255. The plan's §6 ordering (migration, verify every tenant, then code) is what retires it.
+const WIRE_ACCOUNT_ID_MAX = 64;
+
+function accountReportFields(config) {
+  if (!config) return {};
+  const anchor = normalizeAccountAnchor(config.accountAnchor);
+  if (anchor == null) return {};
+  // Same omit-never-null rule as `subscriptionReportFields`, for the same reason: absent says "I
+  // have nothing to say about this column", null says "set this column to null". A machine whose
+  // Cursor has not cached an address must not blank an email the backend learned from the check-in.
+  const fields = {};
+  if (anchor.accountId != null && anchor.accountId.length <= WIRE_ACCOUNT_ID_MAX) {
+    fields.account_uuid = anchor.accountId;
+  }
+  if (anchor.email != null) fields.account_email = anchor.email;
+  // `anchor.subscriptionId` is READ here and deliberately NOT emitted, under any key. It is the
+  // subscription the seat belongs to, and on a Team plan it is the PAYING OWNER's id — putting it on
+  // the wire would upsert every member of a team onto one account row, churn that row's email to
+  // whoever reported last, and absorb-and-DELETE each member's own row (plan §3.1). It stays local,
+  // as a switch signal for `compareAnchors`, until a server field exists that means what it means.
+  return fields;
+}
 
 // The `models` list for a SUBAGENT segment: the parent's model identity and billing pool, with every
 // count zeroed.
@@ -831,7 +904,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // spend (seat allowance vs. on-demand credits), so there is nothing to detect until the pools are
     // known. The other two forks read it from the environment and can resolve it earlier.
     const billingSource = detectBillingSource({ usedCredits: usedCredits(delta.entries) });
-    const subscriptionFields = subscriptionReportFields(billingSource, readBillingConfig());
+    // One read, two answers: the plan fields (gated on the billing source) and the identity fields
+    // (not gated on it — see `accountReportFields`). Reading billing.json twice would let a
+    // concurrent `reconcilePlan` land between them and emit a plan and an account from two
+    // different observations of the machine.
+    const billingConfig = readBillingConfig();
+    const subscriptionFields = subscriptionReportFields(billingSource, billingConfig);
+    const accountFields = accountReportFields(billingConfig);
     const thirdPartyFields = thirdPartyReportFields(billingSource);
 
     // A window of sidecar lines none of which the parser recognises is a writer/reader schema
@@ -1017,6 +1096,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           duration_sec: Math.max(0, Math.round((delta.duration_ms == null ? 0 : delta.duration_ms) / 1000)),
           billing_source: billingSource,
           ...subscriptionFields,
+          ...accountFields,
           ...thirdPartyFields,
           session_name: sessionName,
           ...(timezone ? { timezone } : {}),
@@ -1132,6 +1212,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
             duration_sec: durationSec,
             billing_source: billingSource,
             ...subscriptionFields,
+            ...accountFields,
             ...thirdPartyFields,
             session_name: sessionName,
             ...(timezone ? { timezone } : {}),

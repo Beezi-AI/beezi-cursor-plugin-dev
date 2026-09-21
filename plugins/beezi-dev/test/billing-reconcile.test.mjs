@@ -41,14 +41,14 @@ function v1(overrides) {
 
 // ── schema + migration ────────────────────────────────────────────────────────────────────────
 
-test('one schema version constant, value 2', () => {
-  assert.equal(BILLING_SCHEMA_VERSION, 2);
+test('one schema version constant, value 3', () => {
+  assert.equal(BILLING_SCHEMA_VERSION, 3);
 });
 
 test('v1 migration preserves capturedAt and stamps migratedAt separately', () => {
   const { record, migrated } = migrateBillingRecord(v1(), { now: NOW });
   assert.equal(migrated, true);
-  assert.equal(record.version, 2);
+  assert.equal(record.version, 3);
   assert.equal(record.capturedAt, '2025-01-01T00:00:00.000Z', 'observation freshness must survive a schema rewrite');
   assert.equal(record.migratedAt, NOW_ISO);
   assert.equal(record.identityCheckedAt, null);
@@ -62,12 +62,70 @@ test('migration drops the credential-expiry staleness input', () => {
   assert.equal('credentialsExpiresAt' in record, false);
 });
 
-test('a v2 record is not re-migrated and keeps its stamps', () => {
-  const v2 = migrateBillingRecord(v1(), { now: NOW }).record;
-  const again = migrateBillingRecord(v2, { now: NOW + 10 * DAY });
+test('a current-version record is not re-migrated and keeps its stamps', () => {
+  const current = migrateBillingRecord(v1(), { now: NOW }).record;
+  const again = migrateBillingRecord(current, { now: NOW + 10 * DAY });
   assert.equal(again.migrated, false);
   assert.equal(again.record.migratedAt, NOW_ISO);
   assert.equal(again.record.capturedAt, '2025-01-01T00:00:00.000Z');
+});
+
+// A v2 record on disk is a machine that has been running this plugin and has real history. The
+// v2 -> v3 step ADDS three identity fields and must touch nothing else. The stamp assertions are
+// the point of this test, not decoration: reusing the v1 branch, which nulls `identityCheckedAt`
+// and `lastPlanReadAttemptAt` because a v1 record never had them, would silently erase two records
+// of things that actually happened — and a migration test that only checked the new fields would
+// stay green while it did.
+function v2(overrides) {
+  return {
+    version: 2,
+    source: 'cursor_credits',
+    plan: 'ultra',
+    subscriptionType: 'Ultra',
+    rateLimitTier: 'tier-x',
+    capturedAt: '2026-05-20T00:00:00.000Z',
+    identityCheckedAt: '2026-05-21T00:00:00.000Z',
+    lastPlanReadAttemptAt: '2026-05-22T00:00:00.000Z',
+    migratedAt: '2026-01-01T00:00:00.000Z',
+    accountAnchor: { email: 'dev@example.com', source: 'state_vscdb' },
+    capturedBy: 'session-start',
+    selfReported: true,
+    ...overrides,
+  };
+}
+
+test('v2 -> v3 adds the identity fields as null and preserves everything else', () => {
+  const { record, migrated } = migrateBillingRecord(v2(), { now: NOW });
+  assert.equal(migrated, true);
+  assert.equal(record.version, 3);
+
+  // The three new fields exist and claim nothing.
+  assert.equal(record.subscriptionStatus, null);
+  assert.equal(record.accountAnchor.accountId, null);
+  assert.equal(record.accountAnchor.subscriptionId, null);
+
+  // Everything a v2 record already knew survives, stamps included.
+  assert.equal(record.source, 'cursor_credits');
+  assert.equal(record.plan, 'ultra');
+  assert.equal(record.subscriptionType, 'Ultra');
+  assert.equal(record.rateLimitTier, 'tier-x');
+  assert.equal(record.capturedAt, '2026-05-20T00:00:00.000Z');
+  assert.equal(record.identityCheckedAt, '2026-05-21T00:00:00.000Z', 'a real identity check must not be erased by a schema rewrite');
+  assert.equal(record.lastPlanReadAttemptAt, '2026-05-22T00:00:00.000Z', 'nor the back-off stamp that keeps the host read off every session start');
+  assert.equal(record.accountAnchor.email, 'dev@example.com');
+  assert.equal(record.accountAnchor.source, 'state_vscdb');
+  assert.equal(record.capturedBy, 'session-start');
+  assert.equal(record.selfReported, true);
+
+  // Only the rewrite stamp moves, and a second pass is a no-op.
+  assert.equal(record.migratedAt, NOW_ISO);
+  assert.equal(migrateBillingRecord(record, { now: NOW + 10 * DAY }).migrated, false);
+});
+
+test('a v2 record with no anchor migrates without inventing one', () => {
+  const { record } = migrateBillingRecord(v2({ accountAnchor: null }), { now: NOW });
+  assert.equal(record.accountAnchor, null);
+  assert.equal(record.subscriptionStatus, null);
 });
 
 test('migration is tolerant of junk', () => {
@@ -93,8 +151,8 @@ test('normalizeAccountEmail lowercases, trims and rejects malformed values', () 
 });
 
 test('an anchor always carries a source; a malformed email becomes unknown identity', () => {
-  assert.deepEqual(normalizeAccountAnchor({ email: 'A@b.com', source: 'state_vscdb' }), { email: 'a@b.com', source: 'state_vscdb' });
-  assert.deepEqual(normalizeAccountAnchor({ email: 'garbage', source: 'cli_config' }), { email: null, source: 'cli_config' });
+  assert.deepEqual(normalizeAccountAnchor({ email: 'A@b.com', source: 'state_vscdb' }), { email: 'a@b.com', accountId: null, subscriptionId: null, source: 'state_vscdb' });
+  assert.deepEqual(normalizeAccountAnchor({ email: 'garbage', source: 'cli_config' }), { email: null, accountId: null, subscriptionId: null, source: 'cli_config' });
   assert.equal(normalizeAccountAnchor(null), null);
   assert.equal(normalizeAccountAnchor({ email: 'a@b.com' }), null, 'no source is not an anchor');
 });
@@ -108,6 +166,85 @@ test('unknown identity is neither a match nor a switch', () => {
   assert.equal(compareAnchors(none, a), IdentityMatch.UNKNOWN);
   assert.equal(compareAnchors(a, none), IdentityMatch.UNKNOWN);
   assert.equal(compareAnchors(a, null), IdentityMatch.UNKNOWN);
+});
+
+// ── id-first identity ─────────────────────────────────────────────────────────────────────────
+
+const idAnchor = (over) => ({ email: null, accountId: null, subscriptionId: null, source: 'state_vscdb', ...over });
+
+test('an equal accountId is a match no matter what the email says', () => {
+  // Cursor's id is opaque and does not move when a user renames their address; treating a rename
+  // as a hand-over would blank a perfectly good plan.
+  const before = idAnchor({ email: 'old@example.com', accountId: 'auth0|seat_1' });
+  const after = idAnchor({ email: 'new@example.com', accountId: 'auth0|seat_1' });
+  assert.equal(compareAnchors(after, before), IdentityMatch.MATCH);
+});
+
+test('a different accountId is a switch no matter what the email says', () => {
+  const before = idAnchor({ email: 'shared@example.com', accountId: 'auth0|seat_1' });
+  const after = idAnchor({ email: 'shared@example.com', accountId: 'auth0|seat_2' });
+  assert.equal(compareAnchors(after, before), IdentityMatch.SWITCH);
+});
+
+// The event this whole feature exists to notice: one seat moving between subscriptions.
+test('the same seat on a changed subscription is a switch', () => {
+  const before = idAnchor({ accountId: 'auth0|seat_1', subscriptionId: 'sub_a' });
+  const after = idAnchor({ accountId: 'auth0|seat_1', subscriptionId: 'sub_b' });
+  assert.equal(compareAnchors(after, before), IdentityMatch.SWITCH);
+});
+
+// LEARNING an id is not the seat moving. Every record written before v3 stores
+// `subscriptionId: null`, so if `null -> something` counted as a switch, the first run after this
+// upgrade would take the switch branch on every installed machine — and any machine whose plan
+// happened to read `unknown` that moment would have its stored plan destroyed by
+// `blankedForSwitch`. Data loss, once, everywhere, on upgrade day.
+test('learning a subscriptionId for the first time is NOT a switch', () => {
+  const before = idAnchor({ accountId: 'auth0|seat_1', subscriptionId: null });
+  const after = idAnchor({ accountId: 'auth0|seat_1', subscriptionId: 'sub_a' });
+  assert.equal(compareAnchors(after, before), IdentityMatch.MATCH);
+  assert.equal(compareAnchors(before, after), IdentityMatch.MATCH, 'and losing sight of it is not one either');
+});
+
+test('with an id absent on either side the comparison falls back to email', () => {
+  const stored = idAnchor({ email: 'dev@example.com' });
+  const withId = idAnchor({ email: 'dev@example.com', accountId: 'auth0|seat_1' });
+  const other = idAnchor({ email: 'other@example.com', accountId: 'auth0|seat_1' });
+  assert.equal(compareAnchors(withId, stored), IdentityMatch.MATCH, 'one side has no id: emails decide');
+  assert.equal(compareAnchors(other, stored), IdentityMatch.SWITCH);
+  assert.equal(compareAnchors(idAnchor({ accountId: 'auth0|seat_1' }), stored), IdentityMatch.UNKNOWN,
+    'no id on one side and no email on the other is no identity at all');
+});
+
+test('a newly learned accountId is persisted, not recomputed and discarded', () => {
+  // `anchorsEqual` drives `persist` in the KEPT branch. If it ignored the ids, the id would be
+  // read on every run and written on none.
+  const first = reconcilePlan(VSCDB('pro', 'dev@example.com'), null, { now: NOW }).record;
+  assert.equal(first.accountAnchor.accountId, null);
+  const withId = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_a' };
+  const r = reconcilePlan(withId, first, { now: NOW + 60 * 1000 });
+  assert.equal(r.outcome, ReconcileOutcome.KEPT);
+  assert.equal(r.persist, true, 'inside the recheck window, but the anchor genuinely changed');
+  assert.equal(r.record.accountAnchor.accountId, 'auth0|seat_1');
+  assert.equal(r.record.accountAnchor.subscriptionId, 'sub_a');
+});
+
+test('a seat that moves subscription is reconciled as a switch', () => {
+  const before = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_a' };
+  const first = reconcilePlan(before, null, { now: NOW }).record;
+  const after = { ...VSCDB('team', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_b' };
+  const r = reconcilePlan(after, first, { now: NOW + DAY });
+  assert.equal(r.outcome, ReconcileOutcome.CHANGED);
+  assert.equal(r.record.plan, 'team');
+  assert.equal(r.record.accountAnchor.subscriptionId, 'sub_b');
+});
+
+test('the subscription status rides along with the plan and is never inherited', () => {
+  const observed = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', status: 'active' };
+  const first = reconcilePlan(observed, null, { now: NOW }).record;
+  assert.equal(first.subscriptionStatus, 'active');
+  // A later read that saw no status says so, rather than replaying a stale 'active'.
+  const quiet = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', status: null };
+  assert.equal(reconcilePlan(quiet, first, { now: NOW + 10 * DAY }).record.subscriptionStatus, null);
 });
 
 // ── staleness / due ───────────────────────────────────────────────────────────────────────────
@@ -149,7 +286,7 @@ test('parseArgs reads --force and --email and deprecates --expires-at', () => {
 
 test('observationFromArgs validates the seven-tier allowlist and normalizes the email', () => {
   const obs = observationFromArgs({ plan: 'pro_plus', email: ' Dev@Example.com ', via: 'cursor-command' });
-  assert.deepEqual(obs, { plan: 'pro_plus', rawPlan: 'pro_plus', rateLimitTier: null, source: 'self_report', email: 'dev@example.com', via: 'cursor-command' });
+  assert.deepEqual(obs, { plan: 'pro_plus', rawPlan: 'pro_plus', rateLimitTier: null, source: 'self_report', email: 'dev@example.com', accountId: null, subscriptionId: null, status: null, via: 'cursor-command' });
   assert.throws(() => observationFromArgs({ plan: 'plus' }), /Unknown plan/);
   assert.equal(observationFromArgs({}), null);
 });
@@ -160,7 +297,35 @@ test('observationFromArgs refuses a token-like subscription type', () => {
 
 test('observationFromAccount carries the account email and source through', () => {
   const obs = observationFromAccount({ plan: 'ultra', rawPlan: 'Ultra', source: 'state_vscdb', email: 'Dev@Example.com' }, 'login');
-  assert.deepEqual(obs, { plan: 'ultra', rawPlan: 'Ultra', rateLimitTier: null, source: 'state_vscdb', email: 'dev@example.com', via: 'login' });
+  assert.deepEqual(obs, { plan: 'ultra', rawPlan: 'Ultra', rateLimitTier: null, source: 'state_vscdb', email: 'dev@example.com', accountId: null, subscriptionId: null, status: null, via: 'login' });
+});
+
+test('observationFromAccount carries the whole identity tuple through', () => {
+  const obs = observationFromAccount({
+    plan: 'team_premium', rawPlan: 'Teams Premium', source: 'state_vscdb', email: 'seat@example.com',
+    accountId: 'auth0|seat_1', subscriptionId: 'auth0|owner_9', status: 'active',
+  }, 'session-start');
+  assert.equal(obs.accountId, 'auth0|seat_1');
+  assert.equal(obs.subscriptionId, 'auth0|owner_9');
+  assert.equal(obs.status, 'active');
+});
+
+// `safeField` refuses anything over 64 characters, and an SSO id is routinely longer than that.
+// Routing ids through it would drop exactly the Team/SSO seats this feature exists for, so they
+// take their own path — this asserts the long id is still there after the observation is built.
+test('an over-64-character SSO id is not dropped on its way into an observation', () => {
+  const samlpId = `samlp|${new Array(101).join('c')}|${new Array(82).join('u')}@example.com`;
+  const obs = observationFromAccount({ plan: 'team', rawPlan: 'team', source: 'state_vscdb', email: null, accountId: samlpId, subscriptionId: null, status: null }, 'login');
+  assert.equal(obs.accountId, samlpId);
+  assert.equal(obs.accountId.length, 200);
+  assert.equal(reconcilePlan(obs, null, { now: NOW }).record.accountAnchor.accountId, samlpId, 'and it reaches billing.json whole');
+});
+
+test('an observation from an account with no identity keys claims none', () => {
+  const obs = observationFromAccount({ plan: 'pro', rawPlan: 'pro', source: 'state_vscdb', email: 'a@b.com' }, null);
+  assert.equal(obs.accountId, null);
+  assert.equal(obs.subscriptionId, null);
+  assert.equal(obs.status, null);
 });
 
 test('an unsafe raw plan from the host falls back to the normalized plan instead of throwing', () => {
@@ -193,7 +358,7 @@ test('no observation still persists a pending v1 migration', () => {
   const r = reconcilePlan(null, v1(), { now: NOW });
   assert.equal(r.outcome, ReconcileOutcome.NO_SOURCE);
   assert.equal(r.persist, true);
-  assert.equal(r.record.version, 2);
+  assert.equal(r.record.version, 3);
   assert.equal(r.record.capturedAt, '2025-01-01T00:00:00.000Z');
 });
 
@@ -201,9 +366,9 @@ test('a first deterministic capture fills the plan', () => {
   const r = reconcilePlan(VSCDB('pro', 'dev@example.com'), null, { now: NOW });
   assert.equal(r.outcome, ReconcileOutcome.CHANGED);
   assert.equal(r.record.plan, 'pro');
-  assert.equal(r.record.version, 2);
+  assert.equal(r.record.version, 3);
   assert.equal(r.record.selfReported, false);
-  assert.deepEqual(r.record.accountAnchor, { email: 'dev@example.com', source: 'state_vscdb' });
+  assert.deepEqual(r.record.accountAnchor, { email: 'dev@example.com', accountId: null, subscriptionId: null, source: 'state_vscdb' });
   assert.equal(r.record.capturedAt, NOW_ISO);
   assert.equal(r.record.identityCheckedAt, NOW_ISO);
   assert.equal(r.changes.some((c) => c.kind === ChangeKind.FILLED && c.field === 'plan'), true);
@@ -261,7 +426,7 @@ test('a confirmed account switch invalidates a protected manual plan', () => {
   assert.equal(r.record.plan, null, 'the old account tier cannot be inherited');
   assert.equal(r.record.selfReported, false);
   assert.equal(r.record.capturedAt, null);
-  assert.deepEqual(r.record.accountAnchor, { email: 'new@example.com', source: 'state_vscdb' });
+  assert.deepEqual(r.record.accountAnchor, { email: 'new@example.com', accountId: null, subscriptionId: null, source: 'state_vscdb' });
   assert.equal(r.persist, true);
 });
 
@@ -270,7 +435,7 @@ test('a confirmed account switch accepts only the new account evidence', () => {
   const r = reconcilePlan(VSCDB('free', 'new@example.com'), manual, { now: NOW + DAY });
   assert.equal(r.outcome, ReconcileOutcome.CHANGED);
   assert.equal(r.record.plan, 'free');
-  assert.deepEqual(r.record.accountAnchor, { email: 'new@example.com', source: 'state_vscdb' });
+  assert.deepEqual(r.record.accountAnchor, { email: 'new@example.com', accountId: null, subscriptionId: null, source: 'state_vscdb' });
 });
 
 test('a malformed observed email is unknown identity, not a switch', () => {
@@ -284,7 +449,7 @@ test('an anchor is rebuilt from the observation, never paired across sources', (
   const manual = reconcilePlan(MANUAL('ultra', 'dev@example.com'), null, { now: NOW }).record;
   const r = reconcilePlan(VSCDB('pro', null), manual, { now: NOW + DAY });
   assert.equal(r.outcome, ReconcileOutcome.CHANGED);
-  assert.deepEqual(r.record.accountAnchor, { email: null, source: 'state_vscdb' }, 'another source email must not ride along');
+  assert.deepEqual(r.record.accountAnchor, { email: null, accountId: null, subscriptionId: null, source: 'state_vscdb' }, 'another source email must not ride along');
 });
 
 test('nothing observed and nothing stored asks the user', () => {
@@ -396,17 +561,53 @@ test('a locally stored rate limit tier survives an observation that carries none
 // ── a record from a newer client ──────────────────────────────────────────────────────────────
 
 test('a record written by a newer client is not silently downgraded', () => {
-  const future = { version: 3, source: 'subscription', plan: 'pro', capturedAt: NOW_ISO, somethingNew: 'keep me' };
+  const future = { version: 4, source: 'subscription', plan: 'pro', capturedAt: NOW_ISO, somethingNew: 'keep me' };
   assert.equal(migrateBillingRecord(future, { now: NOW }).record.somethingNew, 'keep me');
 
   const r = reconcilePlan(VSCDB('ultra', null), future, { now: NOW + 10 * DAY });
   assert.equal(r.outcome, ReconcileOutcome.KEPT);
-  assert.equal(r.persist, false, 'rewriting it as v2 would drop fields we do not understand');
-  assert.equal(r.record.version, 3);
+  assert.equal(r.persist, false, 'rewriting it in the current shape would drop fields we do not understand');
+  assert.equal(r.record.version, 4);
   assert.equal(r.changes.some((c) => c.kind === ChangeKind.PRESERVED && c.field === 'version'), true);
 
   // A deliberate manual override is the documented escape hatch for a rolled-back client.
   const forced = reconcilePlan(VSCDB('ultra', null), future, { now: NOW + 10 * DAY, force: true });
   assert.equal(forced.outcome, ReconcileOutcome.CHANGED);
-  assert.equal(forced.record.version, 2);
+  assert.equal(forced.record.version, 3);
+});
+
+// A read that could not SEE an id is not a read that says the id is gone: Cursor withholds one for
+// entirely uninteresting reasons (a locked row, a partial WAL snapshot, a sign-out and back in).
+// Writing the blank through would drop a known accountId, send the next check-in with no id, and
+// mint a fresh email-only provisional row server-side — every time it happened.
+test('a read that sees no id does not erase the id already stored for the same account', () => {
+  const learned = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_a' };
+  const stored = reconcilePlan(learned, null, { now: NOW }).record;
+
+  const blind = reconcilePlan(VSCDB('pro', 'dev@example.com'), stored, { now: NOW + 10 * DAY });
+  assert.equal(blind.record.accountAnchor.accountId, 'auth0|seat_1');
+  assert.equal(blind.record.accountAnchor.subscriptionId, 'sub_a');
+  assert.equal(blind.record.plan, 'pro');
+
+  // It holds across the plan-changed branch too, which builds its record the same way.
+  const upgraded = reconcilePlan(VSCDB('ultra', 'dev@example.com'), stored, { now: NOW + 10 * DAY });
+  assert.equal(upgraded.record.plan, 'ultra');
+  assert.equal(upgraded.record.accountAnchor.accountId, 'auth0|seat_1');
+});
+
+// The backfill is gated on MATCH, and that gate is its whole safety. Carrying the old seat's id
+// onto a new account would attribute a stranger's sessions to it.
+test('the id backfill never crosses an account switch', () => {
+  const stored = reconcilePlan({ ...VSCDB('pro', 'old@example.com'), accountId: 'auth0|seat_1' }, null, { now: NOW }).record;
+  const r = reconcilePlan(VSCDB('free', 'new@example.com'), stored, { now: NOW + DAY });
+  assert.equal(r.outcome, ReconcileOutcome.CHANGED);
+  assert.equal(r.record.accountAnchor.email, 'new@example.com');
+  assert.equal(r.record.accountAnchor.accountId, null, 'the old seat id must not ride along');
+});
+
+test('a newly observed id still wins over the stored one for the same account', () => {
+  const stored = reconcilePlan({ ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_a' }, null, { now: NOW }).record;
+  const moved = { ...VSCDB('pro', 'dev@example.com'), accountId: 'auth0|seat_1', subscriptionId: 'sub_b' };
+  const r = reconcilePlan(moved, stored, { now: NOW + DAY });
+  assert.equal(r.record.accountAnchor.subscriptionId, 'sub_b');
 });

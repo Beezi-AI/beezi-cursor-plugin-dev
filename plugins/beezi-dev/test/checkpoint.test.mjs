@@ -161,6 +161,7 @@ test('the payload carries only fields the ingest DTO accepts', async (t) => {
     'session_name', 'billing_source', 'subscription_type', 'rate_limit_tier', 'subscription_plan',
     'third_party_provider', 'timezone', 'started_at', 'ended_at', 'code_changes', 'operations',
     'is_subagent', 'agent_id', 'agent_type', 'agent_name', 'spawn_depth',
+    'account_uuid', 'account_email',
   ]);
   for (const key of Object.keys(payload)) {
     assert.ok(allowed.has(key), `${key} is not a SessionReportRequestDto field`);
@@ -1061,4 +1062,193 @@ test('startCursor defaults to zero, so an audit with no coverage replays the who
     {},
   );
   assert.deepEqual(seen, [0]);
+});
+
+// ── Phase D: session → subscription attribution ───────────────────────────────────────────
+//
+// `account_uuid` and `account_email` are how the backend resolves this session to a subscription
+// row: exact uuid first, then email SCOPED to the caller's own account link, then OAuth fingerprint.
+// The email step is deliberately scoped and is not to be worked around — unscoped, one user's
+// session would attach to a stranger's subscription that happens to share an address.
+//
+// Everything below drives the REAL payload builders in lib/checkpoint.mjs rather than the helper in
+// isolation, because the two things most likely to go wrong (a field being capped on its way out, a
+// field reaching only one of the two payload sites) are invisible to a unit test of the helper.
+
+// The subscription id is the one value in the anchor that has NO wire field at all. A key-name
+// assertion cannot prove it stayed home — a typo'd spread would ship it under some other name and
+// still pass — so it is given a sentinel that is scanned for across the whole serialized payload.
+const SUBSCRIPTION_SENTINEL = 'auth0|SUBSCRIPTION_MUST_NEVER_SHIP_9f3a';
+
+function writeBilling(home, anchor, extra) {
+  const over = extra == null ? {} : extra;
+  fs.writeFileSync(
+    path.join(home, 'billing.json'),
+    JSON.stringify({
+      version: 3,
+      source: 'subscription',
+      plan: 'pro',
+      subscriptionType: 'pro',
+      capturedAt: '2026-09-21T10:00:00.000Z',
+      capturedBy: 'cursor',
+      selfReported: false,
+      accountAnchor: anchor,
+      ...over,
+    }),
+  );
+}
+
+// A seat whose Cursor knows both halves of its identity — the ordinary case on a signed-in machine.
+function fullAnchor(over) {
+  return {
+    email: 'uliana.gerek@gmail.com',
+    accountId: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T',
+    subscriptionId: SUBSCRIPTION_SENTINEL,
+    source: 'state_vscdb',
+    ...(over == null ? {} : over),
+  };
+}
+
+test('a report carries the account id and email the anchor holds', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, fullAnchor());
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  assert.equal(payload.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T');
+  assert.equal(payload.account_email, 'uliana.gerek@gmail.com');
+  // Beside the plan fields, not instead of them: the two answer different questions and the backend
+  // stores them in different places.
+  assert.equal(payload.subscription_plan, 'pro');
+});
+
+test('account_uuid is OMITTED, never null, when the machine has no seat id', async (t) => {
+  const home = tmpHome(t);
+  // What a machine looks like when Cursor has cached an address but neither per-seat auth key —
+  // the server adopts it as an email-only provisional row, which a later id absorbs cleanly.
+  writeBilling(home, fullAnchor({ accountId: null }));
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  // `in`, not a truthiness check. Absent and null are DIFFERENT instructions to the upsert: absent
+  // says "I have nothing to say about this column", null says "set this column to null" — which
+  // would blank an id the check-in path already taught the backend.
+  assert.equal('account_uuid' in payload, false, 'an explicit null would blank a known id');
+  assert.equal(payload.account_email, 'uliana.gerek@gmail.com', 'the half we do know still goes');
+});
+
+test('account_email is OMITTED, never null, when the machine has no address', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, fullAnchor({ email: null }));
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  assert.equal('account_email' in payload, false);
+  assert.equal(payload.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T', 'the stronger half still goes');
+});
+
+test('no anchor at all emits neither field, and reports everything else as before', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, null);
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  assert.equal('account_uuid' in payload, false);
+  assert.equal('account_email' in payload, false);
+  assert.equal(payload.subscription_plan, 'pro', 'a missing identity must not suppress the plan');
+});
+
+test('an anchor with no source is not an identity and emits nothing', async (t) => {
+  const home = tmpHome(t);
+  // A source is what says WHICH READ produced the identity. An anchor without one — a truncated
+  // write, a hand edit, a rolled-back client — cannot say, and inventing the pairing on the wire is
+  // worse than sending nothing: the backend would upsert a row this machine cannot vouch for.
+  writeBilling(home, { email: 'a@b.com', accountId: 'auth0|user_x', subscriptionId: null });
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  assert.equal('account_uuid' in payload, false);
+  assert.equal('account_email' in payload, false);
+});
+
+test('the subscription id never reaches the wire, under any field name', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, fullAnchor());
+  writeSidecar(home, [
+    { ts: 1, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1', token_input: 10, token_output: 2 },
+    { ts: 2000, ev: 'subagent_start', sid: 'sa-1', stype: 'general-purpose', task: 'audit' },
+    { ts: 602000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'audit' },
+    { ts: 603000, ev: 'stop' },
+  ]);
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), { emitTimeline: true });
+
+  const payloads = queued();
+  assert.ok(payloads.length > 0, 'the scan below is vacuous unless something was queued');
+  for (const payload of payloads) {
+    // A whole-payload substring scan, not `'subscription_id' in payload`. On a Team plan this id is
+    // the PAYING OWNER's, and emitting it under ANY key collapses every member of the team onto one
+    // account row — absorbed and then DELETED, with no rollback endpoint. The key name it would
+    // travel under is not knowable in advance, so the VALUE is what gets asserted.
+    assert.equal(
+      JSON.stringify(payload).includes(SUBSCRIPTION_SENTINEL),
+      false,
+      'the subscription id has no wire field and must stay local',
+    );
+  }
+});
+
+test('the subagent segment carries the same identity as its parent', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, fullAnchor());
+  writeSidecar(home, [
+    { ts: 1, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1', token_input: 10, token_output: 2 },
+    { ts: 2000, ev: 'subagent_start', sid: 'sa-1', stype: 'general-purpose', task: 'audit' },
+    { ts: 602000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'audit' },
+    { ts: 603000, ev: 'stop' },
+  ]);
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), { emitTimeline: true });
+
+  const subagent = queued().find((payload) => payload.is_subagent === true);
+  assert.ok(subagent, 'the subagent segment must exist for this assertion to mean anything');
+  // A subagent's spend is the parent seat's spend. A segment that reached the backend without an
+  // identity would fall through to the OAuth-fingerprint resolution step, or to nothing at all, and
+  // the ten minutes it bills would sit on no subscription.
+  assert.equal(subagent.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T');
+  assert.equal(subagent.account_email, 'uliana.gerek@gmail.com');
+});
+
+test('a 200-char SSO id is OMITTED, never truncated, while the rest of the report still ships', async (t) => {
+  const home = tmpHome(t);
+  // What Auth0 mints for an enterprise connection: `samlp|<connection>|<nameId>`, where nameId is
+  // usually an email. Comfortably past the 64 chars the backend column holds TODAY, which is what
+  // plan §4 E5 widens to 255.
+  const samlp = `samlp|${'c'.repeat(80)}|${'n'.repeat(113)}`;
+  assert.equal(samlp.length, 200, 'the fixture id must really be 200 chars or this proves nothing');
+  writeBilling(home, fullAnchor({ accountId: samlp }));
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
+
+  const [payload] = queued();
+  // THREE distinct outcomes were available here and only one is safe.
+  //
+  //   truncate — mints a phantom subscription row nothing ever matches again. A shortened id is not
+  //              a shorter id, it is a DIFFERENT id. Never.
+  //   emit     — the deployed DTO declares @MaxLength(64) and the global ValidationPipe rejects the
+  //              WHOLE request on a length violation, so this seat would lose every session report
+  //              it sends: tokens, cost, timeline, repo attribution. Not "recoverable" — total, and
+  //              aimed squarely at the Team/SSO seats E5 exists to serve.
+  //   omit     — falls through to the server's email-anchored resolution, lands on a provisional
+  //              row, and the next check-in carrying a short-enough id absorbs it. Attributed a
+  //              little later, never attributed WRONG.
+  assert.equal('account_uuid' in payload, false, 'an over-length id must be omitted, not truncated');
+  assert.equal(payload.account_email, 'uliana.gerek@gmail.com', 'the email anchor still ships — this is the fallback resolution path');
+  // The rest of the report is unaffected: the whole point of omitting is that nothing else is lost.
+  assert.ok(payload.models, 'the report itself must still be intact');
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { REVOKE_CHECK_TIMEOUT_MS, runSessionStart } from '../lib/session-start.mjs';
+import { CHECKIN_TIMEOUT_MS, REVOKE_CHECK_TIMEOUT_MS, runSessionStart } from '../lib/session-start.mjs';
 import { ensureInstalled } from '../lib/plugin-install.mjs';
 import { safeName } from '../lib/sidecar.mjs';
 import { POST_TIMEOUT_MS } from '../lib/http.mjs';
@@ -50,6 +50,10 @@ function linkedDeps(overrides = {}) {
     // `isDue` gates the deterministic plan read. Defaulted off so no case pays for the reconcile
     // path unless it is the thing being tested.
     isDue: () => false,
+    // The account check-in, stubbed for the same reason `readCursorAccount` is: the real one reads
+    // the machine's own tracking cache and, on a machine that has one, would reach a socket. A
+    // suite must never depend on whether the developer running it happens to be signed in.
+    syncAccount: async () => null,
     ...overrides,
   };
 }
@@ -711,4 +715,197 @@ test('live tracking disallowed — local repo discovery and its wording are unto
   assert.deepEqual(urls.filter((u) => u.includes('/repos/status')), []);
   assert.match(msg, /no "origin" remote — this repo would be tracked as a local repo\./);
   assert.match(msg, /turned off for this workspace/i);
+});
+
+// ── plan §4 B3: the account check-in on the hot path ──────────────────────────────────────────
+
+test('session start checks the account in UNFORCED, with the record the reconcile settled', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const reconciled = { plan: 'pro', accountAnchor: { email: 'seat@example.com', accountId: 'auth0|x' } };
+  await runSessionStart(
+    { session_id: 'conv-1', cwd: null },
+    linkedDeps({
+      isDue: () => true,
+      readCursorAccount: () => ({ source: 'cli-config', plan: 'pro' }),
+      reconcilePlan: () => ({ persist: true, record: reconciled }),
+      writeBillingConfig: () => {},
+      whoami: async () => ({ valid: true, email: 'dev@example.com' }),
+      flushQueue: async () => ({ flushed: 0 }),
+      syncAccount: async (token, options, deps) => { calls.push({ token, options, deps }); return null; },
+    }),
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].token, 'tok', 'the token this hook already resolved — no second lookup');
+  // The fingerprint gate plus the seven-day heartbeat IS the intended steady state here. Forcing on
+  // a per-session path would POST on every single session start.
+  assert.equal(calls[0].options.force, false);
+  assert.equal(calls[0].options.via, 'session-start');
+  // The record the reconcile just settled, handed over directly: re-reading billing.json would be
+  // a second file read for an answer already in hand, and a second `readCursorAccount()` on the
+  // WAL-snapshot path costs ~80 ms.
+  assert.equal(calls[0].deps.record, reconciled);
+  assert.equal(calls[0].deps.who.email, 'dev@example.com');
+  assert.equal(calls[0].deps.tracking, null);
+  // An EXPLICIT bound, not whatever default the callee happens to ship — this file has been burned
+  // by an inherited timeout before (see REVOKE_CHECK_TIMEOUT_MS).
+  assert.equal(calls[0].deps.timeoutMs, CHECKIN_TIMEOUT_MS);
+  assert.equal(typeof calls[0].deps.fetchImpl, 'function', 'the hook’s own bounded transport');
+});
+
+test('the check-in is not attempted when the hook budget is nearly spent', async (t) => {
+  tmpHome(t);
+  let first = true;
+  const base = Date.now();
+  const calls = [];
+  const msg = await runSessionStart(
+    { session_id: 'conv-1', cwd: null },
+    linkedDeps({
+      now: () => {
+        if (first) { first = false; return base; }
+        return base + HOOK_BUDGET_MS - 500;
+      },
+      isDue: () => true,
+      whoami: async () => ({ valid: true }),
+      isStale: () => true,
+      flushQueue: async () => ({ flushed: 0 }),
+      syncAccount: async () => { calls.push(1); return null; },
+    }),
+  );
+  // The reserve is strictly larger than the request's own timeout, which is what makes the await
+  // provably bounded: the hook cannot start a request it has no budget to finish.
+  assert.equal(calls.length, 0, '500 ms left is not enough to start a bounded POST');
+  // And everything after it still runs.
+  assert.match(msg, /beezi-refresh/);
+});
+
+test('a check-in that rejects, throws or hangs past its bound never breaks a session start', async (t) => {
+  for (const sync of [
+    () => { throw new Error('threw synchronously'); },
+    () => Promise.reject(new Error('rejected')),
+    async () => { throw new Error('rejected late'); },
+  ]) {
+    tmpHome(t);
+    const msg = await runSessionStart(
+      { session_id: 'conv-1', cwd: null },
+      linkedDeps({
+        isDue: () => true,
+        isStale: () => true,
+        whoami: async () => ({ valid: true }),
+        flushQueue: async () => ({ flushed: 0 }),
+        syncAccount: sync,
+      }),
+    );
+    // The nudge below it still fires: the check-in is the LAST thing in the plan block and it is
+    // not allowed to swallow the block.
+    assert.match(msg, /beezi-refresh/);
+  }
+});
+
+test('no plan-bearing source means no check-in at all', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  await runSessionStart(
+    { session_id: 'conv-1', cwd: null },
+    linkedDeps({
+      // An API-key machine rides no seat, so there is no subscription to report.
+      detectBillingSource: () => 'third_party',
+      whoami: async () => ({ valid: true }),
+      flushQueue: async () => ({ flushed: 0 }),
+      syncAccount: async () => { calls.push(1); return null; },
+    }),
+  );
+  assert.equal(calls.length, 0);
+});
+
+// ── plan §4 C3: session start is the second drainer of the stop hook's pendingCheckIn marker ──
+
+function markerDeps(pending, over) {
+  const cleared = [];
+  return {
+    cleared,
+    deps: {
+      isDue: () => false,
+      whoami: async () => ({ valid: true, email: 'dev@example.com' }),
+      flushQueue: async () => ({ flushed: 0 }),
+      buildCheckInScope: () => ({ ok: true, reason: null, scope: { env: '', beeziAccount: 'beezi-user' } }),
+      accountSyncStateFile: (scope) => `/state/${scope.beeziAccount}.json`,
+      readPendingCheckIn: () => pending,
+      clearPendingCheckIn: (file, scope) => cleared.push([file, scope.beeziAccount]),
+      ...(over == null ? {} : over),
+    },
+  };
+}
+
+test('a due marker forces the check-in and is cleared when the send lands', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const m = markerDeps(true, {
+    syncAccount: async (token, options) => {
+      calls.push(options);
+      return { outcome: 'sent', successful: true, writeback: null };
+    },
+  });
+  await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+
+  assert.equal(calls.length, 1, 'ONE call — draining forces the check-in that was happening anyway');
+  // A marker means an earlier run owed a send that never left the machine, so the hash gate is not
+  // what stands between the server and the truth.
+  assert.equal(calls[0].force, true);
+  assert.deepEqual(m.cleared, [['/state/beezi-user.json', 'beezi-user']]);
+});
+
+test('a marker survives a check-in that did not land', async (t) => {
+  for (const outcome of ['offline', 'failed', 'epoch-changed', 'skipped']) {
+    tmpHome(t);
+    const m = markerDeps(true, {
+      syncAccount: async () => ({ outcome, successful: false, writeback: null }),
+    });
+    await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+    assert.deepEqual(m.cleared, [], `${outcome} is a send still owed — the marker must stay`);
+  }
+});
+
+test('no marker means the ordinary unforced heartbeat, and nothing is cleared', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const m = markerDeps(false, {
+    syncAccount: async (token, options) => {
+      calls.push(options);
+      return { outcome: 'sent', successful: true, writeback: null };
+    },
+  });
+  await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+  assert.equal(calls[0].force, false);
+  assert.deepEqual(m.cleared, []);
+});
+
+test('a marker read that throws leaves the session start — and the check-in — alone', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const m = markerDeps(true, {
+    readPendingCheckIn: () => { throw new Error('unreadable state file'); },
+    syncAccount: async (token, options) => { calls.push(options); return { outcome: 'sent' }; },
+  });
+  const msg = await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+  assert.equal(msg, null);
+  assert.equal(calls.length, 1, 'the heartbeat still runs');
+  assert.equal(calls[0].force, false, 'a marker we could not read is not a marker');
+  assert.deepEqual(m.cleared, []);
+});
+
+test('the marker is read from the file the check-in’s own scope names', async (t) => {
+  tmpHome(t);
+  const seen = [];
+  const m = markerDeps(true, {
+    readPendingCheckIn: (file, scope, d) => { seen.push({ file, scope, now: d.now }); return true; },
+    syncAccount: async () => ({ outcome: 'sent' }),
+  });
+  await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+  // A marker read beside a DIFFERENT file than the heartbeat state is a marker that is never
+  // drained, so the scope comes from the same builder the check-in itself uses.
+  assert.equal(seen[0].file, '/state/beezi-user.json');
+  assert.deepEqual(seen[0].scope, { env: '', beeziAccount: 'beezi-user' });
+  assert.equal(typeof seen[0].now, 'number', 'the due stamp is evaluated against the hook clock');
 });
