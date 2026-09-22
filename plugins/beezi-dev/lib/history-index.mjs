@@ -12,7 +12,7 @@ import {
 // Everything the user did before that, and everything older than two weeks, exists only in
 // Cursor's own durable store (`state.vscdb`, one `composerData:<id>` record per conversation).
 //
-// ── WHAT THIS MODULE DELIBERATELY DOES NOT DO ────────────────────────────────────────────────
+// ── WHAT THIS MODULE DELIBERATELY DOES NOT DO
 //
 // It does not upload. Enumerating `composerData:` is technically easy and accounting off it is
 // not: `usageData` is CUMULATIVE PRICED OVERAGE (lib/vscdb.mjs documents the three-way null / {} /
@@ -37,7 +37,7 @@ export const HistorySource = Object.freeze({
 
 // Cursor stores one record per conversation under this prefix. Kept here as well as in vscdb.mjs
 // because this module parses ids back OUT of the key, which is the inverse operation.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const COMPOSER_KEY_PREFIX = 'composerData:';
 
 // Same window and the same reasoning as the audit's: a conversation whose last REAL activity is

@@ -11,19 +11,15 @@ installHookGuards({ name: 'checkpoint' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run, for the status surfaces. Always true — both registries
-// stay installed and both fire, and the duplicate `shell` lines are collapsed by the reader. Those
-// carry no host id of their own (`afterShellExecution` is not a tool-use event), so they fall to
-// dedupeEvents' content-hash + 1s window instead — see lib/delta-cursor.mjs.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // What used to be here stood a launcher down whenever a bundled run had been recorded in the last
 // fortnight, which under `cursor-agent` meant always and wrongly: the CLI runs no plugin-bundled
 // hook at all (Cursor staff, forum 163890), so the branch-boundary checkpoint below simply stopped
-// happening there. See lib/hook-source.mjs.
+// happening there.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 // `afterShellExecution`. Cursor supplies `command` directly, so there is no dual-surface

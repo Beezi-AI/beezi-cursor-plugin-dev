@@ -25,27 +25,28 @@ import path from 'path';
 import { currentBranch as _currentBranch, taskFromBranch as _taskFromBranch } from './git.mjs';
 import { resolveActiveConversation as _resolveActiveConversation } from './active-conversation.mjs';
 import { runCheckpoint as _runCheckpoint } from './checkpoint.mjs';
+import { AuthState as TrackAuthState } from './auth-state.mjs';
 import { getAccessToken } from './token.mjs';
 import { isLiveTrackingAllowed } from './tracking.mjs';
 import { friendlyMessage } from './friendly-error.mjs';
 
-// A local mirror of CONTRACTS §2's AuthState values, so this module can be written against the
-// typed auth seam before lib/auth-state.mjs exists. Integration replaces this constant with an
-// import from that file — the STRINGS are the contract and must not drift.
-export const TrackAuthState = Object.freeze({
-  READY: 'ready',
-  UNLINKED: 'unlinked',
-  REFRESHING: 'refreshing',
-  UNAVAILABLE: 'unavailable',
-  REAUTH_REQUIRED: 'reauth_required',
-  FORBIDDEN: 'forbidden',
-});
+// CONTRACTS §2's AuthState itself. This was a local mirror of the six strings, written against the
+// typed auth seam while lib/auth-state.mjs did not yet exist; that file now owns them, so the mirror
+// is gone and there is one definition again — the STRINGS are the contract and must not drift.
+// Re-exported under the old name because this module's callers and tests import `TrackAuthState`;
+// renaming them is a separate change, and the binding is the same frozen object either way.
+export { TrackAuthState };
 
 // The default auth seam: today's `getAccessToken()` adapted to the typed shape. It keeps the
 // existing behaviour for a linked machine and splits the one case the old script got wrong — a
 // THROW from the credential store (a locked keychain, a DPAPI failure, a contended read) used to be
 // swallowed into "this machine is not linked", which invites a user with perfectly good credentials
-// to log out and back in. Integration swaps this for token.mjs's own `getAuthState`.
+// to log out and back in.
+//
+// Swapping this for token.mjs's own `getAuthState` was considered when the constant above became a
+// real import, and deliberately NOT done: that call reports states this adapter never produces
+// (REFRESHING and REAUTH_REQUIRED) and so changes which message a user sees. It is a
+// behaviour change, not a deduplication, and it belongs to its own change with its own tests.
 async function defaultAuthState() {
   let token;
   try {

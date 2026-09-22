@@ -855,7 +855,7 @@ bundled ones. In one session each:
 - Whether the `--via` values are what the two registries were meant to pass. Capture records the flag
   verbatim rather than normalizing it, precisely so an unexpected value is visible.
 
-Each answer retires one of the 29 `// TODO(P0): unverified` markers.
+Each answer retires one of the `// TODO(P0): unverified` markers.
 
 ## Plugin crash diagnostics
 
@@ -914,9 +914,10 @@ this client sends and stores; whether the receiving route exists and accepts it 
 **Cursor is not installed on the machine this plugin was written on** — no `~/.cursor`, no
 `cursor-agent`, no `%APPDATA%\Cursor`. Every path, hook payload field and storage key below comes
 from documentation, staff forum posts and decompiled binaries, and is marked in the source with
-`// TODO(P0): unverified` — 29 markers across twelve files. Confirm each on a machine running Cursor
-before trusting the numbers; [Running a capture session](#running-a-capture-session) is how, and one
-session answers most of the list at once.
+`// TODO(P0): unverified`, which recurs across the plugin's Cursor-facing modules. Confirm each on a
+machine running Cursor before trusting the numbers;
+[Running a capture session](#running-a-capture-session) is how, and one session answers most of the
+list at once.
 
 1. **Whether the bundled `hooks/hooks.json` fires in the IDE on a machine with third-party
    extensibility ON.** Discovery is confirmed — Cursor parses the registry and reports the plugin's

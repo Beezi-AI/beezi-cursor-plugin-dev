@@ -147,7 +147,7 @@ function safeRecord(deps, code, name) {
     // path that could put it somewhere it outlives the process.
     const pending = record(code, { source: name == null ? null : name });
     if (pending != null && typeof pending.then === 'function') pending.then(() => {}, () => {});
-  } catch (error) { /* diagnostics must never change a hook's outcome */ }
+  } catch { /* diagnostics must never change a hook's outcome */ }
 }
 
 // The single exit taken by every failure path: record, emit protocol-safe output, exit 0.
@@ -171,7 +171,7 @@ function createBail(opts, deps) {
     if (permission && !wroteStdout) {
       const out = opts.failOutput == null ? PERMISSION_FAILURE_OUTPUT : opts.failOutput;
       if (out !== '') {
-        try { writeOut(deps, out); } catch (error) { /* a closed pipe is still fail-open */ }
+        try { writeOut(deps, out); } catch { /* a closed pipe is still fail-open */ }
       }
     }
     exit(0);
@@ -212,7 +212,7 @@ async function finish(permission, deps) {
   try {
     const shutdown = deps.shutdown == null ? await import('./shutdown.mjs') : deps.shutdown;
     await shutdown.exitClean(0);
-  } catch (error) {
+  } catch {
     exit(0);
   }
 }
@@ -250,7 +250,7 @@ export async function runHook(options) {
       if (!wroteStdout) {
         const out = opts.failOutput == null ? PERMISSION_FAILURE_OUTPUT : opts.failOutput;
         if (out !== '') {
-          try { writeOut(deps, out); } catch (error) { /* a closed pipe is still fail-open */ }
+          try { writeOut(deps, out); } catch { /* a closed pipe is still fail-open */ }
         }
       }
       const exit = deps.exit == null ? ((c) => process.exit(c)) : deps.exit;
@@ -263,7 +263,7 @@ export async function runHook(options) {
   let decoder;
   try {
     decoder = deps.decoder == null ? await import('./hook-input-cursor.mjs') : deps.decoder;
-  } catch (error) {
+  } catch {
     await fail('hook_import_failed');
     return;
   }
@@ -280,7 +280,7 @@ export async function runHook(options) {
     // stampableCwd, not input.cwd: only a value both registries would derive identically may be
     // stamped on a sidecar line, or the reader's duplicate collapse stops collapsing.
     cwd = input == null ? null : decoder.stampableCwd(payload);
-  } catch (error) {
+  } catch {
     await fail('hook_crash');
     return;
   }
@@ -296,7 +296,7 @@ export async function runHook(options) {
   let loaded = null;
   try {
     loaded = typeof opts.load === 'function' ? await opts.load() : null;
-  } catch (error) {
+  } catch {
     await fail('hook_import_failed');
     return;
   }
@@ -320,7 +320,7 @@ export async function runHook(options) {
         emit: (value) => { writeOut(deps, typeof value === 'string' ? value : JSON.stringify(value)); },
       });
     }
-  } catch (error) {
+  } catch {
     await fail('hook_crash');
     return;
   }

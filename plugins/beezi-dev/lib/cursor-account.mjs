@@ -1,7 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import { readKeys } from './vscdb.mjs';
-import * as hostPaths from './paths-cursor.mjs';
+// Default paths come from lib/paths-cursor.mjs, imported statically. This was a top-level
+// `await import()` in a try/catch, from when that module did not exist yet; top-level await needs
+// Node 14.8 and the plugin's floor is 13.2. Nothing is lost — paths-cursor imports only Node
+// builtins and lib/env-identity.mjs, does no work at import time, and so cannot fail to load — and the real degrade was always the try/catch inside `hostPath`,
+// now shared from that module, which is untouched: a path function that throws, or resolves to
+// nothing, still yields null.
+import { hostPath } from './paths-cursor.mjs';
 
 // The Cursor subscription tier, used to price the seat half of the cost model. Three sources, in
 // descending order of authority:
@@ -158,22 +164,6 @@ function statusOrNull(value) {
   return STATUS_TOKEN.test(token) ? token : null;
 }
 
-// Default paths come from lib/paths-cursor.mjs, imported statically. This was a top-level
-// `await import()` in a try/catch, from when that module did not exist yet; top-level await needs
-// Node 14.8 and the plugin's floor is 13.2. Nothing is lost — paths-cursor imports only `os` and
-// `path` and cannot fail to load — and the real degrade was always the try/catch below, which is
-// untouched: a path function that throws, or resolves to nothing, still yields null.
-function hostPath(fnName) {
-  const fn = hostPaths[fnName];
-  if (typeof fn !== 'function') return null;
-  try {
-    const resolved = fn();
-    return typeof resolved === 'string' && resolved !== '' ? resolved : null;
-  } catch {
-    return null;
-  }
-}
-
 // The raw stored value for one exact key out of a readKeys result, or null. A null/absent result
 // set and a key that is simply not there are the same answer here: nothing to unwrap.
 function valueAt(rows, key) {
@@ -211,7 +201,7 @@ function readVscdbCandidate(deps) {
   return { rawPlan: raw, source: AccountSource.STATE_VSCDB, email, accountId, subscriptionId, status };
 }
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine.
+// TODO(P0): unverified — see lib/hook-dump.mjs
 // The CLI's own config; key spelling is a guess, so several are accepted.
 const CLI_CONFIG_FILE = 'cli-config.json';
 const CLI_PLAN_FIELDS = ['stripeMembershipType', 'membershipType', 'plan', 'subscription', 'tier'];

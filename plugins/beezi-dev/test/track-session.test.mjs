@@ -304,6 +304,7 @@ test('runTrack has no update-check surface at all — PIPE-07 stays deferred', a
   const imported = [...code.matchAll(/from '([^']+)'/g)].map((m) => m[1]).sort();
   assert.deepEqual(imported, [
     './active-conversation.mjs',
+    './auth-state.mjs',
     './checkpoint.mjs',
     './friendly-error.mjs',
     './git.mjs',

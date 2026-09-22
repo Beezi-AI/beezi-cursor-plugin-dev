@@ -6,7 +6,7 @@ import { maybeApplyCaptureRetention } from './capture-retention.mjs';
 
 // The hook payload capture harness — the answer to `TODO(P0): unverified`.
 //
-// Twenty-six of those markers are spread across ten files, and every one of them means the same
+// Those markers sit across the plugin's Cursor-facing modules, and every one of them means the same
 // thing: Cursor was never installed on the machine this plugin was written on, so no real hook
 // payload has ever been read. Which key carries an MCP server's identity, whether `afterFileEdit`
 // reports a path or a diff, what a subagent's start event even looks like — all of it is inference
@@ -18,7 +18,7 @@ import { maybeApplyCaptureRetention } from './capture-retention.mjs';
 //
 // So this module looks at it. Turn `BEEZI_CURSOR_DUMP_HOOKS` on, drive Cursor for one session, and
 // `~/.beezi-cursor/capture/hooks.jsonl` holds the exact bytes every registered hook received. One
-// session answers all twenty-six.
+// session answers every one of them.
 //
 // Three properties this must have, each paid for by a bug elsewhere in this plugin:
 //

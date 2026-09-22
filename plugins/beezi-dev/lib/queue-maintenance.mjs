@@ -1,7 +1,7 @@
 // Housekeeping for report-queue records that delivery cannot move: how OLD a queued record is,
 // and when a policy hold has held it long enough to drop.
 //
-// ── WHY THE AGE NEEDS A MIGRATION, AND WHY IT LIVES HERE ────────────────────────────────────────
+// ── WHY THE AGE NEEDS A MIGRATION, AND WHY IT LIVES HERE
 //
 // `_retry.firstQueuedAt` (lib/queue-backoff.mjs) is a FAILURE clock, not an enqueue clock: it is
 // stamped the first time a POST for that record is refused and is absent before then. That is the
@@ -25,6 +25,7 @@
 import fs from 'fs';
 import path from 'path';
 import { queueDir } from './paths-cursor.mjs';
+import { readQueueRecord } from './queue-record.mjs';
 
 // Three days of QUEUE age, and its own constant rather than an import of queue-backoff's 14-day
 // MAX_QUEUE_AGE_MS: those two numbers answer different questions ("the server keeps refusing this"
@@ -100,28 +101,18 @@ export function sweepHeldQueue({ now, maxAgeMs = QUEUE_HOLD_MS, fsImpl = fs, dir
     if (path.extname(file) !== '.json') continue;
     const filePath = path.join(target, file);
 
-    let stat = null;
-    try { stat = fsImpl.statSync(filePath); } catch { stat = null; }
-
-    // Read and parse separately, because they are different verdicts. A file that vanished between
-    // the readdir and here was delivered by a concurrent flush and is nobody's problem; a file whose
-    // BYTES are not JSON is corrupt. lib/fs-store.mjs's readJson collapses both into null and takes
-    // no fs seam, so the two steps are spelled out.
-    let raw;
-    try {
-      raw = fsImpl.readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
+    // Three-way, via the shared reader: read failure and parse failure are DIFFERENT verdicts here,
+    // and the reader takes `fsImpl` as a parameter so this module's injected seam survives.
+    const record = readQueueRecord(fsImpl, filePath);
+    const stat = record.stat;
+    if (record.verdict === 'read-failed') continue;
+    if (record.verdict === 'parse-failed') {
       // NOT deleted: a record that cannot be parsed is the only evidence of whatever wrote it, and
       // erasing it here would beat the quarantine to it.
       result.corrupt += 1;
       continue;
     }
+    const payload = record.payload;
 
     const age = queueAgeMs(payload, stat, at);
     // Unknowable age and future timestamps both land here. Keeping is the conservative answer: the

@@ -246,8 +246,8 @@ export function correlateSubagents(events, options = {}) {
       // turned into a span, because the only thing it could produce is a bar whose start is a guess
       // (`duration_ms` is present on some payloads and absent on others, and a span invented from a
       // duration nobody sent would be indistinguishable from a real one). In practice this means the
-      // start was written to a DIFFERENT sidecar file — see the routing note in
-      // scripts/subagent-start.mjs — so counting them is how that shows up.
+      // start was written to a DIFFERENT sidecar file — see `appendSubagentEvents` in
+      // lib/sidecar-events.mjs, which owns the routing rule — so counting them is how that shows up.
       diagnostics.orphaned += 1;
       continue;
     }

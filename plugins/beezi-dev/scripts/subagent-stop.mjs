@@ -29,9 +29,7 @@ installHookGuards({ name: 'subagent-stop' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run, for the status surfaces. Always true; nothing is
-// arbitrated in a hook process any more — a machine with both registries writes both lines and the
-// reader collapses them (dedupeEvents in lib/delta-cursor.mjs). See lib/hook-source.mjs.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 if (!claimHookRun()) process.exit(0);
 
 // Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone — and
@@ -55,20 +53,9 @@ runHook({
     const [events, sidecar] = mods;
     // The same routing rule as the start hook, and it must stay the same rule: both halves of one
     // span have to land in the same conversation's sidecar or the correlation in
-    // lib/subagents-cursor.mjs cannot see them together. See the long note in
-    // scripts/subagent-start.mjs.
-    const payload = ctx.payload;
-    const parent =
-      payload == null ? undefined
-        : payload.parent_conversation_id != null ? payload.parent_conversation_id
-          : payload.parentConversationId;
-    const target = typeof parent === 'string' && parent !== '' ? parent : ctx.input.session_id;
-    // Subagent lines ONLY — see scripts/subagent-start.mjs for why a stray `tool`/`gen` line from
-    // this payload would double-count the parent's own activity.
-    for (const event of events.eventsFromHookPayload(payload)) {
-      if (typeof event.ev === 'string' && event.ev.startsWith('subagent_')) {
-        sidecar.appendEvent(target, sidecar.withCwd(event, ctx.cwd));
-      }
-    }
+    // lib/subagents-cursor.mjs cannot see them together. That is why it is one function in
+    // lib/sidecar-events.mjs rather than a copy here — see `appendSubagentEvents`, which also
+    // carries the note on why a stray `tool`/`gen` line from this payload is filtered out.
+    events.appendSubagentEvents(sidecar, ctx.payload, ctx.input.session_id, ctx.cwd);
   },
 });

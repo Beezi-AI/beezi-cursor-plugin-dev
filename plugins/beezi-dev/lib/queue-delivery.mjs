@@ -41,6 +41,7 @@ import { writeJsonSecure } from './fs-store.mjs';
 import { queueDir } from './paths-cursor.mjs';
 import { isDue, isExpired, isRetryableStatus, recordFailure, stripRetry } from './queue-backoff.mjs';
 import { seedFirstQueuedAt } from './queue-maintenance.mjs';
+import { readQueueRecord } from './queue-record.mjs';
 import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
 import { sanitizeQueuedPayloadRemote } from './git.mjs';
 
@@ -206,22 +207,18 @@ export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) 
     const file = files[index];
     const filePath = path.join(dir, file);
 
-    let stat = null;
-    try { stat = fsImpl.statSync(filePath); } catch { stat = null; }
-
-    let raw;
-    try {
-      raw = fsImpl.readFileSync(filePath, 'utf-8');
-    } catch {
+    // Three-way, via the shared reader: read failure and parse failure are DIFFERENT verdicts, and
+    // only the second one is a quarantine.
+    const record = readQueueRecord(fsImpl, filePath);
+    const stat = record.stat;
+    if (record.verdict === 'read-failed') {
       // Gone between the readdir and here — delivered by a concurrent flush, or pruned. Not a
       // corrupt record and not this flush's problem.
       continue;
     }
 
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
+    const payload = record.payload;
+    if (record.verdict === 'parse-failed') {
       const target = corruptName(fsImpl, dir, file, now());
       try {
         fsImpl.renameSync(filePath, path.join(dir, target));
@@ -299,7 +296,7 @@ export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) 
       continue;
     }
 
-    // ── 401: one forced refresh per flush, then the exact same payload again ────────────────────
+    // ── 401: one forced refresh per flush, then the exact same payload again
     if (res.status === 401 && !refreshed) {
       refreshed = true;
       let renewal = null;
@@ -346,7 +343,7 @@ export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) 
       continue;
     }
 
-    // ── 403: parse the bounded body BEFORE generic retry classification ─────────────────────────
+    // ── 403: parse the bounded body BEFORE generic retry classification
     if (res.status === 403) {
       const body = await readBody(res, bodyBudgetMs());
       const code = bodyCode(body);

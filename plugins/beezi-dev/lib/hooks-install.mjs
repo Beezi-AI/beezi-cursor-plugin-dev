@@ -63,7 +63,7 @@ export const RELOAD_STEP = 'restart Cursor — hooks are read when the app start
 // RECOGNISE is a different matter: if its loader answers an unknown key by discarding the registry
 // rather than the entry, every hook in this list goes silent together. So the first thing to check
 // after changing this array is that Cursor's own hook listing still shows all of them.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export const BEEZI_HOOKS = Object.freeze([
   { event: 'sessionStart', script: 'session-start.mjs' },
   { event: 'afterShellExecution', script: 'checkpoint.mjs' },
@@ -91,7 +91,7 @@ export function isPermissionEvent(event) {
 }
 
 // Cursor's hooks.json carries a schema version at the top level.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const REGISTRY_VERSION = 1;
 
 // Our ceiling for a hook run, in SECONDS, and Cursor's `timeout` field is in seconds too — this is
@@ -214,7 +214,7 @@ function ownsLauncherName(basename, variantMarker) {
 // that is ALREADY broken unquoted, so quoting cannot regress an install that works today — and
 // `& "…"` is not written here because it is correct in PowerShell and wrong in cmd.exe and sh, and
 // nothing on the authoring machine can say which one Cursor uses.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 function quoteCommand(launcher) {
   return /\s/.test(launcher) ? `"${launcher}"` : launcher;
 }
@@ -256,7 +256,7 @@ export function launcherBody(scriptPath, { nodePath, platform = process.platform
 // documented, per-handler field measured in seconds, and leaving it out does not mean "no limit" —
 // it means Cursor's undocumented default, which is not the number scripts/checkpoint.mjs and
 // lib/checkpoint.mjs budget against. See HOOK_TIMEOUT_SEC.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function buildHookEntries({ launcherDir, platform = process.platform, variantMarker = defaultVariantMarker() }) {
   const out = {};
   for (const { event, script } of BEEZI_HOOKS) {

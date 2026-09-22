@@ -59,7 +59,7 @@ export const CheckInOutcome = Object.freeze({
   EPOCH_CHANGED: 'epoch-changed',
 });
 
-// ── the payload ───────────────────────────────────────────────────────────────────────────────
+// ── the payload
 
 // Everything this client may send. It is an ALLOWLIST, not a filter: a field outside it is a schema
 // failure rather than a quietly dropped key, because the way secrets leak is one caller adding a
@@ -161,7 +161,7 @@ export function hashCheckInPayload(payload) {
   return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
-// ── heartbeat state ───────────────────────────────────────────────────────────────────────────
+// ── heartbeat state
 
 export function accountSyncStateDir() {
   return path.join(beeziCursorHome(), 'account-sync');
@@ -233,7 +233,7 @@ export function isCheckInDue(state, hash, now = Date.now(), heartbeatMs = CHECKI
   return now - state.lastSuccessAt >= heartbeatMs;
 }
 
-// ── charged-cost summary (BILL-09) ────────────────────────────────────────────────────────────
+// ── charged-cost summary (BILL-09)
 
 // The pool a row was actually billed against, taken from the vocabulary the delta EMITS rather than
 // re-spelled here. `BILLING_POOL.CREDITS` is `'credits'`, which is NOT the report-level
@@ -329,7 +329,7 @@ export function summarizeChargedCost(segments) {
   };
 }
 
-// ── server plan writeback ─────────────────────────────────────────────────────────────────────
+// ── server plan writeback
 
 // Whether a plan the server sent back may replace the local record.
 //
@@ -406,7 +406,7 @@ export function planWriteback(response, context) {
   };
 }
 
-// ── the client ────────────────────────────────────────────────────────────────────────────────
+// ── the client
 
 function result(outcome, extra) {
   return {

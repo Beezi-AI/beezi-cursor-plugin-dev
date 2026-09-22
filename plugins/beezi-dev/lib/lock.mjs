@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { stateDir } from './paths-cursor.mjs';
 import { safeName } from './sidecar.mjs';
 import { removeSync } from './fs-compat.mjs';
+import { acquireMkdirLock, releaseMkdirLock } from './mkdir-lock.mjs';
 
 // A per-session mutex for the read-modify-write in lib/checkpoint.mjs.
 //
@@ -21,15 +22,19 @@ import { removeSync } from './fs-compat.mjs';
 //      of this figure: "it can never be recovered — usageData is cumulative, so the increment is
 //      gone." The same sentence is the reason this lock exists.
 //
-// The scheme is lifted from lib/token.mjs:16-45 rather than invented: `mkdir` is atomic on NTFS and
-// on POSIX (it either creates the directory or fails because someone else holds it), it needs no
-// daemon, no fcntl and no cleanup on reboot beyond the staleness rule below, and it is already
-// proven in this plugin. Two things are deliberately different here — see `sessionLockPath` for the
-// first (per-session, not machine-wide) and `withLock` for the second (contention SKIPS).
+// The scheme was not invented here: `mkdir` is atomic on NTFS and on POSIX (it either creates the
+// directory or fails because someone else holds it), it needs no daemon, no fcntl and no cleanup on
+// reboot beyond the staleness rule below, and it is already proven in this plugin — the credential
+// store arbitrates the same way, in lib/credential-lock.mjs `tryAcquire`. (It used to be lifted from
+// token.mjs; token.mjs no longer locks for itself, and its first 45 lines are now imports and
+// constants.) Two things are deliberately different here — see `sessionLockPath` for the first
+// (per-session, not machine-wide) and `withLock` for the second (contention SKIPS).
 //
-// NOT adopted by token.mjs yet: that module is a machine-wide single lock with different contention
-// semantics and is owned elsewhere. Folding it onto this helper is a follow-up, and until then the
-// ~25 duplicated lines are the deliberate cost of not touching a working refresh path.
+// The mkdir mechanics themselves are no longer duplicated: lock.mjs and lib/pulse-cursor.mjs both
+// call lib/mkdir-lock.mjs, which takes the staleness threshold and the fs implementation as
+// parameters so neither caller's tuning leaks into the other. The credential path is still NOT
+// folded in, and deliberately so: credential-lock.mjs reclaims on holder LIVENESS rather than on
+// age, and that is a different primitive wearing the same mkdir.
 
 // How long a lock may sit before the next caller treats it as abandoned and breaks it.
 //
@@ -42,8 +47,9 @@ export const LOCK_STALE_MS = 30_000;
 
 // Where one conversation's lock lives: `state/<id>.lock`, alongside the `state/<id>.json` it guards.
 //
-// Per-session on purpose. token.mjs holds ONE lock for the machine because there is one token to
-// refresh; here a machine-wide lock would make two unrelated conversations — a hook in repo A and a
+// Per-session on purpose. lib/credential-lock.mjs holds ONE lock for the machine — `lockDirFor`
+// puts it at `<home>/credentials.lock` — because there is one credential store that login, logout
+// and refresh all mutate; here a machine-wide lock would make two unrelated conversations — a hook in repo A and a
 // hook in repo B — serialize against each other, and under the SKIP semantics below that is not a
 // wait, it is a dropped checkpoint for a session that had no conflict at all.
 //
@@ -60,39 +66,24 @@ export function sessionLockPath(sessionId) {
   return name === null ? null : path.join(stateDir(), `${name}.lock`);
 }
 
-// Take the lock, or report that someone else holds a live one.
+// Take the lock, or report that someone else holds a live one. The mkdir mechanics — including the
+// parent-directory guard and the ENOENT incident behind it — live in lib/mkdir-lock.mjs.
 function acquire(lockPath, now) {
-  // The lock mkdir stays non-recursive — that is what makes it atomic — so the PARENT has to exist
-  // first. This is the ENOENT that already cost this plugin an outage once in token.mjs: nothing
-  // else had written to the data root yet, so `mkdir` failed with ENOENT, the lock was never
-  // acquired, and every caller took the contention branch forever. The state directory here is
-  // normally created by writeJsonSecure — but the FIRST checkpoint of a fresh install locks before
-  // it ever writes, so on that one run the directory genuinely does not exist.
-  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 }); } catch { /* best effort */ }
-  try {
-    fs.mkdirSync(lockPath, { recursive: false });
-    return true;
-  } catch {
-    try {
-      if (now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
-        removeSync(lockPath, { recursive: true, force: true });
-        fs.mkdirSync(lockPath, { recursive: false });
-        return true;
-      }
-    } catch { /* someone else broke it first, or it vanished — either way we did not get it */ }
-    return false;
-  }
+  return acquireMkdirLock(lockPath, { fsImpl: fs, now, staleMs: LOCK_STALE_MS });
 }
 
 function release(lockPath) {
-  try { removeSync(lockPath, { recursive: true, force: true }); } catch { /* ignore */ }
+  releaseMkdirLock(lockPath);
 }
 
 // Run `fn` while holding `lockPath`; return `options.miss` instead if the lock is already held.
 //
-// CONTENTION SKIPS — it does not sleep and proceed. token.mjs sleeps 750ms under contention and
-// carries on, which is right there (any valid access token will do, so the loser can just re-read
-// what the winner stored) and wrong here for two reasons:
+// CONTENTION SKIPS — it does not sleep and proceed. The credential refresh WAITS under contention:
+// token.mjs asks credential-lock.mjs for the lock with a 1000ms budget capped at 3000ms
+// (LOCK_WAIT_MS / LOCK_WAIT_MAX_MS, spent by `lockWait`), credential-lock.mjs polls for it every
+// 25ms (POLL_MS), and a refresh that still loses reports REFRESHING/LOCKED while serving the token
+// it already holds. That is right there (any valid access token will do, so the loser can just
+// re-read what the winner stored) and wrong here for two reasons:
 //
 //   - The whole checkpoint runs inside a 7500ms budget (HOOK_BUDGET_MS). A sleep spends that budget
 //     to arrive at a state the other process has already changed underneath us, so the loser then
@@ -122,7 +113,7 @@ export async function withLock(lockPath, fn, { now = Date.now, miss = undefined 
   }
 }
 
-// ── long-held sections ────────────────────────────────────────────────────────────────────────
+// ── long-held sections
 //
 // Everything above is built for a HOOK: take the lock, do millisecond work, drop it, and let the
 // next caller break anything older than 30 s because Cursor has already killed a hook that old.

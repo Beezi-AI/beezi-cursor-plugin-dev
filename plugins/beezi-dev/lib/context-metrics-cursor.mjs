@@ -1,3 +1,5 @@
+import { pickString } from './pick-field.mjs';
+
 // Context size and per-effort aggregates, derived from generation evidence. Pure: no filesystem, no
 // clock, no host calls — everything it knows arrives in the array.
 //
@@ -46,14 +48,6 @@ export const UNKNOWN_EFFORT = 'unknown';
 // into a canonical tier. Raw labels are preserved exactly as the host wrote them and carry
 // `known: false`. Filling this list requires a sanitized capture showing the field and its values.
 export const KNOWN_EFFORTS = Object.freeze([]);
-
-function pickString(record, fields) {
-  for (const field of fields) {
-    const value = record == null ? undefined : record[field];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
-}
 
 // A counter is usable only when it is a finite, non-negative whole number. A float, a numeric string
 // or a NaN is a schema surprise, and a schema surprise must not become a measurement.

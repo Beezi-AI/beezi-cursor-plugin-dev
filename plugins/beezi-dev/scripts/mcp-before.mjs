@@ -51,12 +51,10 @@ installHookGuards({ name: 'mcp-before', permission: true });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run, for the status surfaces. Always true; nothing is
-// arbitrated in a hook process any more. See lib/hook-source.mjs.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 // Draining the pipe is not optional: a permission hook that exits without reading the pipe Cursor is

@@ -3,7 +3,14 @@ import os from 'os';
 import path from 'path';
 import { createRequire } from 'module';
 import { pathToFileURL } from 'url';
-import * as hostPaths from './paths-cursor.mjs';
+// Default paths come from lib/paths-cursor.mjs, imported statically. This used to be a top-level
+// `await import()` in a try/catch, from when that module did not exist yet; it needs Node 14.8 and
+// the plugin's floor is 13.2, so the tolerance had to go. Nothing is lost: paths-cursor imports only
+// Node builtins and lib/env-identity.mjs, and does no work at import time, so it cannot fail to load. The degrade this module promises is unchanged and lives
+// in `hostPath`, now shared from that module — a path function that throws, or resolves to nothing,
+// still yields null and callers still take their documented degraded branch, the same one a missing
+// Cursor install produces.
+import { hostPath } from './paths-cursor.mjs';
 import { removeSync } from './fs-compat.mjs';
 
 // Read-only access to Cursor's SQLite stores (state.vscdb, ai-code-tracking.db) with no runtime
@@ -13,24 +20,6 @@ import { removeSync } from './fs-compat.mjs';
 // The degrade table this implements (design doc, "SQLite under a zero-dependency constraint"):
 //   node:sqlite present -> ai-code-tracking.db code changes + usageData cost/pool + plan
 //   absent              -> edits[] fallback, billing_pool 'unknown', plan via --plan self-report
-
-// Default paths come from lib/paths-cursor.mjs, imported statically. This used to be a top-level
-// `await import()` in a try/catch, from when that module did not exist yet; it needs Node 14.8 and
-// the plugin's floor is 13.2, so the tolerance had to go. Nothing is lost: paths-cursor imports only
-// `os` and `path` and cannot fail to load. The degrade this module promises is unchanged and lives
-// in `hostPath` below — a path function that throws, or resolves to nothing, still yields null and
-// callers still take their documented degraded branch, the same one a missing Cursor install
-// produces.
-function hostPath(fnName) {
-  const fn = hostPaths[fnName];
-  if (typeof fn !== 'function') return null;
-  try {
-    const resolved = fn();
-    return typeof resolved === 'string' && resolved !== '' ? resolved : null;
-  } catch {
-    return null;
-  }
-}
 
 let probed;
 
@@ -78,7 +67,7 @@ export function prefixUpperBound(prefix) {
 
 // Cursor has kept its key/value store in two tables across its format moves; both live in
 // state.vscdb and the key namespaces do not collide, so both are scanned.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const KV_TABLES = ['cursorDiskKV', 'ItemTable'];
 
 function decodeValue(value) {
@@ -333,7 +322,7 @@ function stateVscdbFile(deps = {}) {
 }
 
 // Cursor stores one record per conversation under this prefix in its key/value table.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const COMPOSER_KEY_PREFIX = 'composerData:';
 
 // The parsed composerData record for a conversation, or null when it cannot be read (no SQLite, no
@@ -392,7 +381,7 @@ function readComposerDataUncached(conversationId, deps) {
 // Field spellings Cursor has plausibly used for the two numbers we need. Adding a newly observed
 // spelling is a one-line change, and an unrecognized shape yields null (-> 'unknown'), never a zero
 // that would read as "covered by the seat".
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const AMOUNT_FIELDS = ['amount', 'numRequests', 'num_requests', 'requests', 'count'];
 const CENTS_FIELDS = ['costInCents', 'costCents', 'cost_in_cents', 'cents'];
 

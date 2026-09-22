@@ -86,7 +86,7 @@ const SOURCE_VALUES = Object.freeze(Object.keys(DIAGNOSTIC_SOURCES).map((k) => D
 export const isKnownCode = (value) => CODE_VALUES.indexOf(value) !== -1;
 export const isKnownSource = (value) => SOURCE_VALUES.indexOf(value) !== -1;
 
-// ─── suppression and reentrancy ─────────────────────────────────────────────
+// ─── suppression and reentrancy
 
 // Set for the lifetime of the delivery worker: a failure while SENDING diagnostics must never
 // enqueue a diagnostic about that failure, which the next worker would fail to send the same way.
@@ -110,7 +110,7 @@ export function setCurrentSource(source) {
   currentSource = isKnownSource(source) ? source : null;
 }
 
-// ─── shaping ────────────────────────────────────────────────────────────────
+// ─── shaping
 
 function shaped(value, pattern) {
   if (value == null) return null;
@@ -214,7 +214,7 @@ function pluginVersion(pluginRoot) {
   return VERSION.test(pkg.version) ? pkg.version : 'unknown';
 }
 
-// ─── the queue ──────────────────────────────────────────────────────────────
+// ─── the queue
 
 export function readPendingEvents(dir) {
   const target = dir == null ? telemetryQueueDir() : dir;
@@ -268,7 +268,7 @@ export function applyTelemetryRetention(deps = {}) {
   return removed;
 }
 
-// ─── recording ──────────────────────────────────────────────────────────────
+// ─── recording
 
 // Record one structured issue. Returns true only when a file on disk now reflects it.
 //

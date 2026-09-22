@@ -15,25 +15,17 @@ installHookGuards({ name: 'tool-event' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run. It is not a guard any more — it always returns true.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
-// Both registries stay installed permanently now, so on a machine where both fire this hook really
-// does run twice per tool call, and the second line really is written. It is dropped by the READER,
-// on the `eid` the host stamped on the event itself (lib/sidecar-events.mjs, dedupeEvents in
-// lib/delta-cursor.mjs) — identity is a fact about the event, where "which registry is alive" was
-// only ever a guess about the host.
-//
-// The stand-down this line used to perform rested on that guess: a launcher run exited 0 whenever a
-// bundled run had been recorded in the last fortnight. The Cursor CLI does not run a plugin's
-// bundled hooks at all (Cursor staff, forum 163890), so on a machine that used both the IDE and the
-// CLI, one IDE session switched off every `cursor-agent` hook for two weeks — no sidecar line, no
-// segment, no cost, and nothing anywhere saying so. The record is kept because `install status`,
-// `me` and the session banner still have to report which registry has been seen doing the work.
-// See lib/hook-source.mjs.
+// On a machine where both registries fire, this hook really does run twice per tool call, and the
+// stand-down this line used to perform rested on guessing which of them was alive: a launcher run
+// exited 0 whenever a bundled run had been recorded in the last fortnight. The Cursor CLI does not
+// run a plugin's bundled hooks at all (Cursor staff, forum 163890), so on a machine that used both
+// the IDE and the CLI, one IDE session switched off every `cursor-agent` hook for two weeks — no
+// sidecar line, no segment, no cost, and nothing anywhere saying so.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 // `postToolUse` — the hot path. This fires on EVERY tool call, so it appends to the sidecar and

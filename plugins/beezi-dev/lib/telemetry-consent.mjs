@@ -124,7 +124,7 @@ export function markNoticeShown(now = new Date(), deps = {}) {
   }
 }
 
-// ─── the one entry point ────────────────────────────────────────────────────
+// ─── the one entry point
 
 // Apply one of the four user-visible settings.
 //

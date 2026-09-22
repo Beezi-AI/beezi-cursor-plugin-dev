@@ -1,6 +1,10 @@
 import os from 'os';
 import path from 'path';
 import { dataRootName, variantMarker } from './env-identity.mjs';
+// This module's own exports, as the lookup table `hostPath` at the bottom of the file reads by
+// name. A self-import is a live namespace binding, not a second evaluation: nothing is re-run and
+// nothing enters the graph that was not already in it.
+import * as ownPaths from './paths-cursor.mjs';
 
 // This plugin's own data root — deliberately NOT `~/.beezi` (Claude Code's) and NOT `~/.beezi-codex`
 // (the Codex plugin's). All three write the same filenames: `queue/`, `state/`, `billing.json`,
@@ -136,7 +140,7 @@ export function hookSourceFile() {
 // bug in this function: a developer who exports XDG_CONFIG_HOME on Windows genuinely relocates
 // Cursor's config there, so guarding this by platform would send the plugin to a directory Cursor
 // is not using. Do not "fix" it.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function cursorConfigDir() {
   if (process.env.CURSOR_CONFIG_DIR) return process.env.CURSOR_CONFIG_DIR;
   if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, 'cursor');
@@ -146,7 +150,7 @@ export function cursorConfigDir() {
 // Where a locally-installed plugin is materialized. The installer copies the plugin here and points
 // the launchers at this copy, so a plugin upgrade is a re-run of the installer rather than a
 // registry that silently points at a deleted cache directory.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 // Namespaced by environment. Unsuffixed it is one directory for every variant, so installing dev
 // OVERWRITES the materialized prod copy that prod's launchers point at — and uninstalling dev then
 // deletes it.
@@ -156,7 +160,7 @@ export function cursorPluginDir() {
 
 // Cursor's per-project data (chat/agent state). Relocatable via CURSOR_DATA_DIR, which is a
 // *different* variable from CURSOR_CONFIG_DIR — a machine may set one and not the other.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function cursorProjectsDir() {
   const base = process.env.CURSOR_DATA_DIR == null
     ? path.join(os.homedir(), '.cursor')
@@ -167,7 +171,7 @@ export function cursorProjectsDir() {
 // Cursor's user-level hook registry. This is the P0 fallback target: if a plugin-scope
 // `hooks/hooks.json` turns out not to be discovered, the installer merges here instead
 // (`install --scope user`), which is the path the Codex plugin already proved.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function cursorHooksFile() {
   return path.join(cursorConfigDir(), 'hooks.json');
 }
@@ -176,14 +180,14 @@ export function cursorHooksFile() {
 // tracker writes it there regardless of CURSOR_CONFIG_DIR or XDG_CONFIG_HOME, so resolving it
 // through cursorConfigDir() would look in a directory that is empty on exactly the machines that
 // relocate their config.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function aiCodeTrackingDbFile() {
   return path.join(os.homedir(), '.cursor', 'ai-code-tracking.db');
 }
 
 // The VS Code-derived global storage directory that holds `state.vscdb` (Cursor is a VS Code fork,
 // so it keeps VS Code's per-platform layout under its own product name).
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function globalStorageDir() {
   const home = os.homedir();
   if (process.platform === 'win32') {
@@ -201,7 +205,28 @@ export function globalStorageDir() {
   return path.join(xdg, 'Cursor', 'User', 'globalStorage');
 }
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function stateVscdbFile() {
   return path.join(globalStorageDir(), 'state.vscdb');
+}
+
+// One named path function, resolved by name and degrading to null instead of throwing.
+// lib/vscdb.mjs, lib/cursor-account.mjs and lib/code-changes-cursor.mjs each carried a copy of this
+// body, keyed off a namespace import of this module; here the table is this module's own namespace
+// and the behaviour is unchanged. Every caller sits behind a hook that must not break the user's
+// Cursor session, so a name this module does not export, a resolver that throws, and a resolver
+// that answers with nothing are all ONE answer: null, and the caller takes its documented degraded
+// branch — the same one a missing Cursor install produces.
+//
+// The name is looked up per call, never at import time, so this adds no import-time work to the
+// hook processes that all load this module.
+export function hostPath(name) {
+  const fn = ownPaths[name];
+  if (typeof fn !== 'function') return null;
+  try {
+    const resolved = fn();
+    return typeof resolved === 'string' && resolved !== '' ? resolved : null;
+  } catch {
+    return null;
+  }
 }

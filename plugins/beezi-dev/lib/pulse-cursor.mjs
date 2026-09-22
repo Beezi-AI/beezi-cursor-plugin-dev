@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { stateDir } from './paths-cursor.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { removeSync } from './fs-compat.mjs';
+import { acquireMkdirLock, releaseMkdirLock } from './mkdir-lock.mjs';
 import { safeName } from './sidecar.mjs';
 
 // The mid-turn pulse: a long turn reporting before it ends.
@@ -88,7 +88,7 @@ function writeState(file, state, deps) {
   const write = deps.writeJsonImpl == null ? writeJsonSecure : deps.writeJsonImpl;
   // Best-effort: losing the stamp costs one extra checkpoint, while throwing here would cost the
   // tool call this gate is sitting on.
-  try { write(file, { v: STATE_VERSION, ...state }); } catch (error) { /* best effort */ }
+  try { write(file, { v: STATE_VERSION, ...state }); } catch { /* best effort */ }
 }
 
 // Is this event the one that should pay for a checkpoint?
@@ -109,26 +109,14 @@ export function pulseDecision(state, at) {
 }
 
 // The claim. Same atomic non-recursive mkdir the session lock uses — see lib/lock.mjs for why that
-// spelling and not a lock FILE.
+// spelling and not a lock FILE. The mechanics are lib/mkdir-lock.mjs; PULSE_CLAIM_STALE_MS goes in
+// as a parameter so it stays tunable independently of the session lock's own threshold.
 function claim(claimPath, at, fsImpl) {
-  try { fsImpl.mkdirSync(path.dirname(claimPath), { recursive: true, mode: 0o700 }); } catch (error) { /* best effort */ }
-  try {
-    fsImpl.mkdirSync(claimPath, { recursive: false });
-    return true;
-  } catch (error) {
-    try {
-      if (at - fsImpl.statSync(claimPath).mtimeMs > PULSE_CLAIM_STALE_MS) {
-        removeSync(claimPath, { recursive: true, force: true });
-        fsImpl.mkdirSync(claimPath, { recursive: false });
-        return true;
-      }
-    } catch (inner) { /* someone else broke it first, or it vanished */ }
-    return false;
-  }
+  return acquireMkdirLock(claimPath, { fsImpl, now: () => at, staleMs: PULSE_CLAIM_STALE_MS });
 }
 
 function release(claimPath) {
-  try { removeSync(claimPath, { recursive: true, force: true }); } catch (error) { /* ignore */ }
+  releaseMkdirLock(claimPath);
 }
 
 // Run a checkpoint if this session has not had one in PULSE_INTERVAL_MS, and answer what happened.
@@ -174,7 +162,7 @@ export async function maybeRunPulse(input, deps = {}, budgetMs = 0) {
     await runCheckpoint(input, {}, { emitTimeline: true, budgetMs });
     writeState(stateFile, { lastAt: now(), ok: true }, deps);
     return { ran: true, ok: true, reason: 'ran' };
-  } catch (error) {
+  } catch {
     // Stamped as a FAILURE, which is what buys the short retry rather than the full interval.
     writeState(stateFile, { lastAt: now(), ok: false }, deps);
     return { ran: true, ok: false, reason: 'failed' };

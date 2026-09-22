@@ -1,10 +1,22 @@
 import { payloadCursorVersion, sanitizeCursorVersion } from './hook-input-cursor.mjs';
+// `pickString` is the one shared field-probe, and this module carried a copy of it rather than
+// importing one on the grounds that it had to stay dependency-free. It is not, and was not: the
+// line above already reaches lib/hook-input-cursor.mjs, which imports `fs` and lib/hook-cwd.mjs.
+// The constraint that is real — and that this import respects — is that the postToolUse hook must
+// be able to load this module without pulling in the reporting engine (delta-cursor reaches
+// node:sqlite). lib/pick-field.mjs imports nothing at all, so it can neither drag the engine in
+// nor form a cycle.
+//
+// `pickString` and not `firstString`: `firstString` in hook-input-cursor.mjs is varargs and does
+// not trim, so reusing that name here would give one name two behaviours.
+import { pickString } from './pick-field.mjs';
 
 // Cursor hook payload → sidecar event lines.
 //
 // Kept out of both `sidecar.mjs` (the writer, which must not know about hook shapes) and
-// `scripts/tool-event.mjs` (a hot path that has to stay tiny and testable-by-proxy). Pure and
-// dependency-free, so the postToolUse hook can import it without pulling in the reporting engine.
+// `scripts/tool-event.mjs` (a hot path that has to stay tiny and testable-by-proxy). It imports only
+// lib/hook-input-cursor.mjs and lib/pick-field.mjs — neither reaches the reporting engine — so the
+// postToolUse hook can import it without dragging `node:sqlite` onto the hot path.
 //
 // The event kinds are the vocabulary `delta-cursor` / `operations-cursor` / `code-changes-cursor`
 // read back:
@@ -27,7 +39,7 @@ import { payloadCursorVersion, sanitizeCursorVersion } from './hook-input-cursor
 // exceptions are marked where they occur (`beforeMCPExecution`, `subagentStart`/`subagentStop`) and
 // both have the same justification: those payloads are field-ambiguous with payloads we already
 // handle, and guessing wrong DOUBLE-COUNTS rather than under-reports.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 
 // The observed Cursor build, stamped on every line a payload produces and read back by replay.
 //
@@ -133,19 +145,6 @@ const SUBAGENT_TASK_FIELDS = ['task'];
 const SUBAGENT_PARENT_FIELDS = ['parent_conversation_id', 'parentConversationId'];
 const SUBAGENT_STATUS_FIELDS = ['status'];
 
-// Same shape as `pickString` in delta-cursor / operations-cursor / code-changes-cursor. Copied
-// rather than imported: this module's whole point is to stay dependency-free so the postToolUse
-// hook can load it without pulling in the reporting engine (delta-cursor reaches node:sqlite).
-// Named identically to the others on purpose — `firstString` in hook-input-cursor.mjs is varargs
-// and does not trim, so reusing that name here would give one name two behaviours.
-function pickString(payload, fields) {
-  for (const field of fields) {
-    const value = payload[field];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
-}
-
 function byteLengthOf(output) {
   if (typeof output === 'string') return Buffer.byteLength(output, 'utf-8');
   if (output == null) return 0;
@@ -210,6 +209,19 @@ function observedCount(...values) {
   return null;
 }
 
+// The replaced and the replacing text of one edit record, under either spelling, or `undefined` for
+// a side the record does not carry. Shared with `lineCountsFromText` in lib/code-changes-cursor.mjs
+// so write time and read time look under the same keys; only the KEYS are shared, because the two
+// callers deliberately answer differently when neither side is there — `{}` here, null there, and
+// the null is what that module's three-state precedence is built on.
+export function editTexts(record) {
+  if (record == null) return { before: undefined, after: undefined };
+  return {
+    before: typeof record.old_string === 'string' ? record.old_string : record.oldString,
+    after: typeof record.new_string === 'string' ? record.new_string : record.newString,
+  };
+}
+
 // `{ added?, removed? }` for one edit — either what the payload counted, or what its text says, or
 // neither. Mirrors `applyEdit`'s own precedence in code-changes-cursor.mjs so the fallback source is
 // chosen the same way at write time and at read time: reported counts win WHOLESALE (if either is
@@ -225,12 +237,7 @@ function editCounts(record) {
   if (added !== null || removed !== null) {
     return { ...(added === null ? {} : { added }), ...(removed === null ? {} : { removed }) };
   }
-  const before = record == null
-    ? undefined
-    : (typeof record.old_string === 'string' ? record.old_string : record.oldString);
-  const after = record == null
-    ? undefined
-    : (typeof record.new_string === 'string' ? record.new_string : record.newString);
+  const { before, after } = editTexts(record);
   // One side present is enough — a pure insertion has an empty `old_string` and a pure deletion an
   // empty `new_string`, and both are real observations of the edit. Neither side present is not.
   if (typeof before !== 'string' && typeof after !== 'string') return {};
@@ -324,8 +331,8 @@ function editEvents(payload, eid) {
 // carries its own credentials (`npx some-mcp --api-key sk-…`) and a remote server's url can carry a
 // token in its query string; the sidecar is a plain-text file that outlives the session and is read
 // back by the reporting engine, so writing either into it turns a telemetry log into a secret store.
-// Deriving at write time also keeps this module dependency-free, which is the only reason the
-// postToolUse hot path can import it at all.
+// Deriving at write time also keeps the reporting engine out of this module's import graph, which is
+// the only reason the postToolUse hot path can import it at all.
 function mcpServerEvent(tool, server, eid) {
   return {
     ev: 'mcp_server',
@@ -568,4 +575,51 @@ export function eventsFromHookPayload(payload, options = {}) {
     for (const event of events) event[CURSOR_VERSION_FIELD] = version;
   }
   return events;
+}
+
+// One subagent hook payload → the parent conversation's sidecar. Shared by
+// scripts/subagent-start.mjs and scripts/subagent-stop.mjs, which are REQUIRED to apply the
+// identical rule — see the routing note in the body.
+//
+// It lives here and not in lib/sidecar.mjs because the rule reads `parent_conversation_id`, which
+// is a hook payload field: sidecar.mjs is the writer, and the writer must not know about hook
+// shapes. Payload shapes are exactly what this module owns.
+//
+// The writer is a PARAMETER, not an import. lib/checkpoint.mjs and lib/code-changes-cursor.mjs
+// load this module for its read-side helpers alone, and importing lib/sidecar.mjs here would hand
+// them the writer and lib/paths-cursor.mjs with it. Both hook scripts already hold the module —
+// they load it in the same dynamic `Promise.all` — so injecting it costs them nothing.
+//
+// Introduces no output and no throw path of its own, which is not optional: `subagentStart` is a
+// PERMISSION hook whose whole contract is that it says nothing and exits 0 on every path. See the
+// header of scripts/subagent-start.mjs. `appendEvent` is documented never to throw.
+export function appendSubagentEvents(sidecar, payload, sessionId, cwd) {
+  // WHICH CONVERSATION'S SIDECAR. `parent_conversation_id` wins over the payload's own session id.
+  //
+  // Only a TOP-LEVEL `stop` / `sessionEnd` ever checkpoints, and a checkpoint reads exactly one
+  // conversation's sidecar. If Cursor stamps this payload with the CHILD's id, the line lands in a
+  // file nothing will ever flush — the subagent is recorded, perfectly, into a void. Routing to the
+  // parent is what makes the span reachable by the hook that reports it. When the two are the same
+  // id (or the parent field is absent, which is the documented shape today) this is a no-op.
+  //
+  // Both hooks apply this one rule, so both halves of a span land in the same file — which is the
+  // reason it is a function rather than a copy in each script. When the stop payload carries no
+  // parent field and its session id IS the child's, the two halves land apart — the start stays
+  // open and is closed synthetically, which is the designed fallback rather than a lost worker.
+  // Whether that happens is a capture-session question, not a design one.
+  const parent =
+    payload == null ? undefined
+      : payload.parent_conversation_id != null ? payload.parent_conversation_id
+        : payload.parentConversationId;
+  const target = typeof parent === 'string' && parent !== '' ? parent : sessionId;
+  // Subagent lines ONLY. `eventsFromHookPayload` is field-driven and this payload can carry a
+  // `tool_name` or a `model` too — emitting those would write a second `tool`/`gen` line for a call
+  // `postToolUse` has already recorded, and because the two lines differ in content (this one has no
+  // bytes and no timing) the reader's duplicate collapse cannot merge them. That double-counts the
+  // parent's operations and its request count for every delegation.
+  for (const event of eventsFromHookPayload(payload)) {
+    if (typeof event.ev === 'string' && event.ev.startsWith('subagent_')) {
+      sidecar.appendEvent(target, sidecar.withCwd(event, cwd));
+    }
+  }
 }

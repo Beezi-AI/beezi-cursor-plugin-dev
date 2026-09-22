@@ -176,7 +176,7 @@ export function readControlSnapshot(deps = {}) {
   };
 }
 
-// ── reading ──────────────────────────────────────────────────────────────────
+// ── reading
 
 const readOutcome = (status, over = {}) => ({
   status,
@@ -347,7 +347,7 @@ function lockOptions(deps, options) {
   };
 }
 
-// ── committing ───────────────────────────────────────────────────────────────
+// ── committing
 
 // Distinguishes two attempts by the SAME process (the CONFLICT rebase below makes a second one), so
 // a retry never reuses the slot name its first attempt may have left behind.
@@ -536,7 +536,7 @@ export async function commitCredentials(creds, deps = {}, options = {}) {
   return result;
 }
 
-// ── deleting ─────────────────────────────────────────────────────────────────
+// ── deleting
 
 // Erase this namespace's credential and prove it. A logout that reports success while the keyring
 // still serves the token is AUTH-01 itself, so the committed slot is re-read afterwards and a value
@@ -621,7 +621,7 @@ export async function deleteCredentialRecord(deps = {}, options = {}) {
   return result;
 }
 
-// ── recovering a credential written by an older client ───────────────────────
+// ── recovering a credential written by an older client
 
 // The rollback hole this closes: an older build reads `credentials.json`, which migration retired,
 // so it reports "not linked"; the user signs in again and that build writes the LEGACY slot; the
@@ -665,7 +665,7 @@ export async function recoverLegacyCredential(deps = {}) {
   return { status: CredentialStatus.COMMITTED, generation: result.generation, where: result.where };
 }
 
-// ── compatibility adapters ───────────────────────────────────────────────────
+// ── compatibility adapters
 //
 // The three functions every existing caller imports. They keep their old shapes — a credentials
 // object or null, a "where it landed" sentence, and a best-effort delete — so the typed API above

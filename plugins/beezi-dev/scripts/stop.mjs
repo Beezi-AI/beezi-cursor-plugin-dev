@@ -16,18 +16,15 @@ installHookGuards({ name: 'stop' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run, for the status surfaces. Always true — nothing is
-// arbitrated here any more; both registries stay installed, both fire, and the duplicate lines are
-// collapsed by the reader on the host's own event id (dedupeEvents in lib/delta-cursor.mjs).
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // This hook is the worst place the old stand-down could have fired, and under `cursor-agent` it
 // fired here every time: no bundled hook runs in the CLI at all (Cursor staff, forum 163890), so a
 // launcher that stood down because an IDE session had been recorded took the turn's token counts,
-// the turn boundary and the checkpoint with it. See lib/hook-source.mjs.
+// the turn boundary and the checkpoint with it.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 runHook({

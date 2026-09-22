@@ -11,19 +11,15 @@ installHookGuards({ name: 'stop-failure' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run, for the status surfaces. Always true; both registries
-// stay installed and both fire, and the duplicate sidecar lines are collapsed by the reader on the
-// host's own event id (dedupeEvents in lib/delta-cursor.mjs).
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // The stand-down that used to live here exited a launcher run whenever a bundled run had been
 // recorded in the last fortnight. The Cursor CLI runs no plugin-bundled hook at all (Cursor staff,
 // forum 163890), so on a machine that used both hosts, every tool failure under `cursor-agent` went
-// unreported — the one hook whose entire job is telling the user something broke. See
-// lib/hook-source.mjs.
+// unreported — the one hook whose entire job is telling the user something broke.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 // `postToolUseFailure` — the failure-reporting hook the Codex fork had to delete (Codex has no

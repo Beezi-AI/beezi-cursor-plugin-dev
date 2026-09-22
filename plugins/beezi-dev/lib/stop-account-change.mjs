@@ -102,7 +102,7 @@ export const ChangeReason = Object.freeze({
   PAYLOAD_EMAIL: 'payload-email-mismatch',
 });
 
-// ── the scope, the transport and the call are NOT built here ──────────────────────────────────
+// ── the scope, the transport and the call are NOT built here
 //
 // `lib/account-checkin.mjs` is plan §4 B3's one production entry point for the check-in, and it
 // already owns every piece of wiring this path would otherwise have to reinvent: the
@@ -127,7 +127,7 @@ function checkInTimeoutMs(remainingMs) {
   return Math.max(Math.min(remainingMs - CHECKIN_BUDGET_RESERVE_MS, POST_TIMEOUT_MS), 250);
 }
 
-// ── the pending marker ────────────────────────────────────────────────────────────────────────
+// ── the pending marker
 //
 // `readAccountSyncState` normalizes the file down to four known fields and `writeAccountSyncState`
 // writes exactly those, so neither can carry a marker. The marker is therefore read and written
@@ -185,7 +185,7 @@ export function clearPendingCheckIn(file, scope, deps) {
   patchAccountSyncState(file, scope, { pendingCheckIn: false, pendingNextAt: 0 }, deps);
 }
 
-// ── C4: the hook payload's `user_email` ───────────────────────────────────────────────────────
+// ── C4: the hook payload's `user_email`
 //
 // PRIVACY, AND IT IS NOT NEGOTIABLE. The live Cursor `stop` payload carries `user_email`.
 // `lib/hook-input-cursor.mjs` refuses to carry it into the normalized input and
@@ -213,7 +213,7 @@ export function payloadEmailMismatch(payload, anchor) {
   return fromPayload !== stored;
 }
 
-// ── C2: did anything move? ────────────────────────────────────────────────────────────────────
+// ── C2: did anything move?
 //
 // `compareAnchors` first, because it is the only comparison that can tell a seat apart from
 // another seat; then the plan and the status, which move under a seat that did not change at all
@@ -241,7 +241,7 @@ export function detectChange(observedAnchor, record, observation, payload) {
   return null;
 }
 
-// ── C1–C4: the whole check ────────────────────────────────────────────────────────────────────
+// ── C1–C4: the whole check
 
 // Called from the stop hook's handler, AFTER the turn boundary is appended and BEFORE
 // `runCheckpoint`. It never throws: every failure inside it is caught and answered as FAILED, so a

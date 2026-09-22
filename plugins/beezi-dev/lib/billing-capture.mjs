@@ -38,7 +38,7 @@ function safeHostField(value) {
   }
 }
 
-// ── argument parsing ──────────────────────────────────────────────────────────────────────────
+// ── argument parsing
 
 // `--expires-at` accepted a vendor credential expiry that Cursor has never exposed. It stays
 // PARSEABLE so an older installed shim or a copied command line does not hard-fail, but the value
@@ -78,7 +78,7 @@ export const DEPRECATION_NOTICES = Object.freeze({
 
 export { AccountSource, DEPRECATED_FLAGS };
 
-// ── observations ──────────────────────────────────────────────────────────────────────────────
+// ── observations
 
 // Self-reported plans a user can pick in the sign-in fallback. Cursor has **no** `AskUserQuestion`
 // equivalent and no `$ARGUMENTS` substitution in commands, so the value reaches this script as free
@@ -148,7 +148,7 @@ export function observationFromAccount(account, via) {
   );
 }
 
-// ── identity ──────────────────────────────────────────────────────────────────────────────────
+// ── identity
 
 export const IdentityMatch = Object.freeze({
   MATCH: 'match',
@@ -183,7 +183,7 @@ export function compareAnchors(observed, existing) {
   return observed.email === existing.email ? IdentityMatch.MATCH : IdentityMatch.SWITCH;
 }
 
-// ── reconciliation ────────────────────────────────────────────────────────────────────────────
+// ── reconciliation
 
 export const ReconcileOutcome = Object.freeze({
   // Nothing could be observed at all (no SQLite, no CLI config, no argument).
@@ -369,7 +369,7 @@ export function reconcilePlan(observationInput, existing, options) {
     changes.push(change(ChangeKind.MIGRATED, 'version', existing.version == null ? 1 : existing.version, BILLING_SCHEMA_VERSION));
   }
 
-  // ── a record from a newer client ───────────────────────────────────────────────────────────
+  // ── a record from a newer client
   // Rewriting it in this version's shape would drop whatever that client added. Refuse, and leave
   // `--force` as the documented escape hatch for a user who deliberately rolled the plugin back.
   if (prior != null && typeof prior.version === 'number' && prior.version > BILLING_SCHEMA_VERSION && !force) {
@@ -377,7 +377,7 @@ export function reconcilePlan(observationInput, existing, options) {
     return { outcome: ReconcileOutcome.KEPT, record: prior, changes, persist: false };
   }
 
-  // ── nothing was observed ───────────────────────────────────────────────────────────────────
+  // ── nothing was observed
   if (observationInput == null) {
     changes.push(change(ChangeKind.UNAVAILABLE, 'plan', prior == null ? null : prior.plan, prior == null ? null : prior.plan));
     if (!attempted) {
@@ -412,7 +412,7 @@ export function reconcilePlan(observationInput, existing, options) {
   const priorKnown = prior != null && known(prior.plan);
   const due = force || prior == null || isDue(prior, now, RECHECK_MS);
 
-  // ── a confirmed switch to a different account ──────────────────────────────────────────────
+  // ── a confirmed switch to a different account
   if (identity === IdentityMatch.SWITCH) {
     // Name the identity that actually moved. On an id-driven switch both emails can be null, and
     // reporting `null -> null` would describe the one event a user most needs to understand as
@@ -438,7 +438,7 @@ export function reconcilePlan(observationInput, existing, options) {
     };
   }
 
-  // ── same account, or an account we cannot identify ─────────────────────────────────────────
+  // ── same account, or an account we cannot identify
   if (known(obs.plan)) {
     const anchorChanged = !anchorsEqual(anchor, prior == null ? null : prior.accountAnchor);
     if (!priorKnown) {
@@ -475,7 +475,7 @@ export function reconcilePlan(observationInput, existing, options) {
     };
   }
 
-  // ── the source produced no plan we recognize ───────────────────────────────────────────────
+  // ── the source produced no plan we recognize
   if (priorKnown) {
     // Preserve the value AND its provenance. `capturedAt` must not move: nothing about the plan
     // was observed, and an unobserved plan that looks freshly captured is the whole of BILL-V01.
@@ -511,7 +511,7 @@ export function reconcilePlan(observationInput, existing, options) {
   };
 }
 
-// ── reporting the outcome ─────────────────────────────────────────────────────────────────────
+// ── reporting the outcome
 
 // A skill must not have to parse arbitrary console wording to learn what happened, so every run
 // prints exactly one machine-readable line with this prefix. The human lines around it are free to

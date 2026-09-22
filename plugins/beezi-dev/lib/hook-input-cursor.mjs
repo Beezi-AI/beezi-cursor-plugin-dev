@@ -181,7 +181,7 @@ export function stampableCwd(payload, env = process.env) {
 // Still returns an array: the caller's guard is `.some(isGitCheckpointCommand)`, and keeping the
 // plural shape means a future Cursor event that batches commands is a one-line change here rather
 // than a change at every call site.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 export function shellCommandsOf(input) {
   const direct = input == null ? undefined : input.command;
   if (typeof direct === 'string' && direct !== '') return [direct];

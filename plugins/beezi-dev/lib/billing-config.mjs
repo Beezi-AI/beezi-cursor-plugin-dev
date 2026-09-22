@@ -19,7 +19,7 @@ export function writeBillingConfig(obj) {
   writeJsonSecure(billingConfigFile(), obj);
 }
 
-// ── account anchor ────────────────────────────────────────────────────────────────────────────
+// ── account anchor
 //
 // The anchor answers "whose plan is this?". It is deliberately NOT the same thing as the record's
 // `source` field: that one names the money stream (the BillingSource enum), this one names where
@@ -70,7 +70,7 @@ export function normalizeAccountAnchor(raw) {
   };
 }
 
-// ── migration ─────────────────────────────────────────────────────────────────────────────────
+// ── migration
 
 function isoOrNull(value) {
   if (typeof value !== 'string') return null;
@@ -150,7 +150,7 @@ export function migrateBillingRecord(raw, options) {
   return { record, migrated: true };
 }
 
-// ── freshness ─────────────────────────────────────────────────────────────────────────────────
+// ── freshness
 
 function lastLookedAt(record) {
   const stamps = [];

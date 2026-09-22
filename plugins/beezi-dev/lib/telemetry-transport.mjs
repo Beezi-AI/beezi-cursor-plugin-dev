@@ -105,7 +105,7 @@ const BACKEND_REASONS = new Set([
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-// ─── the request ────────────────────────────────────────────────────────────
+// ─── the request
 
 // Seconds or an HTTP-date, per RFC 9110. Anything else, or a value past an hour, reads as absent,
 // so a hostile or broken header cannot park the queue indefinitely.
@@ -165,7 +165,7 @@ export async function postDiagnostics(url, payload, deps = {}) {
   return { status, retryAfterMs: retryAfterMs(header, now()), body };
 }
 
-// ─── the envelope ───────────────────────────────────────────────────────────
+// ─── the envelope
 
 function pick(value, allowed, fallback) {
   return typeof value === 'string' && allowed.has(value) ? value : fallback;
@@ -216,7 +216,7 @@ function isPostableEvent(value) {
     && typeof value.lastSeenAt === 'string' && value.lastSeenAt.length > 0;
 }
 
-// ─── the queue side ─────────────────────────────────────────────────────────
+// ─── the queue side
 
 // Freezes each accumulating event into an immutable one, named for its eventId. `rename` is the
 // synchronization: it is atomic within a filesystem, so a competing recorder either finds the file

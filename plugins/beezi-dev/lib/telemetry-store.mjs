@@ -96,7 +96,7 @@ export function noticeFile(home) {
   return path.join(telemetryDir(home), 'notice.json');
 }
 
-// ─── the lock ───────────────────────────────────────────────────────────────
+// ─── the lock
 
 // Long enough that a worker doing four bounded round trips plus its 30s watchdog cannot have its
 // lock stolen while it is still alive, short enough that a machine that hard-powered-off mid-batch
@@ -238,7 +238,7 @@ export function withTelemetryLockSync(fn, options = {}) {
   }
 }
 
-// ─── queue primitives ───────────────────────────────────────────────────────
+// ─── queue primitives
 
 // Only `.json` basenames are events. A `.tmp` left by an interrupted atomic write is not one, and
 // neither is a directory — the same rule lib/queue-delivery.mjs applies to the analytics queue.
@@ -267,7 +267,7 @@ export function countPending(dir) {
   return listQueueFiles(dir).length;
 }
 
-// ─── the purges ─────────────────────────────────────────────────────────────
+// ─── the purges
 //
 // Here rather than in telemetry-consent.mjs because BOTH the consent CLI and the delivery worker
 // have to run them — the worker rechecks consent before every batch and empties the queue itself

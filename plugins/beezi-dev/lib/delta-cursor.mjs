@@ -4,6 +4,10 @@ import { computeOperations, totalEstTokens } from './operations-cursor.mjs';
 import { computeCodeChanges } from './code-changes-cursor.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import * as hostTiming from './timing.mjs';
+// One `timestampOf`, owned by the dependency-free module. This file used to carry an identical
+// copy; lib/subagents-cursor.mjs imports nothing, so reading it from there cannot make a cycle.
+import { timestampOf } from './subagents-cursor.mjs';
+import { pickString } from './pick-field.mjs';
 
 // Turn the sidecar into one reportable segment and split its requests across the two money streams.
 //
@@ -40,7 +44,7 @@ export const BILLING_POOL = Object.freeze({
   UNKNOWN: 'unknown',
 });
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const GEN_EVENTS = new Set(['gen', 'generation']);
 const MODEL_FIELDS = ['model', 'model_name', 'modelName'];
 // The user-facing spelling of the same model — the id with its `model_params` folded in
@@ -136,24 +140,6 @@ const UNKNOWN_MODEL = 'unknown';
 // straddled, so a short tail is enough and an unbounded list would grow for the life of a
 // conversation. Oldest entries fall off the front.
 export const MAX_CARRIED_GENERATIONS = 200;
-
-function pickString(event, fields) {
-  for (const field of fields) {
-    const value = event == null ? undefined : event[field];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
-}
-
-function timestampOf(event) {
-  const raw = event == null ? undefined : (event.ts == null ? event.timestamp : event.ts);
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw < 1e12 ? raw * 1000 : raw;
-  if (typeof raw === 'string') {
-    const ms = Date.parse(raw);
-    return Number.isFinite(ms) ? ms : null;
-  }
-  return null;
-}
 
 // Every `usageData` key that prices one model, matched case-insensitively — a case difference
 // between the hook payload's spelling and Cursor's own would otherwise move an entire model's spend

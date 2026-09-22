@@ -1,4 +1,4 @@
-import { apiBase, ENDPOINTS } from './config.mjs';
+import { apiBase } from './config.mjs';
 import { postJson as _postJson, readJsonBounded, POST_TIMEOUT_MS } from './http.mjs';
 import { getAccessToken as _getAccessToken, authEpoch as _authEpoch } from './token.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
@@ -56,7 +56,7 @@ function skipped(reason) {
   return { outcome: null, successful: false, writeback: null, skipped: reason };
 }
 
-// ── the scope ─────────────────────────────────────────────────────────────────────────────────
+// ── the scope
 
 // `checkInAccount` REFUSES an incomplete scope — `SCHEMA/incomplete-scope`, and it looks exactly
 // like every other schema refusal. Building the scope here, and reporting a failure to build it as
@@ -102,7 +102,7 @@ export function buildCheckInScope(sources) {
   return { ok: true, reason: null, scope: { env, beeziAccount } };
 }
 
-// ── the transport adapter ─────────────────────────────────────────────────────────────────────
+// ── the transport adapter
 
 // `checkInAccount` expects `postJson(endpoint, body, token) -> {ok, status, body}`. `lib/http.mjs`
 // exports `postJson(url, token, body, deps) -> Response`. THREE things differ, and every one of
@@ -136,7 +136,7 @@ export function makeCheckInTransport(options) {
   };
 }
 
-// ── the payload ───────────────────────────────────────────────────────────────────────────────
+// ── the payload
 
 // Everything is taken from the RECONCILED RECORD, not from a second read of the host.
 //
@@ -167,7 +167,7 @@ export function identifiesAnAccount(payload) {
   return typeof payload.accountUuid === 'string' || typeof payload.email === 'string';
 }
 
-// ── the call ──────────────────────────────────────────────────────────────────────────────────
+// ── the call
 
 // Check this machine's Cursor account in with the portal, if there is anything to say.
 //

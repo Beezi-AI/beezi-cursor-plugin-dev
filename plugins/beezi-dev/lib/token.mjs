@@ -89,7 +89,7 @@ function cacheableWith(deps) {
   return !STORE_SEAMS.some((seam) => deps[seam] !== undefined);
 }
 
-// ── reading the store through whichever seam the caller supplied ─────────────
+// ── reading the store through whichever seam the caller supplied
 
 // The caller's deadline, spent where it is actually spent.
 //
@@ -163,7 +163,7 @@ function shape(state, reason, record, over = {}) {
   });
 }
 
-// ── refresh ──────────────────────────────────────────────────────────────────
+// ── refresh
 
 function lockWait(options) {
   if (options == null || options.deadlineMs == null) return LOCK_WAIT_MS;
@@ -299,7 +299,7 @@ async function commitRefreshed(next, record, deps) {
   return committed;
 }
 
-// ── the public typed accessor ────────────────────────────────────────────────
+// ── the public typed accessor
 
 // The one auth accessor: never throws, never deletes credentials, and reports WHY when there is no
 // token rather than collapsing every cause into "not linked".
@@ -406,7 +406,7 @@ export async function forceRefresh(options = {}, deps = options) {
   };
 }
 
-// ── compatibility adapter ────────────────────────────────────────────────────
+// ── compatibility adapter
 
 // The bare-token accessor every existing caller imports. Returns a bearer-ready access token, or
 // null when there is not one to offer — a caller that needs to know WHY (and every caller that

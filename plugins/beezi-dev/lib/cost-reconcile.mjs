@@ -11,7 +11,7 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 // authoritative cumulative statement from what the host can still be read for, and tracks
 // separately what it ATTEMPTED to scan and what the server ACKNOWLEDGED.
 //
-// ─── WHAT IS NOT HERE, ON PURPOSE ────────────────────────────────────────────────────────────
+// ─── WHAT IS NOT HERE, ON PURPOSE
 // There is no route. Replaying cumulative totals into an additive segment ingest double-bills, so
 // the server must first specify replacement/max/revision semantics, identity (account AND
 // environment, not just conversation/model/pool), reset and decreasing-total handling, and how a
@@ -42,7 +42,7 @@ export const SnapshotStatus = Object.freeze({
   UNREADABLE: 'unreadable',
 });
 
-// ── the pure snapshot builder ─────────────────────────────────────────────────────────────────
+// ── the pure snapshot builder
 
 function finiteNumber(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -144,11 +144,17 @@ export function buildUsageSnapshot(readableUsage, options) {
   };
 }
 
-// ── account-scoped pending state ──────────────────────────────────────────────────────────────
+// ── account-scoped pending state
 
-// Exported because lib/account-sync.mjs scopes its heartbeat state by exactly the same three
-// facts, and two spellings of one scope key mean two files that disagree about which account they
-// belong to. A shared lib/account-scope.mjs is the eventual home; see the handoff.
+// Exported for this module's own callers. lib/account-sync.mjs does NOT share this key: it builds
+// its own two-segment `checkInScopeKey` (environment + Beezi account) and leaves the Cursor
+// account out on purpose, because including it breaks the sub1 -> sub2 -> sub1 flip-back re-send
+// (see lib/account-sync.mjs:170-186). This key is three-segment and lowercases the Cursor account.
+// The two are deliberately DIFFERENT and stay different: the digest is the state FILENAME, so
+// folding them into one helper would re-orphan every state file on disk — account-sync already
+// paid that migration cost once, accepting one extra check-in per machine. The differing segment
+// counts are also what guarantees a check-in key can never collide with a cost-state key. The
+// shared lib/account-scope.mjs plan is dead: that file does not exist and is not coming.
 export function accountScopeKey(scope) {
   const s = scope == null ? {} : scope;
   return [
@@ -166,8 +172,11 @@ export function accountScopeDigest(scope) {
 // anywhere else in the plugin: a floor carried across an account switch would tell the new account
 // that the old account's conversations were already reconciled.
 //
-// The path SHAPE lives here rather than in lib/paths-cursor.mjs because that file is shared and
-// frozen for this change; the handoff carries the patch that moves it there.
+// The path SHAPE lives here rather than in lib/paths-cursor.mjs because the cost-state layout is
+// this module's own concern: paths-cursor.mjs exports no cost-state helper, and this module takes
+// only `beeziCursorHome` from it. (The older note that paths-cursor.mjs was shared and frozen
+// pending a handoff is obsolete — that handoff landed, and paths-cursor.mjs is itself being edited
+// in this refactor.)
 export function costStateDir() {
   return path.join(beeziCursorHome(), 'cost-state');
 }
@@ -206,7 +215,7 @@ export function writeCostState(file, state, scope) {
   writeJsonSecure(file, { ...state, version: COST_STATE_VERSION, scope: accountScopeKey(scope) });
 }
 
-// ── scheduling and the attempt gate ───────────────────────────────────────────────────────────
+// ── scheduling and the attempt gate
 
 // The state transitions below all take a partial state (a caller may hold one built by hand, or a
 // state file written before a field existed) and always hand back a complete one. A missing
@@ -259,7 +268,7 @@ export function releaseScanAttempt(state) {
   return { ...normalizeState(state), attempt: null };
 }
 
-// ── acknowledgement-only floor ────────────────────────────────────────────────────────────────
+// ── acknowledgement-only floor
 
 // The ONLY way the floor moves. A late acknowledgement for an older scan cannot rewind it, and an
 // unacknowledged result leaves it exactly where it was so the next scan covers the same ground.
@@ -291,7 +300,7 @@ export function selectConversations(entries, state, options) {
   });
 }
 
-// ── the sender (gated off) ────────────────────────────────────────────────────────────────────
+// ── the sender (gated off)
 
 // Sends an authoritative cumulative statement. Default-off and route-less: both gates have to be
 // opened deliberately, by a caller that has the deployed contract in hand.

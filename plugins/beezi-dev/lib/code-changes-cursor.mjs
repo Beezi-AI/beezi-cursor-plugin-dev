@@ -1,7 +1,8 @@
 import path from 'path';
 import * as hostPaths from './paths-cursor.mjs';
 import { withDatabase } from './vscdb.mjs';
-import { lineCount } from './sidecar-events.mjs';
+import { lineCount, editTexts } from './sidecar-events.mjs';
+import { pickString } from './pick-field.mjs';
 
 // Code-change stats for a segment, in the same shape the Codex and Claude engines report:
 //   { files_changed, lines_added, lines_removed, by_extension }
@@ -28,7 +29,7 @@ import { lineCount } from './sidecar-events.mjs';
 // plugin's floor is 13.2, so the binding is static now: the module is a sibling in this package, and
 // resolveDbFile() below still degrades to null on anything short of a callable export.
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine.
+// TODO(P0): unverified — see lib/hook-dump.mjs
 // ai-code-tracking.db's table and column names come from decompiled-binary analysis and have moved
 // before, so they are discovered from sqlite_master rather than hardcoded to one spelling. Each
 // candidate list is one line per name.
@@ -59,14 +60,6 @@ const REMOVED_FIELDS = ['removed', 'lines_removed', 'linesRemoved', 'deletions']
 function extOf(filePath) {
   const ext = path.extname(filePath || '').toLowerCase();
   return ext || '(none)';
-}
-
-function pickString(record, fields) {
-  for (const field of fields) {
-    const value = record == null ? undefined : record[field];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
 }
 
 // A count the record actually carried, or null when it carried none. `typeof value === 'number'` is
@@ -137,12 +130,7 @@ function finalize(collector) {
 // whose replaced text is under keys we do not know returns null here, the caller records the file
 // as touched with no line counts, and `uncountedEdits` says so. Never a wrong number.
 function lineCountsFromText(record) {
-  const before = record == null
-    ? undefined
-    : (typeof record.old_string === 'string' ? record.old_string : record.oldString);
-  const after = record == null
-    ? undefined
-    : (typeof record.new_string === 'string' ? record.new_string : record.newString);
+  const { before, after } = editTexts(record);
   if (typeof before !== 'string' && typeof after !== 'string') return null;
   // `lineCount` answers 0 for a non-string, which is the right answer for the one-sided cases: a
   // pure insertion carries no `old_string` and a pure deletion no `new_string`.
@@ -335,12 +323,5 @@ export function computeCodeChanges(events, deps = {}) {
 }
 
 function resolveDbFile() {
-  const fn = hostPaths.aiCodeTrackingDbFile;
-  if (typeof fn !== 'function') return null;
-  try {
-    const resolved = fn();
-    return typeof resolved === 'string' && resolved !== '' ? resolved : null;
-  } catch {
-    return null;
-  }
+  return hostPaths.hostPath('aiCodeTrackingDbFile');
 }

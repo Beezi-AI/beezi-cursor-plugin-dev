@@ -42,7 +42,7 @@ export function lazyRecordIssue(code, fields) {
       // round trip on the user's tool call to report that an earlier tool call went wrong.
       return mod.recordIssue(code, fields === undefined ? {} : fields);
     }, () => false);
-  } catch (error) {
+  } catch {
     return Promise.resolve(false);
   }
 }

@@ -101,7 +101,7 @@ export function saveLedger(ledger) {
   writeJsonSecure(auditLedgerFile(), ledger);
 }
 
-// ── repeatable sync progress ─────────────────────────────────────────────────────────────────
+// ── repeatable sync progress
 //
 // A SEPARATE, separately-versioned file from the one-time ledger above, and the separation is the
 // migration rule, not tidiness. The v1 ledger's `sessions` map means "the one-time pull handed this

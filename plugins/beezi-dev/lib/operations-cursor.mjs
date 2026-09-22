@@ -1,3 +1,5 @@
+import { pickString } from './pick-field.mjs';
+
 // Bucket each Cursor tool call in a segment into the same seven operation categories the Codex and
 // Claude engines report, so the server's operation breakdown needs no per-agent branch.
 //
@@ -32,7 +34,7 @@
 // are non-enumerable, and that is load-bearing rather than tidy: the whole operations object is
 // serialized into the report body, and one unknown key 400s the entire report.
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine.
+// TODO(P0): unverified — see lib/hook-dump.mjs
 // Tool names come from Cursor's documented agent tool vocabulary. Each set is one line per name so a
 // newly observed tool is a one-line addition; an unrecognized name is never dropped, it lands in
 // `other` and is reported through the diagnostics below.
@@ -65,7 +67,7 @@ const MCP_PREFIX = 'mcp_';
 const CATEGORIES = ['file', 'search', 'internet', 'mcp', 'shell', 'skill', 'other'];
 
 // The sidecar's tool record, tolerating the field spellings the writer might settle on.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const TOOL_EVENTS = new Set(['tool', 'tool_call', 'tool_error', 'tool_failed']);
 const NAME_FIELDS = ['tool', 'tool_name', 'name'];
 const BYTES_FIELDS = ['bytes', 'output_bytes', 'outputBytes'];
@@ -85,14 +87,6 @@ const SERVER_FIELDS = ['server'];
 // computeOperations: 64 is far more MCP tools than a session uses and small enough that the state
 // file stays a state file.
 const MCP_ALIAS_CAP = 64;
-
-function pickString(event, fields) {
-  for (const field of fields) {
-    const value = event[field];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
-}
 
 function pickBytes(event, fields) {
   for (const field of fields) {

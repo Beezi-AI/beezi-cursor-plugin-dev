@@ -5,7 +5,7 @@ import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './ac
 import { correlateSubagents, subagentIntervals } from './subagents-cursor.mjs';
 import { countEvents as _countEvents, readEventsFrom } from './sidecar-read.mjs';
 import { authEpoch as _authEpoch, forceRefresh as _forceRefresh, getAccessToken as _getAccessToken } from './token.mjs';
-import { pendingBatchFile, pendingDir, queueDir, sessionStateFile } from './paths-cursor.mjs';
+import { pendingBatchFile, queueDir, sessionStateFile } from './paths-cursor.mjs';
 import {
   git, currentBranch, resolveOriginRemote, localRemoteFromRoot,
   clampBranch, UNATTRIBUTED_REMOTE,
@@ -13,8 +13,7 @@ import {
 import { currentAccountKey, isLiveTrackingAllowed } from './tracking.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
-import { apiBase, ENDPOINTS } from './config.mjs';
-import { postJson, POST_TIMEOUT_MS } from './http.mjs';
+import { POST_TIMEOUT_MS } from './http.mjs';
 import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { HOOK_GUARD_MARGIN_MS } from './hook-runner.mjs';
 import { safeName } from './sidecar.mjs';
@@ -120,7 +119,7 @@ function enqueueIfAbsent(payload) {
   return true;
 }
 
-// ── the pending batch ──────────────────────────────────────────────────────────────────────────
+// ── the pending batch
 //
 // `state/<id>.json` is COMMITTED TRUTH — cursor, cursorBytes, usageSnapshot, coveredIntervals,
 // anchor. A pending batch is UNCOMMITTED INTENT. They are two files because one atomic write
@@ -322,7 +321,7 @@ function modelsFrom(entries) {
 // failure takes the WHOLE report with it, not the field.
 const MAX_AGENT_NAME_CHARS = 200;
 
-// ── who this session belongs to (plan §4 D) ───────────────────────────────────────────────────
+// ── who this session belongs to (plan §4 D)
 //
 // The two identity keys the backend resolves a session to a subscription row with:
 //
@@ -540,7 +539,7 @@ export function createCheckpointCaches() {
 // what lets the backfill report a session as unreadable rather than as one that genuinely held no
 // usage. Nothing else can now explain a run that produced no report — see `deltaFailed` below.
 //
-// ── options ──────────────────────────────────────────────────────────────────────────────────
+// ── options
 //
 // `budgetMs` bounds the network work: hooks pass it, the CLI (track.mjs) does not, because a user
 // waiting at a terminal would rather see the whole queue drained than a partial flush.
@@ -716,7 +715,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     return r;
   };
 
-  // ── the guarded read-modify-write ────────────────────────────────────────────────────────────
+  // ── the guarded read-modify-write
   //
   // Everything from `loadState` to `saveState` is one read-modify-write on `state/<id>.json`, and
   // Cursor fires `afterShellExecution`, `stop` and `sessionEnd` as SEPARATE OS PROCESSES that land
@@ -776,7 +775,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // The audit takes this parse and NOT the timeline POST below — a distinction the single
     // `emitTimeline` flag could not express, which is exactly how the backfill ended up shipping
     // no subagent segments at all.
-    // ── C-10 recovery: finish whatever the last run left half-done ─────────────────────────
+    // ── C-10 recovery: finish whatever the last run left half-done
     //
     // Inside the session lock and before `computeDelta`, because both halves matter: the lock is
     // what stops two hooks recovering the same batch, and being before the delta is what stops the
@@ -1164,7 +1163,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       } catch { /* keep going; the cursor deliberately does NOT advance below (see `advanceable`) */ }
     }
 
-    // ── one report segment per correlated subagent ───────────────────────────────────────────────
+    // ── one report segment per correlated subagent
     //
     // Cursor exposes NO per-subagent token usage anywhere — no sub-transcript, no usage block, no
     // per-agent cost — so `duration_sec` is the only quantitative thing one of these segments can
@@ -1421,7 +1420,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     if (sentSubagentsDirty) {
       next.sentSubagents = sentSubagents;
     }
-    // ── C-10 steps 2-3: the batch becomes durable before a single item is queued ────────────
+    // ── C-10 steps 2-3: the batch becomes durable before a single item is queued
     //
     // Nothing above this line touched the queue or the state. If any of it fails the run is over
     // and NOTHING is committed: the cursor stands still, the record (if it was written) is
@@ -1493,7 +1492,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       // half look safe.
       if (delivered !== items.length) committable = false;
     }
-    // ── C-10 step 4: one commit, or none ──────────────────────────────────────────
+    // ── C-10 step 4: one commit, or none
     if (committable) commitNext();
     else enqueued = 0;
     // A historical parse must not rewrite this session's live state: the backfill route, not the
@@ -1508,13 +1507,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     if (stateDirty && !freshState) {
       try { saveState(session_id, state); } catch { committed = false; }
     }
-    // ── C-10 step 5: and only now ─────────────────────────────────────────────
+    // ── C-10 step 5: and only now
     //
     // The record is the authority right up to the moment the state commit is on disk. Unlinking it
     // before that would turn a lost commit into a lost window.
     if (pendingWritten && committed) dropPendingBatch(session_id);
 
-    // ── best-effort network, deliberately BELOW the commit ─────────────────────────────
+    // ── best-effort network, deliberately BELOW the commit
     //
     // Both of the calls below can spend the rest of the hook's budget, and a host that kills a hook
     // at its registered timeout kills it mid-POST. Above the commit that would throw away a window

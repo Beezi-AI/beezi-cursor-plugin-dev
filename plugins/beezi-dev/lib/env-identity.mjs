@@ -135,7 +135,7 @@ function usableUrl(value) {
   let parsed;
   try {
     parsed = new URL(value);
-  } catch (error) {
+  } catch {
     return false;
   }
   return parsed.protocol === 'http:' || parsed.protocol === 'https:';

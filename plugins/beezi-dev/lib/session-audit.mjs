@@ -111,7 +111,7 @@ export const SyncHalt = Object.freeze({
   EPOCH_UNAVAILABLE: 'epoch-unavailable',
 });
 
-// ── typed authentication (CONTRACTS §2) ───────────────────────────────────────────────────────
+// ── typed authentication (CONTRACTS §2)
 //
 // The values are mirrored here rather than imported from `lib/auth-state.mjs`: that module is the
 // auth lane's and does not exist on this branch yet, and an import of a missing file would take
@@ -792,7 +792,7 @@ export async function runAudit(deps = {}, options = {}) {
   return result;
 }
 
-// ── the repeatable sync ───────────────────────────────────────────────────────────────────────
+// ── the repeatable sync
 
 // Which pending queue files exist and which sessions they belong to.
 //

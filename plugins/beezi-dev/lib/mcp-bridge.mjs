@@ -211,7 +211,7 @@ function openBody(res) {
         try {
           const done = reader.cancel();
           if (done != null && typeof done.catch === 'function') done.catch(() => {});
-        } catch (error) {
+        } catch {
           /* a body that refuses to be cancelled must not replace the real failure */
         }
       },
@@ -227,7 +227,7 @@ function openBody(res) {
     cancel: () => {
       try {
         if (typeof body.destroy === 'function') body.destroy();
-      } catch (error) {
+      } catch {
         /* see above */
       }
     },
@@ -298,14 +298,14 @@ export function createBridge(deps = {}) {
             {},
           );
           return state;
-        } catch (error) {
+        } catch {
           return authShape(AuthState.UNAVAILABLE, AuthReason.UNREADABLE, null);
         }
       },
       forceRefresh: async (options) => {
         try {
           return await renew(options == null || options.deadlineMs == null ? {} : { deadlineMs: options.deadlineMs }, {});
-        } catch (error) {
+        } catch {
           return { ok: false, token: null, state: AuthState.UNAVAILABLE, reason: AuthReason.UNREADABLE, epoch: '', generation: null };
         }
       },
@@ -325,7 +325,7 @@ export function createBridge(deps = {}) {
           return token
             ? authShape(AuthState.READY, AuthReason.NONE, token)
             : authShape(AuthState.UNLINKED, AuthReason.MISSING, null);
-        } catch (error) {
+        } catch {
           return authShape(AuthState.UNAVAILABLE, AuthReason.UNREADABLE, null);
         }
       },
@@ -339,7 +339,7 @@ export function createBridge(deps = {}) {
           const token = await getToken({}, { forceRefresh: true });
           if (token) return { ok: true, token, state: AuthState.READY, reason: AuthReason.NONE, epoch: '', generation: null };
           return { ok: false, token: null, state: AuthState.REAUTH_REQUIRED, reason: AuthReason.MISSING, epoch: '', generation: null };
-        } catch (error) {
+        } catch {
           return { ok: false, token: null, state: AuthState.UNAVAILABLE, reason: AuthReason.UNREADABLE, epoch: '', generation: null };
         }
       },
@@ -366,7 +366,7 @@ export function createBridge(deps = {}) {
             return { ok: false, token: null, state: AuthState.UNAVAILABLE, reason: AuthReason.UNREADABLE };
           }
           return result;
-        } catch (error) {
+        } catch {
           // A refresh that could not be completed is not a refresh that proved anything about the
           // stored credential, so nothing is deleted and the caller is told it was temporary.
           return { ok: false, token: null, state: AuthState.UNAVAILABLE, reason: AuthReason.UNREADABLE };
@@ -415,7 +415,7 @@ export function createBridge(deps = {}) {
       state.expired = true;
       try {
         controller.abort();
-      } catch (error) {
+      } catch {
         /* an abort that throws must not replace the failure it was reporting */
       }
     };
@@ -457,7 +457,7 @@ export function createBridge(deps = {}) {
         if (typeof cancel === 'function') {
           try {
             cancel();
-          } catch (error) {
+          } catch {
             /* bounded cleanup failure */
           }
         }
@@ -709,7 +709,7 @@ export function createBridge(deps = {}) {
       if (recordedIssues.has(key)) return;
       recordedIssues.add(key);
       recordIssue(code, { source: 'mcp_bridge', status, reason, durationMs: now() - startedAt });
-    } catch (error) {
+    } catch {
       /* diagnostics are best-effort by construction */
     }
   }
@@ -971,7 +971,7 @@ export function createBridge(deps = {}) {
       const message = sanitizeServerMessage(err == null ? undefined : err.message)
         || sanitizeServerMessage(body == null ? undefined : body.message);
       if (message) return `Beezi MCP error: ${message}`;
-    } catch (error) {
+    } catch {
       /* non-JSON body, or a body that stopped arriving: the status is still worth reporting */
     }
     return `Beezi MCP request failed (HTTP ${res.status}).`;

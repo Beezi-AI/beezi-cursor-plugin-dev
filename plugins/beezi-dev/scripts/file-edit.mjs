@@ -12,14 +12,10 @@ installHookGuards({ name: 'file-edit' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run. Always true; nothing is arbitrated in a hook process any
-// more. Duplicate lines from a machine running both registries are dropped by the READER, on the
-// `eid` the host stamped on the event — see lib/hook-source.mjs and dedupeEvents in
-// lib/delta-cursor.mjs.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 // `afterFileEdit` — the only source of code-change data a `cursor-agent` machine has.

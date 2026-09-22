@@ -14,20 +14,15 @@ installHookGuards({ name: 'session-start' });
 const stdin = captureHookStdin();
 dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
-// Records which registry started this run — and this is the run the record is FOR: `install
-// status`, `me` and the banner below all report which registry has been seen doing the work, and
-// "no bundled hook has ever run here" is what tells a CLI-only machine apart from a broken install.
+// Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
-// Always true. Both registries stay installed permanently and both fire; the duplicate lines are
-// collapsed by the reader on the host's own event id (dedupeEvents in lib/delta-cursor.mjs). The
-// stand-down this line used to perform assumed a live bundled registry made the launcher redundant,
-// and the Cursor CLI runs no plugin-bundled hook at all (Cursor staff, forum 163890) — so on a
-// machine that used both, the queue flush and prune below stopped running under `cursor-agent`
-// entirely, for as long as the IDE kept being used. See lib/hook-source.mjs.
+// The stand-down this line used to perform assumed a live bundled registry made the launcher
+// redundant, and the Cursor CLI runs no plugin-bundled hook at all (Cursor staff, forum 163890) —
+// so on a machine that used both, the queue flush and prune below stopped running under
+// `cursor-agent` entirely, for as long as the IDE kept being used.
 if (!claimHookRun()) process.exit(0);
 
-// Cursor starts most plugin hooks inside the plugin directory, which is itself a git clone —
-// attribute the user's repository, not this one. See lib/hook-cwd.mjs.
+// Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
 enterProjectDir();
 
 runHook({

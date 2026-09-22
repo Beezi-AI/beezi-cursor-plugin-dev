@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BEEZI_HOOKS, HOOK_TIMEOUT_SEC, PLUGIN_ROOT, hookTimeoutSec } from '../lib/hooks-install.mjs';
+import { BEEZI_HOOKS, PLUGIN_ROOT, hookTimeoutSec } from '../lib/hooks-install.mjs';
 import { HookSource } from '../lib/hook-source.mjs';
 import { readJson } from '../lib/fs-store.mjs';
 

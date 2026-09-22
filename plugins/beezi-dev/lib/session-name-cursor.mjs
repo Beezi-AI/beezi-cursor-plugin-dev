@@ -10,7 +10,7 @@ import { readEvents } from './sidecar-read.mjs';
 
 const MAX = 200;
 
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 const NAME_FIELDS = ['name', 'title', 'composerTitle'];
 const PROMPT_EVENTS = new Set(['prompt', 'user', 'user_message', 'user_prompt']);
 const PROMPT_TEXT_FIELDS = ['text', 'prompt', 'message', 'content'];
@@ -32,7 +32,7 @@ function pick(record, fields) {
 
 // Cursor marks a user turn as type 1 in its stored conversation array; `role` appears in the newer
 // shape. Both are accepted so a format move costs the fallback, not the name.
-// TODO(P0): unverified — Cursor not installed on the authoring machine
+// TODO(P0): unverified — see lib/hook-dump.mjs
 function isUserMessage(message) {
   if (message === null || typeof message !== 'object') return false;
   if (message.type === 1) return true;

@@ -334,7 +334,7 @@ export async function runSessionStart(input, deps = {}) {
   if (!token)
     return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Run the beezi-login skill.';
 
-  // ── Everything LOCAL first. Nothing on disk may be hostage to the network. ──────────────────
+  // ── Everything LOCAL first. Nothing on disk may be hostage to the network.
   //
   // The revocation check used to sit here, awaited serially, ahead of all of it. That ordering is
   // what made a slow portal a data-retention bug rather than a slow banner: `getAccessToken()` alone
@@ -373,7 +373,7 @@ export async function runSessionStart(input, deps = {}) {
     if (dirty || removed > 0) saveRepoMap(map);
   } catch { /* best-effort */ }
 
-  // ── Then the network: ONE bounded probe, then everything that depends on its verdict. ───────
+  // ── Then the network: ONE bounded probe, then everything that depends on its verdict.
   //
   // The probe and the revocation check are the SAME request. `isTokenRevoked` used to call whoami
   // and throw away everything except the validity bit, from inside a Promise.all with the flush and
