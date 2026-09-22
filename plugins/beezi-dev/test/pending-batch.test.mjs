@@ -119,7 +119,7 @@ function block(file) {
 }
 
 const MAIN = 'conv-1:0-7';
-const SUB = 'conv-1:sa-1:0-7';
+const SUB = 'conv-1:sa-1';
 
 // ─── the shape of the record ─────────────────────────────────────────────────────────────────────
 

@@ -478,9 +478,12 @@ const CAPABILITIES = Object.freeze({
   // C-5 / data P4. `models[].by_effort`. Same gate, its own flag: effort is per-model and could ship
   // without the two above.
   effortBreakdown: false,
-  // C-7 / data P7. `computeSessionTimeline`'s `allowBreakState` — the break/subtype gate. That
-  // argument defaults to `{}`, so `false` here is byte-identical to passing nothing at all.
-  breakState: false,
+  // C-7 / data P7. `computeSessionTimeline`'s `allowBreakState`. FLIPPED ON: `break` is a member of
+  // CliAgentActivityState, the portal client renders it as "Session break" and its analytics
+  // exclude it from tracked session time, and the sibling Claude plugin has always emitted it to
+  // this same ingest. The DTO's `state` is a bounded string rather than a closed enum for exactly
+  // this case, so an older reader shows an unknown word instead of rejecting the document.
+  breakState: true,
   // M04 / data P5 / G15. The per-run attribution split: `computeDelta` PRODUCES `delta.segments`
   // whenever the planner returns runs, and this module deliberately emits one unsplit main payload
   // anyway. It is the largest unshipped thing in the file, so it belongs in the object that claims
@@ -1012,6 +1015,27 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
     let coveredDirty = false;
 
+    // `agent_id` -> the `duration_sec` this conversation has already REPORTED for that worker.
+    //
+    // It is two things at once, deliberately: the cumulative total a re-sent row must carry, and the
+    // record of what was last sent, which is what keeps a stable `segmentId` from re-queueing the
+    // same unchanged row at every turn-end for the rest of the conversation. One map rather than a
+    // total plus a sent-flag, because two of them can disagree and this one cannot - the same shape
+    // `sentSessionName` and `sentTimelineSig` already use.
+    //
+    // A key is `agent_id`, which lib/subagents-cursor.mjs guarantees is stable across re-derivations
+    // of the same session, so the map holds one small entry per worker the conversation actually
+    // delegated to and nothing else. DELIBERATELY UNCAPPED, unlike `coveredIntervals` beside it:
+    // that list grows with idle gaps, which a long session produces by the thousand, while this one
+    // grows only with delegations. Note that `MAX_SUBAGENTS` is NOT a bound here — it is applied in
+    // lib/session-timeline-cursor.mjs to the timeline document, and the loop below walks every span
+    // the correlation returns. If a session is ever seen delegating on a scale where this matters,
+    // cap it the way coverage is capped (oldest first); do not assume something upstream already
+    // did.
+    const sentSubagents = state.sentSubagents != null && typeof state.sentSubagents === 'object'
+      && !Array.isArray(state.sentSubagents) ? { ...state.sentSubagents } : {};
+    let sentSubagentsDirty = false;
+
     // delta-cursor returns ONE main segment per checkpoint — the sidecar is a single ordered stream
     // per conversation, so there is no per-turn cwd to re-segment on the way Codex's rollout has.
     // Repo and branch therefore come from the hook's own cwd, refined by anything the delta chose to
@@ -1183,25 +1207,48 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       for (const span of subagents) {
         const own = subagentIntervals([span]);
         if (own.length === 0) continue;
-        const durationSec = Math.round(totalMs(subtractIntervals(own, covered)) / 1000);
-        // Nothing left to bill: the parent (or an earlier sibling) already covered every second of
-        // this worker's span. Skipped rather than sent as a zero, and that is not just tidiness —
-        // the spans are re-derived from the WHOLE stream on every turn-end, so without this guard
-        // every subagent a session ever ran would enqueue one more empty segment at every turn for
-        // the rest of the conversation.
-        if (durationSec <= 0) continue;
-        // Only now is a git shell-out worth spending: a session that delegated nothing, or whose
-        // workers are all already covered, must not pay for one.
+        // The RESIDUAL for this window: the part of the worker's span that neither the main segment
+        // nor an earlier-billed sibling has claimed. Routinely ZERO, and that is the normal case
+        // rather than a defect - the parent goes on emitting generation lines all the way through a
+        // fan-out it is blocked on, so the main segment's own active intervals already cover every
+        // second the workers ran in.
+        const residualSec = Math.round(totalMs(subtractIntervals(own, covered)) / 1000);
+        const alreadySent = sentSubagents[span.agent_id];
+        // CUMULATIVE, never this window's residual alone. The row is upserted by a `segmentId` that
+        // no longer names a window (see below), so the value on the wire has to be the whole of what
+        // this worker has billed: a later turn-end that finds ten more residual seconds sends the
+        // total, and the server's upsert lands on the right number instead of replacing the earlier
+        // figure with the increment.
+        const durationSec = (alreadySent == null ? 0 : alreadySent) + residualSec;
+        // Nothing new to say: this worker has already been reported with exactly this duration.
+        //
+        // THIS is what stops the re-derivation from re-queueing, and it is deliberately NOT the
+        // `durationSec <= 0` test that used to stand here. That one skipped a fully-covered worker
+        // ENTIRELY, so a fan-out the parent stayed noisy through produced no `is_subagent` row at
+        // all: the portal's Subagents card, its per-worker tree and the Tokens-by-Subagent panel all
+        // read those rows, and a session that ran fifteen workers showed none of them while the
+        // timeline's own gantt lanes (a different endpoint, derived straight from the spans) drew
+        // all fifteen. A zero-duration row is the honest shape here - Cursor exposes no per-subagent
+        // tokens, and the seconds are already billed on the parent.
+        if (alreadySent != null && durationSec === alreadySent) continue;
+        // Only now is a git shell-out worth spending: a session that delegated nothing must not pay
+        // for one. Memoized inside `attributionOf`, so a fifteen-worker fan-out costs exactly one.
         const { branch, remote } = attributionOf();
         try {
           const payload = {
-            // `<sessionId>:<agentId>:<from>-<to>`. The agent id is what keeps this from colliding
-            // with the main segment's `<sessionId>:<from>-<to>` on the server's idempotency upsert;
-            // the line range is what keeps two turn-ends from colliding with each other, which
-            // matters because a still-open worker legitimately bills more residual seconds next
-            // turn as its synthetic close extends. The range names the window the segment was
-            // DERIVED in, not lines the subagent wrote — Cursor gives a subagent no lines of its own.
-            segmentId: `${session_id}:${span.agent_id}:${delta.from}-${delta.to}`,
+            // `<sessionId>:<agentId>`, and the omission of a line range is the point. The agent id
+            // keeps this from colliding with the main segment's `<sessionId>:<from>-<to>` on the
+            // server's idempotency upsert, and the id is stable across re-derivations of the same
+            // session (lib/subagents-cursor.mjs), so every later report about this worker UPSERTS
+            // onto the one row.
+            //
+            // It used to carry `:<from>-<to>`, the window it was derived in, so a still-open worker
+            // that billed more residual seconds next turn landed on a second row. That was only
+            // survivable while the old `<= 0` skip made such rows rare; now that a worker is
+            // reported whether or not it has seconds left, a window-scoped id would add one row per
+            // worker per turn-end. One row per worker carrying the cumulative duration is the shape
+            // the Subagents card and the duration sums both want.
+            segmentId: `${session_id}:${span.agent_id}`,
             sessionId: session_id,
             remote,
             branch,
@@ -1239,6 +1286,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           // batch is then either queued or not, together, so the claim can no longer outlive it.
           covered = claimIntervals(covered, own);
           coveredDirty = true;
+          // Recorded on the same condition and for the same reason: a duration nobody was told about
+          // must not count as reported, or the next turn-end would compute this worker's cumulative
+          // total from a figure the server never received. Committed with the rest of `next` - one
+          // commit or none - so a batch that fails to become durable leaves the worker looking
+          // unreported, which is the safe direction: the row is simply sent again.
+          sentSubagents[span.agent_id] = durationSec;
+          sentSubagentsDirty = true;
           enqueued += 1;
         } catch { /* keep going; an unqueued subagent claims nothing and retries next turn-end */ }
       }
@@ -1356,6 +1410,16 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // long conversation with thousands of idle gaps grows this state file for its whole life.
     if (coveredDirty) {
       next.coveredIntervals = covered;
+    }
+    // What each subagent has been reported as having billed. Same commit gate as the coverage it is
+    // derived from - between them they answer one question ("which seconds are spoken for, and by
+    // whom"), and a state where one landed and the other did not is a worker that either bills twice
+    // or never bills again.
+    //
+    // NEVER REACHES THE WIRE: like `mcpAliases`, it lives on `state`, which is not spread into any
+    // payload.
+    if (sentSubagentsDirty) {
+      next.sentSubagents = sentSubagents;
     }
     // ── C-10 steps 2-3: the batch becomes durable before a single item is queued ────────────
     //

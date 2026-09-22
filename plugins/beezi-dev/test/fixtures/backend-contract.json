@@ -610,7 +610,7 @@
       "id": "timeline-break-state",
       "status": "SCHEMA-OK, DEPLOYMENT UNVERIFIED",
       "what": "`state` is a bounded string (<=50) and `break` is already a member of CliAgentActivityState at this commit, excluded from activity-breakdown totals. So the schema accepts it; whether the DEPLOYED reader knows it is unverified.",
-      "client_position": "The client keeps `break` behind options.allowBreakState, default OFF. Nothing emits it today."
+      "client_position": "The client EMITS it: allowBreakState defaults on and CAPABILITIES.breakState is true. `break` is a member of CliAgentActivityState, the portal client renders it as \"Session break\" and the analytics exclude it from tracked time, and the sibling Claude plugin already sends it to this ingest. A user wait of 3h or more classifies as `break`; an agent-side gap never does, whatever its length."
     },
     {
       "id": "timeline-waiting-subtype",
@@ -699,7 +699,7 @@
       }
     },
     "subagent": {
-      "segmentId": "conv-1:sa-1:0-9",
+      "segmentId": "conv-1:sa-1",
       "sessionId": "conv-1",
       "remote": "https://example.com/acme/app.git",
       "branch": "feature/task-42",

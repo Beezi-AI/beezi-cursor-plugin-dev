@@ -9,7 +9,7 @@
       "name": "beezi-dev",
       "source": "./plugins/beezi-dev",
       "description": "Reports Cursor session analytics for Beezi task branches. — dev environment build.",
-      "version": "0.6.0-dev.5323",
+      "version": "0.6.0-dev.5331",
       "author": {
         "name": "Beezi"
       },

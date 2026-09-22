@@ -288,7 +288,8 @@ test('GATED: break and waiting_subtype are schema-legal but unproven on the depl
   assert.ok(breakGate.status.includes('DEPLOYMENT UNVERIFIED'));
   assert.ok(fixture.timeline.known_states.includes('break'));
   assert.ok(fixture.timeline.known_waiting_subtypes.includes('command_approval'));
-  // And the client keeps both off by default, which is what makes the gate safe to leave open.
+  // `break` is emitted now (a user wait of BREAK_MS or more), so what this pins is narrower: the
+  // recorded payload's periods are all short, and none of them may drift into the state by accident.
   const states = fixture.payloads.timeline.periods.map((period) => period.state);
   assert.equal(states.includes('break'), false);
 });

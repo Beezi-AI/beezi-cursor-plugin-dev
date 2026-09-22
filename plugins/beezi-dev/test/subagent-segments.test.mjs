@@ -115,7 +115,10 @@ test('a foreground subagent gets a segment of its own, distinct from the main on
   // separates them.
   assert.notEqual(sub.segmentId, main.segmentId);
   assert.equal(main.segmentId, 'conv-1:0-4');
-  assert.equal(sub.segmentId, 'conv-1:sa-1:0-4');
+  // The subagent's id carries NO line range: the worker is re-derived from the whole stream at every
+  // turn-end, and one row per worker is what lets a later, larger duration upsert onto itself
+  // instead of adding a row.
+  assert.equal(sub.segmentId, 'conv-1:sa-1');
 
   assert.equal(sub.is_subagent, true);
   assert.equal(sub.agent_id, 'sa-1');
@@ -176,17 +179,17 @@ test('three parallel subagents cannot bill more wall clock than the session had'
   assert.ok(billed <= wallClockSec, `billed ${billed}s against ${wallClockSec}s of wall clock`);
   assert.equal(billed, wallClockSec, 'and none of it went missing either');
 
-  // Only the first worker has residual seconds to bill; B and C ran inside the same stretch and are
-  // fully covered by the time their turn comes, so they queue NOTHING. That is deliberate — a
-  // zero-duration, zero-token segment is a row that says nothing — and it costs no visibility: the
-  // gantt lanes, the Subagents card and the tool-attribution tree all read the session TIMELINE,
-  // which still carries all three spans.
+  // All three workers are REPORTED, and only the first one bills. B and C ran inside the stretch A
+  // already claimed, so their residual is zero — but a worker that billed nothing still ran, and the
+  // Subagents card, the per-worker tree and the Tokens-by-Subagent panel are all driven by these
+  // rows. Suppressing the zero-duration ones (which is what this test used to assert) made a
+  // fan-out of fifteen show as none.
   const subs = payloads.filter((p) => p.is_subagent);
-  assert.equal(subs.length, 1);
-  assert.equal(subs[0].agent_id, 'sa-a');
+  assert.deepEqual(subs.map((p) => p.agent_id), ['sa-a', 'sa-b', 'sa-c']);
+  assert.deepEqual(subs.map((p) => p.duration_sec), [600, 0, 0]);
 });
 
-test('a subagent the parent already covered bills nothing and queues nothing', async (t) => {
+test('a subagent the parent already covered is still reported, billing nothing', async (t) => {
   const home = tmpHome(t);
   // A short worker: the parent is chatting either side of it, so its ten seconds are inside the
   // parent's own active time and were already reported on the main segment.
@@ -198,9 +201,45 @@ test('a subagent the parent already covered bills nothing and queues nothing', a
   ]);
 
   const res = await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), turnEnd);
-  assert.equal(res.enqueued, 1);
-  assert.deepEqual(queued().filter((p) => p.is_subagent), []);
-  assert.equal(queued()[0].duration_sec, 12);
+  assert.equal(res.enqueued, 2);
+
+  const main = queued().find((p) => !p.is_subagent);
+  const sub = queued().find((p) => p.is_subagent);
+  // The parent keeps all twelve seconds: the worker's ten are inside them and are billed once.
+  assert.equal(main.duration_sec, 12);
+  // And the worker's row exists anyway, saying exactly what is true — it ran, and it added no time
+  // of its own. This is the COMMON case, not an edge one: a parent that goes on generating through
+  // a fan-out covers every second of it, and the old `<= 0` skip turned that into an empty
+  // Subagents card for the whole session.
+  assert.equal(sub.duration_sec, 0);
+  assert.equal(sub.agent_id, 'sa-1');
+  assert.equal(sub.agent_name, 'quick lookup');
+});
+
+test('a reported subagent is not re-queued while nothing about it changed', async (t) => {
+  const home = tmpHome(t);
+  writeSidecar(home, 'conv-1', [
+    { ts: T0, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1' },
+    { ts: T0 + 1_000, ev: 'subagent_start', sid: 'sa-1', stype: 'general-purpose', task: 'quick lookup' },
+    { ts: T0 + 11_000, ev: 'subagent_stop', task: 'quick lookup' },
+    { ts: T0 + 12_000, ev: 'stop' },
+  ]);
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), turnEnd);
+  assert.equal(queued().filter((p) => p.is_subagent).length, 1);
+  assert.deepEqual(stateOf('conv-1').sentSubagents, { 'sa-1': 0 });
+
+  // Spans are re-correlated from the WHOLE stream at every turn-end. Without the sent-duration test
+  // this worker would enqueue one more row per turn for the life of the conversation — which is the
+  // failure the old `<= 0` skip was doing double duty to prevent.
+  fs.appendFileSync(
+    path.join(home, 'events', 'conv-1.jsonl'),
+    [
+      JSON.stringify({ ts: T0 + 13_000, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g2' }),
+      JSON.stringify({ ts: T0 + 14_000, ev: 'stop' }),
+    ].join('\n') + '\n',
+  );
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), turnEnd);
+  assert.equal(queued().filter((p) => p.is_subagent).length, 1, 'no second row for the same worker');
 });
 
 test('the same subagent is not re-billed on the next turn-end', async (t) => {
@@ -236,7 +275,7 @@ test('coverage is claimed only when the whole batch reached the queue', async (t
   // over the target, and renaming onto a directory throws on every platform this ships to. A queue
   // write really does fail in the field — a Windows AV scanner or backup agent holding a handle is
   // the usual cause — and the failure must not silently swallow the window for everyone behind it.
-  const blocked = path.join(queueDir(), `${safeName('conv-1:sa-1:0-4')}.json`);
+  const blocked = path.join(queueDir(), `${safeName('conv-1:sa-1')}.json`);
   fs.mkdirSync(blocked, { recursive: true });
 
   // This assertion used to read "only the main segment got through, and only its own two seconds are
@@ -372,7 +411,7 @@ test('the model identity survives a window that contains no generation line', as
   // Block the first attempt so the segment is retried in a LATER window — one whose own slice holds
   // no `gen` line at all, which is the common case for a subagent worth billing (its residual
   // seconds are by definition the stretch where the parent was quiet).
-  const blocked = path.join(queueDir(), `${safeName('conv-1:sa-1:0-4')}.json`);
+  const blocked = path.join(queueDir(), `${safeName('conv-1:sa-1')}.json`);
   fs.mkdirSync(blocked, { recursive: true });
   await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), turnEnd);
   fs.rmSync(blocked, { recursive: true, force: true });

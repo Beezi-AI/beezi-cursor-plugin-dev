@@ -138,7 +138,14 @@ function agentIdFor(span, used) {
   const base = span.sid == null
     ? (span.toolCallId == null ? `sa-${span.startedMs}` : span.toolCallId)
     : span.sid;
-  const head = base.slice(0, MAX_AGENT_ID_CHARS);
+  // Whitespace collapsed to a single space, because Cursor's own ids CONTAIN A NEWLINE: a live
+  // `subagent_start` carries `sid` (and `tool_call_id`, and `eid`) as the tool call id, a LF, and
+  // the function-call id — "call-07fdcd0c-…-3\nfc_2d0c19a8-…_0". The id is not just displayed, it
+  // is half of the report segment's idempotency key, so it travels through a queue filename, an
+  // HTTP body and a database column; a raw control character in it is the sort of thing that
+  // survives every layer until one of them silently mangles it. Collapsing keeps the whole value —
+  // both halves still distinguish two workers — and makes it a single line.
+  const head = base.replace(/\s+/g, ' ').slice(0, MAX_AGENT_ID_CHARS);
   if (!used.has(head)) {
     used.add(head);
     return head;

@@ -186,6 +186,22 @@ test('two id-less starts in the same millisecond stay two agents', () => {
   assert.equal(new Set(subagents.map((s) => s.agent_id)).size, 2);
 });
 
+test('the newline Cursor puts inside its own sid does not reach agent_id', () => {
+  // Verbatim shape from a live sidecar: the tool call id, a LF, then the function-call id. The
+  // value is half of a report segment's idempotency key, so it travels through a queue filename, an
+  // HTTP body and a database column — none of which want a raw control character.
+  const { subagents } = correlateSubagents([
+    start(1, { sid: 'call-07fdcd0c-3\nfc_2d0c19a8_0', task: 'audit' }),
+    start(2, { sid: 'call-07fdcd0c-4\nfc_2d0c19a8_1', task: 'review' }),
+  ]);
+  assert.deepEqual(
+    subagents.map((s) => s.agent_id),
+    ['call-07fdcd0c-3 fc_2d0c19a8_0', 'call-07fdcd0c-4 fc_2d0c19a8_1'],
+  );
+  // Both halves are kept, which is what keeps two workers of one fan-out apart.
+  assert.equal(new Set(subagents.map((s) => s.agent_id)).size, 2);
+});
+
 test('agent_id and agent_type are bounded to the columns the backend accepts', () => {
   const { subagents } = correlateSubagents([
     start(1, { sid: 'x'.repeat(400), stype: 'y'.repeat(400) }),

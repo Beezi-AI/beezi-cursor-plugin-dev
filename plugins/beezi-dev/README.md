@@ -725,7 +725,6 @@ turn on:
 | Always-applied rules count, project-instruction status | The fields exist; the naming and a deployed ingest that accepts them do not. |
 | Context peak/final tokens, final model | Same. |
 | Per-effort model breakdown | Same. |
-| Timeline `break` periods | Schema-legal, unverified on the deployed reader. |
 | Per-run (per-repository) segments | No deployed route is known to accept several segments for one window. The split is computed and recorded locally for provenance; one unsplit segment is sent. |
 
 Nothing in this table is a partial or best-effort send. Either a field goes on the wire or it does

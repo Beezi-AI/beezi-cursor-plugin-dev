@@ -36,9 +36,29 @@ test('the gap after a stop is time the user owns', () => {
   assert.equal(tl.periods[1].ended_at, '2026-01-01T00:03:00.000Z');
 });
 
-test('a long gap is idle even when it follows a stop', () => {
+test('a long gap after a stop is the user, not idle', () => {
+  // Thirty minutes between a turn end and the next generation is a human reading a diff, and it
+  // stays the human's however far past the idle threshold it runs. Classifying it `idle` — which is
+  // what the old ordering did for anything over five minutes — charted a quarter of an hour of the
+  // user's own time as nobody's.
   const tl = timelineOf([gen(0), stop(1), gen(30)]);
-  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'idle']);
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'waiting_user']);
+});
+
+test('a user wait past the break threshold is a break', () => {
+  // Three hours after a stop is a person who left, not a person thinking. What must never happen is
+  // a 14-hour `waiting_user` band claiming someone sat there all night.
+  const overnight = { ts: at(1) + BREAK_MS + 1000, ev: 'gen', model: 'gpt-5' };
+  const tl = timelineOf([gen(0), stop(1), overnight]);
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'break']);
+});
+
+test('a long gap MID-TURN is the agent waiting, and stays idle at any length', () => {
+  // No turn end in front of it: a background script or a fan-out the agent is blocked on. However
+  // long it runs it is never the human's time, so BREAK_MS does not apply to it.
+  const later = { ts: at(0) + BREAK_MS * 2, ev: 'gen', model: 'gpt-5' };
+  const tl = timelineOf([gen(0), later]);
+  assert.deepEqual(tl.periods.map((p) => p.state), ['idle']);
 });
 
 test('a long gap between two work events is idle', () => {
@@ -347,23 +367,28 @@ test('the idle boundary agrees with the billed duration to the millisecond', () 
   assert.deepEqual(statesOf([atMs(0), atMs(IDLE_GAP_MS)]), ['idle']);
 });
 
-test('the break state stays off unless the caller opts in — an old server rejects the enum', () => {
+test('an agent-side gap is idle whatever the caller asked for', () => {
+  // No turn end in front of these, so the break threshold is not theirs to cross under any option.
   assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS)]), ['idle']);
   assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS)], {}), ['idle']);
   assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS)], { allowBreakState: false }), ['idle']);
+  assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS)], { allowBreakState: true }), ['idle']);
 });
 
-test('one millisecond below six hours is idle, at and above it is a break', () => {
-  const opts = { allowBreakState: true };
-  assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS - 1)], opts), ['idle']);
-  assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS)], opts), ['break']);
-  assert.deepEqual(statesOf([atMs(0), atMs(BREAK_MS + 1)], opts), ['break']);
+test('one millisecond below the threshold is still the user, at and above it is a break', () => {
+  // Both sides of the boundary, measured from a TURN END, which is the only place it applies.
+  const after = (ms) => [atMs(0), stopAtMs(1000), atMs(1000 + ms)];
+  assert.deepEqual(statesOf(after(BREAK_MS - 1)), ['working', 'waiting_user']);
+  assert.deepEqual(statesOf(after(BREAK_MS)), ['working', 'break']);
+  assert.deepEqual(statesOf(after(BREAK_MS + 1)), ['working', 'break']);
 });
 
 test('a break outranks waiting_user — an overnight gap after a stop is not the user thinking', () => {
   const events = [atMs(0), stopAtMs(1000), atMs(1000 + BREAK_MS)];
-  assert.deepEqual(statesOf(events, { allowBreakState: true }), ['working', 'break']);
-  assert.deepEqual(statesOf(events), ['working', 'idle']);
+  assert.deepEqual(statesOf(events), ['working', 'break']);
+  // Opting OUT returns the pre-break vocabulary, and the gap stays the user's — never `idle`, which
+  // would claim the agent was busy with something of its own.
+  assert.deepEqual(statesOf(events, { allowBreakState: false }), ['working', 'waiting_user']);
 });
 
 test('periods merge only when state AND subtype agree', () => {

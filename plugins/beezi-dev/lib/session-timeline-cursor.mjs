@@ -53,12 +53,24 @@ const dedupeEvents =
 const IDLE_GAP_SEC =
   typeof hostTiming.IDLE_GAP_SEC === 'number' ? hostTiming.IDLE_GAP_SEC : 300;
 
+// THE VOCABULARY, and which side of the conversation each word belongs to. Getting this wrong is
+// not a cosmetic mislabel: the portal charts these bands, excludes `break` from tracked session
+// time, and reads `idle` as the agent waiting on something of its own.
+//
+//   working       the agent is doing something, and the evidence is events closer together than
+//                 the idle threshold.
+//   idle          the AGENT is waiting, mid-turn: a background script, a long shell command, a
+//                 fan-out of subagents it is blocked on. Nobody has handed the turn back to the
+//                 human, so this is never the user's time however long it runs.
+//   waiting_user  the turn ENDED and the next thing is the human: the next instruction, or an
+//                 approval prompt (`waiting_subtype`). Length alone never takes a gap out of this
+//                 state — only BREAK_MS does.
+//   break         a wait on the human long enough that the person plainly left. Only reachable
+//                 from a turn end, for the reason above.
 const STATE = {
   WORKING: 'working',
   WAITING_USER: 'waiting_user',
   IDLE: 'idle',
-  // A gap long enough that calling it "idle" tells the reader nothing: an overnight stop and a
-  // six-minute coffee are the same word otherwise. GATED — see BREAK_MS.
   BREAK: 'break',
 };
 
@@ -70,15 +82,16 @@ const STATE = {
 // no second of duration backs is the kind of disagreement nobody can debug from a dashboard.
 export const IDLE_GAP_MS = IDLE_GAP_SEC * 1000;
 
-// Six hours: the reference threshold the Claude engine's timeline uses for the same distinction
-// (session-timeline.mjs), kept identical so one number means one thing across agents.
+// Three hours, and it applies to ONE kind of gap: a wait on the human. Past this the session was
+// not being waited on, it was left — the person went home, into a meeting, onto something else —
+// and charting three hours of that as `waiting_user` says a human sat in front of the editor all
+// afternoon.
 //
-// EMISSION IS GATED and defaults OFF. `state` is a bounded string on the backend's timeline DTO
-// rather than a closed enum, but "the source accepts it" is not "the deployment stores it", and a
-// rejected document takes the periods, the plan events and the subagents with it. Callers pass
-// `options.allowBreakState` only once DATA-09 confirms the accepted vocabulary; until then a long
-// gap classifies exactly as it did before, as `idle`.
-export const BREAK_MS = 6 * 60 * 60 * 1000;
+// DELIBERATELY NOT the Claude engine's six (beezi-claude-plugins, lib/session-timeline.mjs). The
+// two numbers answer slightly different questions here: this one only ever splits user waits,
+// because an agent-side gap of any length stays `idle` (see buildPeriods), so it can be tighter
+// without swallowing a long background run.
+export const BREAK_MS = 3 * 60 * 60 * 1000;
 
 // The only `waiting_subtype` this module can honestly emit, and only from a marker the CALLER
 // validated against a real host signal.
@@ -100,6 +113,11 @@ export const WAITING_SUBTYPE = Object.freeze({ COMMAND_APPROVAL: 'command_approv
 // `subagent_stop` is deliberately NOT in here, and must never be added. It is matched by exact
 // equality, so it is already excluded; adding it would classify the gap after a fan-out finishes as
 // `waiting_user` and bill the parent's own think-time to the user on every delegation.
+//
+// That prohibition got STRONGER with the classification order in buildPeriods. A turn end now
+// outranks the idle threshold, so a mistaken member here no longer mislabels gaps under five
+// minutes only — it mislabels every gap up to BREAK_MS, six hours of parent work drawn as the user
+// sitting there.
 const TURN_END_EVENTS = new Set(['stop', 'end', 'session_end']);
 
 // Re-exported from the dependency-free module that owns it — same function, one implementation. See
@@ -197,7 +215,12 @@ function subtypeFor(markers, startMs, endMs) {
 }
 
 export function buildPeriods(events, options = {}) {
-  const allowBreakState = options.allowBreakState === true;
+  // Opt-OUT, not opt-in. `break` is a member of CliAgentActivityState, the client renders it as
+  // "Session break" and the backend excludes it from activity-breakdown totals; `state` is a
+  // bounded string on the DTO precisely so a word a reader does not know cannot 400 the document.
+  // A caller that has reason to distrust the deployment can still pass `false` and get the
+  // pre-break vocabulary, where a long wait stays `waiting_user`.
+  const allowBreakState = options.allowBreakState !== false;
   const markers = validMarkers(options.permissionMarkers);
   const anchors = [];
   for (const event of events) {
@@ -215,14 +238,25 @@ export function buildPeriods(events, options = {}) {
     const gap = cur.ts - prev.ts;
     let state;
     let subtype = null;
-    // Break FIRST: a long break is a kind of idle, so testing idle first would swallow it, and the
-    // gap after a `stop` that runs overnight is not the user thinking about a reply.
-    if (allowBreakState && gap >= BREAK_MS) state = STATE.BREAK;
-    else if (gap >= IDLE_GAP_MS) state = STATE.IDLE;
-    else if (prev.endsTurn) {
-      state = STATE.WAITING_USER;
-      subtype = subtypeFor(markers, prev.ts, cur.ts);
-    } else state = STATE.WORKING;
+    // WHO WAS WAITING decides the state; how long only ever splits a user wait into `break`.
+    //
+    // The turn boundary comes FIRST, and that is the fix for the misclassification this module
+    // shipped with: the idle threshold used to be tested before it, so any think-time over five
+    // minutes stopped being the user's. Sixteen real minutes of a person reading a diff drew as
+    // `idle` — which the portal renders as "Subagents working" — in the middle of a session where
+    // no subagent was running.
+    //
+    // Length never moves a gap OUT of the user's column except past BREAK_MS, and length never
+    // moves an agent-side gap INTO it: a four-hour background script is the agent waiting, not the
+    // human, so it stays `idle` whatever the clock says.
+    if (prev.endsTurn) {
+      if (allowBreakState && gap >= BREAK_MS) state = STATE.BREAK;
+      else {
+        state = STATE.WAITING_USER;
+        subtype = subtypeFor(markers, prev.ts, cur.ts);
+      }
+    } else if (gap >= IDLE_GAP_MS) state = STATE.IDLE;
+    else state = STATE.WORKING;
 
     const last = merged[merged.length - 1];
     // State AND subtype: merging a labelled wait into an unlabelled one would spread an observation
