@@ -84,7 +84,7 @@ export function credentialsFile() {
 }
 
 // Durable "already imported" ledger for the login-time history backfill. Deliberately at the
-// beeziCursorHome() ROOT and not under state/, queue/ or events/: pruneStale() deletes 14-day-old
+// beeziCursorHome() ROOT and not under state/, queue/ or events/: pruneStale() deletes expired
 // files in all three, so a marker living there would expire and make every old session look
 // importable again on the next run.
 export function auditLedgerFile() {
@@ -92,7 +92,7 @@ export function auditLedgerFile() {
 }
 
 // Repeatable-sync progress, account-scoped and separately versioned from the one-time ledger above.
-// Root-level for the same pruneStale() reason: a 14-day expiry here would make every run re-ask
+// Root-level for the same pruneStale() reason: an mtime expiry here would make every run re-ask
 // coverage for the whole machine.
 export function syncStateFile() {
   return path.join(beeziCursorHome(), 'sync-state.json');

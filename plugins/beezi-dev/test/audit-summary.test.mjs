@@ -23,6 +23,7 @@ const auditResult = (over = {}) => ({
   liveTracked: 0,
   alreadyImported: 0,
   oversize: 0,
+  tooOld: 0,
   candidates: 1,
   plannedChunks: 1,
   plannedReports: 1,
@@ -116,10 +117,54 @@ test('a finalized pull with no oversize sessions keeps the plain wording', () =>
   assert.doesNotMatch(line, /without/);
 });
 
-test('the 14-day horizon and the plan caveat are always stated', () => {
+// ─── retention (30-day window) ──────────────────────────────────────────────
+
+test('too-old sessions are printed whenever nonzero', () => {
+  const rendered = renderBackfillSummary(auditResult({ tooOld: 2 }), {});
+
+  assert.match(text(rendered), /2 sessions were older than 30 days/);
+  // Never as a failure the user could retry: the count only grows on a re-run.
+  assert.doesNotMatch(text(rendered), /re-run.*older than 30 days/i);
+});
+
+test('a run with nothing new still accounts for the sessions retention dropped', () => {
+  const rendered = renderBackfillSummary(
+    auditResult({ candidates: 0, sessionsImported: 0, tooOld: 4 }),
+    {},
+  );
+
+  assert.match(text(rendered), /older than 30 days/);
+});
+
+test('a finalized pull names the too-old sessions it sealed without', () => {
+  const rendered = renderBackfillSummary(auditResult({ tooOld: 3, finalized: true }), {});
+
+  const line = rendered.lines.find((l) => /finalized/.test(l));
+  assert.ok(line, 'expected a finalization line');
+  assert.match(line, /without 3 sessions older than 30 days/);
+});
+
+test('a finalized pull names both permanent exclusions in one sentence', () => {
+  const rendered = renderBackfillSummary(
+    auditResult({ oversize: 1, tooOld: 2, finalized: true }),
+    {},
+  );
+
+  const line = rendered.lines.find((l) => /finalized/.test(l));
+  assert.match(line, /1 session too large to read and 2 sessions older than 30 days/);
+});
+
+test('sync reports too-old sessions rather than claiming Beezi holds everything', () => {
+  const rendered = renderSyncSummary(syncResult({ candidates: 0, sessionsImported: 0, tooOld: 2 }), {});
+
+  assert.match(text(rendered), /nothing new was uploaded/);
+  assert.match(text(rendered), /2 sessions were older than 30 days/);
+});
+
+test('the local history horizon and the plan caveat are always stated', () => {
   const rendered = renderBackfillSummary(auditResult({}), {});
 
-  assert.match(text(rendered), /14 days/);
+  assert.match(text(rendered), /30 days/);
   assert.match(text(rendered), /Plan and billing/);
 });
 
@@ -167,6 +212,7 @@ const syncResult = (over = {}) => ({
   scanned: 2,
   active: 0,
   oversize: 0,
+  tooOld: 0,
   queueHeld: 0,
   candidates: 1,
   upToDate: 0,

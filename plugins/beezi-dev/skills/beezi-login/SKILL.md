@@ -120,8 +120,8 @@ command:
 
 `node "<BEEZI>/scripts/backfill.mjs" --via login`
 
-It is the one-time upload of this machine's recorded Cursor history into Beezi and can take
-several minutes; it prints progress lines as it goes. Report its output verbatim — progress and
+It is the one-time upload of this machine's recorded Cursor history from the last 30 days into
+Beezi and can take several minutes; it prints progress lines as it goes. Report its output verbatim — progress and
 final summary, or the error line. It is safe on every login: already-uploaded sessions are
 skipped, and if it says nothing new to upload, just tell the user their history is up to date. If
 some sessions could not be delivered, tell the user that re-running this login skill later will

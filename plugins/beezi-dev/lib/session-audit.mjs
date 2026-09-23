@@ -59,6 +59,7 @@ import {
 } from './tracking.mjs';
 import { UserError } from './friendly-error.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
+import { RETENTION_WINDOW_DAYS, RETENTION_WINDOW_MS } from './retention-window.mjs';
 
 // A sidecar this big is read several times over (delta, timeline) and would put the process into
 // the hundreds of MB. Report it rather than let node die mid-run. In practice pruneStale()'s
@@ -85,6 +86,15 @@ const AUDIT_TIMEOUT_MS = 60_000;
 // restamp lands after the machine link). A day with no real activity is the line between "open
 // and possibly resumed" and "forgotten".
 const ACTIVE_SESSION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// The retention floor, shared with the local pruner — see lib/retention-window.mjs for why the two
+// are one number. Sessions whose last real activity is older are skipped and counted, never
+// uploaded.
+//
+// Deliberately NOT expressed as a default `--since`: `shouldFinalize` refuses to seal the one-time
+// pull whenever `sinceMs` is set, so a default there would leave the backfill re-running the full
+// audit on every login forever. This is its own gate with its own counter, and the two compose —
+// `--since` narrows the window, retention floors it.
 
 const SINCE_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -227,12 +237,15 @@ export function parseArgs(argv) {
 // nothing about what Beezi is missing — it would silently exclude exactly the old session whose
 // upload died halfway, which is the case sync exists to repair. `--force` has nothing to force
 // past: there is no one-time seal on this path.
+//
+// The retention floor is not the same thing and is not negotiable by a flag: it bounds the window
+// this tool reports on at all, rather than filtering inside it.
 export function parseSyncArgs(argv) {
   for (const flag of argv) {
     if (flag === '--since') {
       throw new UserError(
         'Beezi: the beezi-sync skill does not take --since — it uploads exactly what Beezi is '
-          + 'missing, whenever those sessions ran. Run it with no flags.',
+          + `missing from the last ${RETENTION_WINDOW_DAYS} days. Run it with no flags.`,
       );
     }
     if (flag === '--force') {
@@ -373,6 +386,9 @@ export async function runAudit(deps = {}, options = {}) {
     liveTracked: 0,
     alreadyImported: 0,
     oversize: 0,
+    // Sessions outside the retention window — last real activity more than
+    // RETENTION_WINDOW_DAYS ago. Never uploaded, and a re-run can only make them older.
+    tooOld: 0,
     candidates: 0,
     plannedChunks: 0,
     // Reports built and handed to the flush — in a dry run, what WOULD have been sent. Counted in
@@ -507,6 +523,7 @@ export async function runAudit(deps = {}, options = {}) {
   const machineLinkedAtMs = linkedAtMs(tracking, deps);
   const linkCutoffMs = liveMode ? machineLinkedAtMs : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
+  const retentionCutoffMs = now() - RETENTION_WINDOW_MS;
 
   // Every time gate below keys on the session's last REAL activity, not the file mtime — Cursor
   // restamps every still-open tab with session_end on restart, so the mtime tracks the last
@@ -532,6 +549,11 @@ export async function runAudit(deps = {}, options = {}) {
     }
     if (linkCutoffMs != null && activityMs != null && activityMs >= linkCutoffMs) { result.liveTracked += 1; continue; }
     if (!options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
+    // Retention floor. Placed after `alreadyImported` so an old session already uploaded keeps
+    // reading as imported rather than being re-counted as skipped, and before `--since` so the
+    // narrower of the two windows always wins. Same activity-or-mtime fallback as `--since`: the
+    // two date gates must not disagree about a sidecar with no real activity on it.
+    if ((activityMs == null ? entry.mtimeMs : activityMs) < retentionCutoffMs) { result.tooOld += 1; continue; }
     if (options.sinceMs != null && (activityMs == null ? entry.mtimeMs : activityMs) < options.sinceMs) continue;
     candidates.push(entry);
   }
@@ -945,6 +967,8 @@ export async function runSync(deps = {}, options = {}) {
     scanned: 0,
     active: 0,
     oversize: 0,
+    // Sessions outside the retention window (see RETENTION_WINDOW_DAYS).
+    tooOld: 0,
     // Sessions with an unacknowledged window still in the live queue.
     queueHeld: 0,
     // Sessions the server did not mention at all. NOT zero — see SPARSE_ZERO_CONFIRMED.
@@ -1048,6 +1072,7 @@ export async function runSync(deps = {}, options = {}) {
   const all = listConversations();
   result.scanned = all.length;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
+  const retentionCutoffMs = now() - RETENTION_WINDOW_MS;
 
   const considered = [];
   for (const entry of all) {
@@ -1055,6 +1080,9 @@ export async function runSync(deps = {}, options = {}) {
     if (heldSessions.has(entry.sessionId)) { result.queueHeld += 1; continue; }
     const activityMs = lastActivityOf(entry);
     if (activityMs != null && activityMs > activeCutoffMs) { result.active += 1; continue; }
+    // The same retention floor the backfill applies, so the two paths agree on what history
+    // exists: a session sync refuses to send is not one the backfill would have sent either.
+    if ((activityMs == null ? entry.mtimeMs : activityMs) < retentionCutoffMs) { result.tooOld += 1; continue; }
     considered.push(entry);
   }
   if (considered.length === 0) {

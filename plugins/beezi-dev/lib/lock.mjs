@@ -60,7 +60,7 @@ export const LOCK_STALE_MS = 30_000;
 //
 // Nothing else in the plugin trips over the extra directory entry: active-conversation.mjs filters
 // on `.json`, and prune.mjs's `unlinkSync` refuses directories and skips them (a lock older than
-// 14 days cannot exist anyway — the next caller breaks it at 30s).
+// the retention horizon cannot exist anyway — the next caller breaks it at 30s).
 export function sessionLockPath(sessionId) {
   const name = safeName(sessionId);
   return name === null ? null : path.join(stateDir(), `${name}.lock`);

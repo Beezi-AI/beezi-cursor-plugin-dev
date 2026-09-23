@@ -8,7 +8,14 @@ import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 // Fixed test clock, far past every fixture mtime + the 1-day activity window.
 const CLOCK = 40 * 24 * 60 * 60 * 1000;
 
-const conversation = (sessionId, mtimeMs = 1_000) => ({
+// The epoch the small fixture timestamps below (T0 + 1_000, T0 + 9_000, …) are offsets from. They
+// only ever get compared with each other and with the machine-link stamp, so their absolute value
+// never mattered — until the 30-day retention floor, which skips anything older than it. Twenty
+// days back keeps every such fixture quiet (past the 1-day active window) AND inside retention;
+// the retention tests below pick their own explicit ages.
+const T0 = CLOCK - 20 * 24 * 60 * 60 * 1000;
+
+const conversation = (sessionId, mtimeMs = T0 + 1_000) => ({
   sessionId,
   eventsPath: `C:/home/.beezi-cursor/events/${sessionId}.jsonl`,
   mtimeMs,
@@ -197,7 +204,7 @@ test('--force ignores the ledger', async () => {
 // excludes the conversation the login skill itself runs in.
 test('skips recently-active conversations', async () => {
   const { deps } = makeDeps({
-    listConversations: () => [conversation('old', 1_000), conversation('open', CLOCK - 60_000)],
+    listConversations: () => [conversation('old', T0 + 1_000), conversation('open', CLOCK - 60_000)],
   });
 
   const result = await runAudit(deps, {});
@@ -241,8 +248,8 @@ test('a session holding only lifecycle noise is a candidate and reads as empty',
 test('live-mode tenants only upload conversations predating the machine link', async () => {
   const { deps } = makeDeps({
     readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: false }),
-    statImpl: () => ({ mtimeMs: 5_000 }),
-    listConversations: () => [conversation('before-link', 1_000), conversation('after-link', 9_000)],
+    statImpl: () => ({ mtimeMs: T0 + 5_000 }),
+    listConversations: () => [conversation('before-link', T0 + 1_000), conversation('after-link', T0 + 9_000)],
   });
 
   const result = await runAudit(deps, {});
@@ -259,11 +266,11 @@ test('the link cutoff comes from the tracking stamp, not the credentials file', 
     readTrackingStateImpl: () => ({
       trackingMode: 'live',
       backfillCompleted: false,
-      linkedAt: new Date(5_000).toISOString(),
+      linkedAt: new Date(T0 + 5_000).toISOString(),
     }),
     // No credentials file on this machine — a stat-only implementation gives up here.
     statImpl: () => { throw new Error('ENOENT'); },
-    listConversations: () => [conversation('before-link', 1_000), conversation('after-link', 9_000)],
+    listConversations: () => [conversation('before-link', T0 + 1_000), conversation('after-link', T0 + 9_000)],
   });
 
   const result = await runAudit(deps, {});
@@ -400,7 +407,7 @@ const zeroReport = (sessionId, over = {}) => ({
 test('a session whose every report is barren is skipped, not uploaded', async () => {
   const flush = fakeFlush();
   const { deps } = makeDeps({
-    listConversations: () => [conversation('lifecycle-only'), conversation('real', 2_000)],
+    listConversations: () => [conversation('lifecycle-only'), conversation('real', T0 + 2_000)],
     flushBackfillChunksImpl: flush.impl,
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(
@@ -569,12 +576,59 @@ test('a sidecar that fails twice stops blocking the seal on the second run', asy
 
 test('--since drops conversations older than the cutoff', async () => {
   const { deps } = makeDeps({
-    listConversations: () => [conversation('old', 1_000), conversation('new', 9_000)],
+    listConversations: () => [conversation('old', T0 + 1_000), conversation('new', T0 + 9_000)],
   });
 
-  const result = await runAudit(deps, { sinceMs: 5_000 });
+  const result = await runAudit(deps, { sinceMs: T0 + 5_000 });
 
   assert.equal(result.candidates, 1);
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+test('sessions older than the retention window are skipped and counted', async () => {
+  const { deps } = makeDeps({
+    listConversations: () => [
+      conversation('ancient', CLOCK - 31 * DAY_MS),
+      conversation('recent', CLOCK - 29 * DAY_MS),
+    ],
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1, 'the 29-day-old session is still inside the window');
+});
+
+// The floor keys on real activity for the same reason every other date gate here does: Cursor
+// restamps a forgotten tab's file on every app launch, so an mtime inside the window says nothing
+// about when the work happened.
+test('retention keys on last real activity, not the restamped file mtime', async () => {
+  const { deps } = makeDeps({
+    listConversations: () => [conversation('restamped', CLOCK - 60_000)], // mtime: a minute ago
+    lastActivityOfImpl: () => CLOCK - 31 * DAY_MS, // the work itself: a month ago
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 0);
+});
+
+// The counterpart of the --since rule in shouldFinalize: a scoped run holds the pull open, but the
+// retention floor must not, or the one-time pull could never seal on a machine with old history.
+test('too-old sessions do not hold the one-time pull open', async () => {
+  const { deps } = makeDeps({
+    listConversations: () => [
+      conversation('ancient', CLOCK - 31 * DAY_MS),
+      conversation('recent', CLOCK - 29 * DAY_MS),
+    ],
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.finalized, true);
 });
 
 test('skips a sidecar too large to parse safely', async () => {
@@ -840,7 +894,7 @@ test('drives runCheckpoint in audit mode with the recorded cwd', async () => {
 test('every candidate shares one git-fact cache bag', async () => {
   const bags = new Set();
   const { deps } = makeDeps({
-    listConversations: () => [conversation('s1'), conversation('s2', 2_000), conversation('s3', 3_000)],
+    listConversations: () => [conversation('s1'), conversation('s2', T0 + 2_000), conversation('s3', T0 + 3_000)],
     runCheckpointImpl: async (input, _d, options) => {
       bags.add(options.caches);
       options.sink(report(input.session_id));
@@ -939,9 +993,9 @@ test('an unattributed chunk blocks finalization', async () => {
 });
 
 test('--since never finalizes (a scoped run must not seal a partial dataset)', async () => {
-  const { deps, events } = makeDeps({ listConversations: () => [conversation('new', 9_000)] });
+  const { deps, events } = makeDeps({ listConversations: () => [conversation('new', T0 + 9_000)] });
 
-  const result = await runAudit(deps, { sinceMs: 5_000 });
+  const result = await runAudit(deps, { sinceMs: T0 + 5_000 });
 
   assert.ok(!events.includes('complete'));
   assert.equal(result.finalized, false);
@@ -959,7 +1013,7 @@ test('a pre-link active session holds the seal open; the clean import still uplo
       linkedAt: new Date(linkedAt).toISOString(),
     }),
     listConversations: () => [
-      conversation('quiet-old', 1_000),
+      conversation('quiet-old', T0 + 1_000),
       conversation('open-pre-link', CLOCK - 60 * 60 * 1000), // active AND pre-link
     ],
   });
@@ -982,7 +1036,7 @@ test('the login conversation (active, post-link) never blocks the seal', async (
       linkedAt: new Date(linkedAt).toISOString(),
     }),
     listConversations: () => [
-      conversation('quiet-old', 1_000),
+      conversation('quiet-old', T0 + 1_000),
       conversation('login-convo', CLOCK - 60_000), // active, post-link
     ],
   });
@@ -1000,7 +1054,7 @@ test('the login conversation (active, post-link) never blocks the seal', async (
 test('with no link instant anywhere, active sessions do not block the seal', async () => {
   const { deps } = makeDeps({
     readTrackingStateImpl: () => null,
-    listConversations: () => [conversation('quiet-old', 1_000), conversation('open', CLOCK - 60_000)],
+    listConversations: () => [conversation('quiet-old', T0 + 1_000), conversation('open', CLOCK - 60_000)],
   });
 
   const result = await runAudit(deps, {});
@@ -1201,6 +1255,9 @@ test('shouldFinalize truth table', () => {
   assert.equal(shouldFinalize({ ...clean, activePreLink: 1 }, {}), false);
   assert.equal(shouldFinalize(clean, { sinceMs: 123 }), false);
   assert.equal(shouldFinalize(clean, { dryRun: true }), false);
+  // Retention is a property of the window, not an unfinished job: a re-run can only make those
+  // sessions older, so they must never block the seal.
+  assert.equal(shouldFinalize({ ...clean, tooOld: 3 }, {}), true);
 });
 
 // ─── typed authentication (08-A) ────────────────────────────────────────────

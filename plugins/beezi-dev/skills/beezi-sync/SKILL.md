@@ -26,15 +26,18 @@ so running it twice in a row is safe and the second run uploads nothing. It is *
 history import: it never finalizes that import, never re-opens it, and never changes it in either
 direction. A machine whose one-time import has already been used can still run this.
 
-It only ever covers what is still on this machine. Cursor history older than 14 days is deleted
-locally by the plugin's own retention, and nothing can bring it back.
+It only ever covers what is still on this machine, and only the **last 30 days**: sessions whose
+last real activity is older than that are skipped and reported as skipped, on this command and on
+the one-time import alike. History older than 30 days is deleted locally by the plugin's own
+retention, and nothing can bring it back.
 
 ## Flags
 
 `--dry-run` reports what would be uploaded and sends nothing.
 
 `--history` is a local, read-only count: how many conversations this plugin recorded, and how many
-exist only in Cursor's own storage (from before the plugin was installed, or older than 14 days). It
+exist only in Cursor's own storage (from before the plugin was installed, older than the 14 days
+Cursor itself keeps, or past this plugin's own 30-day retention). It
 makes no network request and uploads nothing. Report its output verbatim; it says plainly that the
 conversations it found in Cursor's storage cannot be uploaded, and why. Do not offer to upload them
 and do not suggest that support is coming.

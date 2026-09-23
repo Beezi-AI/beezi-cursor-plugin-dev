@@ -24,7 +24,9 @@ export const ROTATE_AT_BYTES = 8 * 1024 * 1024;
 // At most four logs exist at once — the active one plus three rotations, so a full capture
 // directory costs 32 MiB rather than a disk.
 export const MAX_LOG_FILES = 4;
-// The same fortnight lib/prune.mjs uses for analytics, so a machine has one retention story.
+// Raw stdin payloads keep their own fortnight, deliberately SHORTER than lib/prune.mjs's analytics
+// horizon: these are unredacted hook inputs, and holding them longer than the derived analytics
+// they produced would widen what a stolen machine gives up for no reporting benefit.
 export const LOG_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 // A replay file exists only for the microseconds between a hook reading stdin and parsing it. An
 // hour is generous for a host that killed the hook mid-turn, and short enough that raw payloads do

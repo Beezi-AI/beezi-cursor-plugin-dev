@@ -598,8 +598,12 @@ Cursor's storage. That has two consequences worth stating plainly:
 
 - **History starts when the plugin was installed.** Nothing you did in Cursor before that was
   recorded by Beezi and none of it can be uploaded.
-- **The horizon is 14 days.** The plugin's own retention deletes sidecars older than that, so a
-  conversation from three weeks ago is gone from this machine and no command can bring it back.
+- **The horizon is 30 days.** The plugin's own retention (`lib/retention-window.mjs`) deletes
+  sidecars older than that, so a conversation from two months ago is gone from this machine and no
+  command can bring it back. The upload floor in `lib/session-audit.mjs` is the same number, and it
+  is not redundant: prune works on the file mtime, which Cursor restamps on every app restart, so a
+  tab forgotten for months keeps a fresh file and survives every sweep. The floor keys on the last
+  *real* activity, which is what a user would call the session's age.
 
 Conversations that exist only in Cursor's own storage are *discoverable* but not uploadable — see
 "What is still missing" below.
@@ -614,6 +618,10 @@ other machines, run `beezi-login` there *before* it seals.
 
 It deliberately skips:
 
+- **Sessions older than 30 days**, measured on the same last *real* activity as the active window
+  below. Beezi reports on the last 30 days, so older history is upload time and storage for rows
+  nobody reads. The floor is not a `--since` default: `--since` holds the one-time pull open (a
+  scoped run can never seal it), while retention is counted separately and never blocks the seal.
 - **Sessions active in the last 24 hours**, measured on the last *real* activity (the last event
   that is not `session_end`), never the file's modification time — Cursor re-fires `session_end` for
   every open tab when the app restarts, so an mtime-based window would never expire for a forgotten
@@ -651,7 +659,7 @@ missing) and no `--force` (there is no seal on this path). Both are rejected wit
 
 ### What is still missing
 
-Conversations from before the plugin was installed, or older than 14 days, exist only in Cursor's
+Conversations from before the plugin was installed, or older than 30 days, exist only in Cursor's
 own database. The plugin can count them but cannot upload them: Cursor records *priced overage* for
 a conversation, not a total cost, token counts or a duration, and uploading a report built from that
 would report numbers nobody measured.
@@ -1041,7 +1049,7 @@ workarounds are still in the code and read as over-engineering without them:
 | **Subagent report segments** | `subagents[]` on the timeline was the whole feature for one round. `lib/checkpoint.mjs` now also emits one report segment per correlated span, carrying `is_subagent` / `agent_id` / `agent_type` / `agent_name` with every token count zeroed, because Cursor exposes no per-subagent usage and a fabricated one would be indistinguishable from a measurement. The interval union in `lib/active-time.mjs` landed in the same change rather than after it, which was the point: the main segment is enqueued first and keeps its full span, each subagent bills only `subtractIntervals(own, covered)`, and coverage is claimed only once the write has landed — so a three-worker fan-out cannot bill the same minute three times. |
 | **The MCP alias carry-over** | `computeOperations(window, { mcpAliases })` is now fed from `state.mcpAliases`, so a tool→server mapping learned in one window still names the tool in the next. `beforeMCPExecution` fires before the call and `postToolUse` after it, so the two halves genuinely do land in different windows. The LRU is capped at 64 and rides on a **non-enumerable** property: an enumerable one would be serialized into the report body and 400 the whole thing on the DTO whitelist. |
 | **Bounded body reads** | `bounded()` clears its abort timer the moment the headers arrive — fetch settles there, not at the end of the body — so `res.json()` ran with no bound at all. Measured against a real server: headers in 27 ms, `res.json()` still pending at 12 s, against undici's 300 s `bodyTimeout` and a hook Cursor kills at 10 s. `readJsonBounded` in `lib/http.mjs` holds the stream reader itself so it can cancel, and resolves `null` on a stall rather than throwing. `whoami` is bounded at 1500 ms rather than the generic 10 s read default, shares that one budget across headers and body, and has been moved off the serial session-start path so `pruneStale` is no longer hostage to the network. |
-| **Flush backoff** | `flushQueue` iterates `readdir` order, which on NTFS is lexicographic, so the SAME file was attempted first on every flush forever. Three permanently-failing files at the head of the list consumed the whole 7500 ms budget on every flush and everything behind them was never attempted once — not retried and given up on, never tried — until `prune.mjs` deleted it at 14 days. `lib/queue-backoff.mjs` puts retry state on the payload (30 s doubling to 30 min). Two details are load-bearing: `_retry` is stripped before the POST body is built, because one unknown top-level key 400s the whole report; and expiry reads `firstQueuedAt` rather than file mtime, because recording a retry rewrites the file and refreshes its mtime — the one file that can never be sent would otherwise be the one file that can never be deleted. |
+| **Flush backoff** | `flushQueue` iterates `readdir` order, which on NTFS is lexicographic, so the SAME file was attempted first on every flush forever. Three permanently-failing files at the head of the list consumed the whole 7500 ms budget on every flush and everything behind them was never attempted once — not retried and given up on, never tried — until `prune.mjs` deleted it at the retention horizon. `lib/queue-backoff.mjs` puts retry state on the payload (30 s doubling to 30 min). Two details are load-bearing: `_retry` is stripped before the POST body is built, because one unknown top-level key 400s the whole report; and expiry reads `firstQueuedAt` rather than file mtime, because recording a retry rewrites the file and refreshes its mtime — the one file that can never be sent would otherwise be the one file that can never be deleted. |
 | **MCP credential cache** | `mcp-bridge` read the credential store on every JSON-RPC message, and on Windows a credential read is a synchronous PowerShell spawn costing ~532 ms. `lib/token.mjs` now memoizes in-process, and disables the cache whenever a store seam is injected so the tests still exercise the real path. |
 | **Per-session state lock** | Two hooks could run `load → await → save` on one state file at once. That is not merely a duplicated segment: `usageSnapshot` is the cumulative-credits baseline, and an unlocked write can rewind it, which re-bills spend that cannot be recovered. `lib/lock.mjs` takes a per-session lock and SKIPS on contention rather than waiting — a hook that waits for a lock spends the budget it was going to do the work with. |
 

@@ -7,7 +7,7 @@ const LEDGER_VERSION = 1;
 // handed to the server, and what the server said.
 //
 // This has to be durable in a way ~/.beezi-cursor/state/<id>.json is not: pruneStale() deletes
-// anything in state/, queue/ and events/ older than 14 days, so a marker there expires and every
+// anything in state/, queue/ and events/ past the retention horizon, so a marker there expires and every
 // old session looks importable again on the next run. auditLedgerFile() sits at the
 // beeziCursorHome() root, outside the dirs pruneStale walks.
 //

@@ -13,7 +13,7 @@
 //   genuinely gone would otherwise spend the whole hook budget renewing.
 //
 //   QUARANTINE, NOT SILENCE. An unparseable `.json` record used to be skipped — every flush,
-//   forever, invisibly, until prune deleted it at 14 days. It is now RENAMED to `.corrupt`, which
+//   forever, invisibly, until prune deleted it at the retention horizon. It is now RENAMED to `.corrupt`, which
 //   takes it out of the delivery path while preserving the bytes: a record nobody can read is the
 //   only evidence of whatever wrote it, and deleting evidence is how the bug that produced it stays
 //   unfindable. Renaming is also the only honest reading of "malformed" — salvaging a JSON prefix

@@ -8,7 +8,8 @@ import {
 // What history exists on this machine, from BOTH places it can live, merged by conversation id.
 //
 // The sidecar (`~/.beezi-cursor/events/<id>.jsonl`) is this plugin's source of truth, and it has a
-// hard horizon: it starts when the plugin was installed and pruneStale() deletes it at 14 days.
+// hard horizon: it starts when the plugin was installed and pruneStale() deletes it at the
+// retention horizon (lib/retention-window.mjs).
 // Everything the user did before that, and everything older than two weeks, exists only in
 // Cursor's own durable store (`state.vscdb`, one `composerData:<id>` record per conversation).
 //
@@ -203,7 +204,7 @@ export function renderHistorySummary(index) {
     lines.push(
       `  ${index.durable.truncated ? 'At least ' : ''}${plural(index.counts.durableOnly, 'conversation')} ` +
         `${index.counts.durableOnly === 1 ? 'exists' : 'exist'} only in Cursor's own storage — from before this plugin was installed, or older than ` +
-        'the 14 days it keeps.',
+        'the 14 days Cursor itself keeps.',
     );
     lines.push(
       '  Those cannot be uploaded. Cursor records priced overage for them, not a total cost, token ' +

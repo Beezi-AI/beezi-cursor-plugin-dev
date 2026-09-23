@@ -8,7 +8,7 @@
 // POST is bounded at POST_TIMEOUT_MS (3000ms), so one flush completes two or three requests: three
 // permanently-failing files at the head of the list consume the entire budget on every flush and
 // everything behind them is never attempted at all. Those segments are not retried and then given
-// up on — they are never tried once — until prune.mjs deletes them at 14 days. The user's analytics
+// up on — they are never tried once — until prune.mjs deletes them at the retention horizon. The user's analytics
 // simply stop, with a queue directory that is visibly full and a flush that reports "failed: 3".
 //
 // The fix is retry state on the payload itself, so a file that just failed is NOT DUE and is skipped

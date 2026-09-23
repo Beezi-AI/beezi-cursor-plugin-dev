@@ -1,5 +1,6 @@
 import { BackfillHalt } from './audit-flush.mjs';
 import { SyncHalt } from './session-audit.mjs';
+import { RETENTION_WINDOW_DAYS } from './retention-window.mjs';
 
 // What the history commands print.
 //
@@ -33,6 +34,18 @@ function authUnavailableMessage(result) {
     'Nothing was changed — your credentials, your upload history and the one-time import are exactly as they were. ' +
     'Wait a moment and try again; signing in again is not needed.'
   );
+}
+
+// Sessions the retention floor dropped. Stated as a property of the product ("Beezi reports on the
+// last N days"), not as a failure the user could retry: the count is permanent, and a sentence that
+// reads like an error sends people back to re-run a command that will skip exactly the same files.
+function tooOldLines(result) {
+  if (!(result.tooOld > 0)) return [];
+  return [
+    `  ${plural(result.tooOld, 'session')} ${were(result.tooOld)} older than ` +
+      `${RETENTION_WINDOW_DAYS} days and ${were(result.tooOld)} skipped — Beezi only reports on the ` +
+      `last ${RETENTION_WINDOW_DAYS} days.`,
+  ];
 }
 
 function oversizeLines(result) {
@@ -98,10 +111,12 @@ export function renderBackfillSummary(result, options = {}) {
     if (result.alreadyImported > 0) bits.push(`${plural(result.alreadyImported, 'session')} already uploaded`);
     if (result.liveTracked > 0) bits.push(`${result.liveTracked} already tracked live`);
     if (result.active > 0) bits.push(`${result.active} still active — they upload on a later login`);
+    if (result.tooOld > 0) bits.push(`${result.tooOld} older than ${RETENTION_WINDOW_DAYS} days`);
     lines.push(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
     // Printed BEFORE the finalization line, so the sentence that says "without them" has the
     // sessions it is talking about directly above it.
     lines.push(...oversizeLines(result));
+    lines.push(...tooOldLines(result));
     if (result.finalized) {
       lines.push(finalizedLine(result));
     } else if (result.activePreLink > 0) {
@@ -119,6 +134,7 @@ export function renderBackfillSummary(result, options = {}) {
         '(dry run — nothing sent).',
     );
     lines.push(...oversizeLines(result));
+    lines.push(...tooOldLines(result));
     return { error: null, lines };
   }
 
@@ -168,6 +184,7 @@ export function renderBackfillSummary(result, options = {}) {
     lines.push(`  ${plural(result.unreadable, 'session')} could not be read — not uploaded.`);
   }
   lines.push(...oversizeLines(result));
+  lines.push(...tooOldLines(result));
   if (result.plannedReports > result.reportsStored + result.reportsSkipped) {
     lines.push(
       `  Note: ${plural(result.plannedReports, 'report')} sent, ${result.reportsStored} stored ` +
@@ -214,7 +231,10 @@ export function renderBackfillSummary(result, options = {}) {
     lines.push('  Rate-limit events are not collected in audit mode.');
   }
   lines.push('  Plan and billing details reflect your current setup, not the plan you were on at the time.');
-  lines.push('  Note: Cursor history older than 14 days is not retained on this machine and cannot be uploaded.');
+  lines.push(
+    `  Note: history older than ${RETENTION_WINDOW_DAYS} days is not retained on this machine `
+      + 'and cannot be uploaded.',
+  );
   return { error: null, lines };
 }
 
@@ -222,10 +242,17 @@ export function renderBackfillSummary(result, options = {}) {
 // giants has to say which history it sealed WITHOUT. "Your history pull is finalized" on its own
 // is the sentence that turns a permanent gap into a surprise.
 function finalizedLine(result) {
-  if (!(result.oversize > 0)) return '✓ Beezi: your history pull is finalized.';
+  // Both exclusions are permanent for the same reason — the seal cannot be reopened — so they are
+  // named in one sentence rather than left for the user to piece together from two.
+  const without = [];
+  if (result.oversize > 0) without.push(`${plural(result.oversize, 'session')} too large to read`);
+  if (result.tooOld > 0) {
+    without.push(`${plural(result.tooOld, 'session')} older than ${RETENTION_WINDOW_DAYS} days`);
+  }
+  if (without.length === 0) return '✓ Beezi: your history pull is finalized.';
   return (
-    `✓ Beezi: your history pull is finalized — without ${plural(result.oversize, 'session')} that ` +
-    `${were(result.oversize)} too large to read. The one-time import cannot be re-opened for them.`
+    `✓ Beezi: your history pull is finalized — without ${without.join(' and ')}. ` +
+    'The one-time import cannot be re-opened for them.'
   );
 }
 
@@ -382,6 +409,7 @@ function skippedAnything(result) {
     result.deferred > 0 ||
     result.active > 0 ||
     result.oversize > 0 ||
+    result.tooOld > 0 ||
     result.unreadable > 0
   );
 }
@@ -424,6 +452,7 @@ function syncFootnotes(result) {
     lines.push(`  ${plural(result.unreadable, 'session')} could not be read — not uploaded.`);
   }
   lines.push(...oversizeLines(result));
+  lines.push(...tooOldLines(result));
   if (result.active > 0) {
     lines.push(
       `  ${plural(result.active, 'session')} ${were(result.active)} still active — they sync once they have been quiet for a day.`,
@@ -439,6 +468,9 @@ function syncFootnotes(result) {
     lines.push('  ' + plural(result.timelines, 'session timeline') + ' attached.');
   }
   lines.push('  Plan and billing details reflect your current setup, not the plan you were on at the time.');
-  lines.push('  Note: Cursor history older than 14 days is not retained on this machine and cannot be uploaded.');
+  lines.push(
+    `  Note: history older than ${RETENTION_WINDOW_DAYS} days is not retained on this machine `
+      + 'and cannot be uploaded.',
+  );
   return lines;
 }

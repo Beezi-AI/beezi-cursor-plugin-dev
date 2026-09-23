@@ -454,7 +454,7 @@ test('a foreign batch on a session with nothing new is left for prune', async (t
   assert.ok(pendingOf('conv-1'), 'and the record is still there');
 
   fs.utimesSync(path.join(pendingDir(), 'conv-1.json'), new Date(T0), new Date(T0));
-  pruneStale(T0 + 15 * 24 * 3600 * 1000);
+  pruneStale(T0 + 31 * 24 * 3600 * 1000);
   assert.equal(pendingOf('conv-1'), null, 'prune collects it in the end');
 });
 

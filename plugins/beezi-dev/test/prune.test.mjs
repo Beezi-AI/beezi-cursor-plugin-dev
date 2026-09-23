@@ -40,15 +40,15 @@ function ageFile(p, ageMs, now = Date.now()) {
 
 // ─── test 1: prunes old state file ──────────────────────────────────────────
 
-test('1. prunes old state file (mtime 15 days ago)', (t) => {
+test('1. prunes old state file (mtime 31 days ago)', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
 
   const now = Date.now();
-  const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
+  const expiredMs = 31 * 24 * 60 * 60 * 1000;
 
   const p = writeFile(stateDir(homeDir), 'old.json');
-  ageFile(p, fifteenDaysMs, now);
+  ageFile(p, expiredMs, now);
 
   pruneStale(now);
 
@@ -78,13 +78,13 @@ test('3. prunes old queue file, keeps recent queue file', (t) => {
   setHome(homeDir);
 
   const now = Date.now();
-  const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
+  const expiredMs = 31 * 24 * 60 * 60 * 1000;
 
   const qd = queueDir(homeDir);
   const oldFile = writeFile(qd, 'old-seg.json');
   const recentFile = writeFile(qd, 'recent-seg.json');
 
-  ageFile(oldFile, fifteenDaysMs, now);
+  ageFile(oldFile, expiredMs, now);
   ageFile(recentFile, 0, now);
 
   pruneStale(now);
@@ -134,14 +134,14 @@ test('5. custom maxAgeMs boundary — 2-day-old file pruned at 1d, kept at 3d', 
 
 // ─── pending/ and the capture sweep (integration step 2: PR-1, PR-2) ────────────────────────────
 
-test('pruneStale collects a 14-day-old pending batch and keeps a fresh one', (t) => {
+test('pruneStale collects an expired pending batch and keeps a fresh one', (t) => {
   const home = makeTmpDir(t);
   setHome(home);
   const dir = path.join(home, 'pending');
   const old = writeFile(dir, 'conv-old.json', '{"version":1}');
   const fresh = writeFile(dir, 'conv-new.json', '{"version":1}');
   const now = Date.now();
-  ageFile(old, 15 * 24 * 60 * 60 * 1000, now);
+  ageFile(old, 31 * 24 * 60 * 60 * 1000, now);
 
   pruneStale(now);
 

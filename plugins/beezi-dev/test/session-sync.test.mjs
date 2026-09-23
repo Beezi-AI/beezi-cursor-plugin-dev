@@ -17,7 +17,11 @@ import path from 'node:path';
 
 const CLOCK = 40 * 24 * 60 * 60 * 1000;
 
-const conversation = (sessionId, mtimeMs = 1000) => ({
+// Twenty days back: quiet (past the 1-day active window) and inside the 30-day retention floor,
+// which skips anything older. The retention test picks its own explicit age.
+const T0 = CLOCK - 20 * 24 * 60 * 60 * 1000;
+
+const conversation = (sessionId, mtimeMs = T0 + 1000) => ({
   sessionId,
   eventsPath: `C:/home/.beezi-cursor/events/${sessionId}.jsonl`,
   mtimeMs,
@@ -387,8 +391,23 @@ test('a concurrent hook that enqueues between the scan and the lock takes the se
   assert.equal(order.some((o) => o.startsWith('extract')), false);
 });
 
+test('sync skips sessions older than the retention window', async () => {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const { deps, order } = makeDeps({
+    listConversations: () => [
+      conversation('ancient', CLOCK - 31 * DAY_MS),
+      conversation('recent', CLOCK - 29 * DAY_MS),
+    ],
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(order.some((o) => o.startsWith('extract:ancient')), false);
+});
+
 test('a session that became active again between the scan and the lock is left alone', async () => {
-  let activity = 1000;
+  let activity = T0 + 1000;
   const { deps } = makeDeps({
     lastActivityOfImpl: () => activity,
     withSessionLock: async (sessionId, fn) => { activity = CLOCK - 1000; return fn(); },

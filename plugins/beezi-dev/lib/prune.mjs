@@ -3,15 +3,14 @@ import path from 'path';
 import { eventsDir, pendingDir, queueDir, stateDir } from './paths-cursor.mjs';
 import { captureDir } from './hook-dump.mjs';
 import { applyCaptureRetention } from './capture-retention.mjs';
-
-const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+import { RETENTION_WINDOW_MS } from './retention-window.mjs';
 
 // Deletes files in the state, queue and events dirs whose mtime is older than maxAgeMs.
 // Best-effort: never throws. `now` injectable for deterministic tests.
 //
 // The sidecar has to be on this list. It is append-only, one JSONL per conversation, and nothing
 // else ever deletes one — so without it `events/` grows for the life of the machine while its
-// state file (which holds the read cursor) is pruned out from under it at 14 days. Reopening such
+// state file (which holds the read cursor) is pruned out from under it at the retention horizon. Reopening such
 // a conversation would then start from cursor 0 against a full sidecar. Both directories age on
 // the same clock, and the cursor is now monotonic, so neither half can strand the other.
 // `pending/` joins the list for one reason the others do not have: a batch whose account no longer
@@ -19,7 +18,7 @@ const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 // under the current credentials, or advancing this account's cursor over work reported to a
 // different one, are both worse than one orphaned file) — so nothing else on the machine ever
 // deletes it. It is a flat directory of immediate files, which is all this sweep can clean.
-export function pruneStale(now = Date.now(), maxAgeMs = FOURTEEN_DAYS_MS) {
+export function pruneStale(now = Date.now(), maxAgeMs = RETENTION_WINDOW_MS) {
   for (const dir of [stateDir(), queueDir(), eventsDir(), pendingDir()]) {
     let files;
     try { files = fs.readdirSync(dir); } catch { continue; } // dir missing → skip

@@ -347,7 +347,7 @@ export async function runSessionStart(input, deps = {}) {
   try { pruneStale(); } catch { /* best-effort */ }
   // Local, cheap, and ahead of every network call for the same reason pruneStale is: a machine
   // whose API is slow must still age out its own held records. pruneStale cannot do this job — it
-  // deletes on mtime at 14 days, and recording a retry rewrites the file, which refreshes the
+  // deletes on mtime at the retention horizon, and recording a retry rewrites the file, which refreshes the
   // mtime. See lib/queue-maintenance.mjs.
   try { sweepHeldQueue({ now: startedAt }); } catch { /* best-effort */ }
 

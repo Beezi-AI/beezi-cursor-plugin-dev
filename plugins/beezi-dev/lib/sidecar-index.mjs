@@ -14,7 +14,7 @@ const FINGERPRINT_VERSION = 'v1';
 // plugin's transcript-index. The sidecar (not Cursor's own storage) is what gets enumerated:
 // the hook scripts append to it unconditionally, linked or not, so an unlinked machine
 // accumulates exactly the history the login-time backfill exists to upload. The horizon is
-// pruneStale()'s 14 days — anything older is gone, which is also why the audit ledger lives
+// pruneStale()'s retention horizon — anything older is gone, which is also why the audit ledger lives
 // outside the pruned dirs.
 
 // Every recorded conversation: ~/.beezi-cursor/events/<conversation>.jsonl.
