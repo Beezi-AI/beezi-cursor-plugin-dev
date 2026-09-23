@@ -126,10 +126,11 @@ test('live plugin hooks do NOT excuse an absent user-scope registry', async () =
   // the bundled registry was seen firing and never read the user scope at all, and describeReporting
   // answered "nothing needs installing" — so this exact machine was reported as healthy.
   //
-  // It is not healthy. `cursor-agent` does not run hooks that come from an installed plugin,
-  // marketplace or local; only ~/.cursor/hooks.json fires under the CLI (Cursor staff, forum 163890,
-  // still open). The absent registry below is therefore the CLI's ONLY path, and every cursor-agent
-  // session on this machine records nothing at all while the IDE looks perfect.
+  // It is not healthy. Older `cursor-agent` builds (Jun–Aug 2026) ran no hook that came from an
+  // installed plugin, marketplace or local; only ~/.cursor/hooks.json fired under the CLI (Cursor
+  // staff, forum 163890). On those builds, and on a machine without Node on PATH, the absent registry
+  // below is the CLI's ONLY path, and every cursor-agent session records nothing at all while the
+  // IDE looks perfect.
   const s = await linkStatus({
     getAccessToken: async () => 'tok',
     whoami: async () => ({ valid: true, name: 'Dev' }),
@@ -163,8 +164,9 @@ test('both registries are reported, and neither hides the other', async () => {
 });
 
 test('a CLI-only machine is not told its hooks are broken', async () => {
-  // The converse mistake. No bundled hook has ever fired here — normal on a machine that only runs
-  // `cursor-agent` — and the user-scope registry is doing all the work. Nothing needs fixing.
+  // The converse mistake. No bundled hook has ever fired here — normal on an older `cursor-agent`
+  // build or without `node` on PATH — and the user-scope registry is doing all the work. Nothing
+  // needs fixing.
   const s = await linkStatus({
     getAccessToken: async () => 'tok',
     whoami: async () => ({ valid: true }),

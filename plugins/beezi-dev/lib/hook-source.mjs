@@ -17,14 +17,20 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 // premise — "the bundled registry is alive, so the launcher is redundant" — and the premise is
 // false.
 //
-// The Cursor CLI does not run hooks that come from an installed plugin, marketplace or local, even
-// though it does load that plugin's rules and skills; only `~/.cursor/hooks.json` and
-// `<project>/.cursor/hooks.json` fire under `cursor-agent` (Cursor staff, forum 163890, still open
-// as of Aug 2026). The two registries are therefore not substitutes for each other — they cover
-// different hosts. One IDE session recording `plugin-hooks` was enough to switch the launchers off
-// for a fortnight and have the self-installer delete them, and from then on every `cursor-agent`
-// session on that machine reported nothing at all: no sidecar line, no segment, no cost. Silently,
-// and for as long as the IDE kept being used, which on a machine that uses both is forever.
+// Older Cursor CLI builds (Jun–Aug 2026) did not run hooks that come from an installed plugin,
+// marketplace or local, even though they loaded that plugin's rules and skills; only
+// `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` fired under `cursor-agent` (Cursor
+// staff, forum 163890). The two
+// registries were therefore not substitutes for each other — they covered different hosts. One IDE
+// session recording `plugin-hooks` was enough to switch the launchers off for a fortnight and have
+// the self-installer delete them, and from then on every `cursor-agent` session on that machine
+// reported nothing at all: no sidecar line, no segment, no cost. Silently, and for as long as the
+// IDE kept being used, which on a machine that uses both is forever.
+//
+// CLI 2026.09.18 does run bundled hooks: every event fired twice, once from each registry. That
+// makes neither registry redundant. A CLI build that predates the change still runs only the
+// launchers, and the bundled entries call bare `node`, so on a CLI-only machine without Node on
+// PATH the launchers (which record a node path) are the only hooks that run at all.
 //
 // Nothing is arbitrated now. Both registries stay installed, both fire, and the duplicate lines they
 // write are collapsed by the READER on the host's own event id — see `eid` in lib/sidecar-events.mjs
@@ -33,9 +39,10 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 //
 // The record is kept because the status surfaces still have a real question to answer. `install`,
 // `me` and the session banner report which registry has been seen doing the work, and "no bundled
-// hook has ever run here" is what distinguishes a CLI-only machine from a broken install. Each
-// registry gets its own entry: on a machine where both fire, a single shared slot would be rewritten
-// by whichever ran last — on every tool call, in the hottest path the plugin has.
+// hook has ever run here" is what distinguishes a CLI-only machine on an older CLI build from a
+// broken install. Each registry gets its own entry: on a machine where both fire, a single shared
+// slot would be rewritten by whichever ran last — on every tool call, in the hottest path the
+// plugin has.
 
 export const HookSource = Object.freeze({
   PLUGIN: 'plugin-hooks',
@@ -115,8 +122,8 @@ export function recordHookRun({ via, pluginRoot = PLUGIN_ROOT, now = Date.now(),
 // Called first by every hook script, and always true: every run does the work it was started for.
 //
 // The stand-down branch that used to live here exited 0 on a launcher run whenever a bundled run had
-// been seen in the last fortnight. Under `cursor-agent`, where the bundled registry never fires at
-// all, that switched off the only hooks the CLI has — see the module header. Duplicates are
+// been seen in the last fortnight. Under a `cursor-agent` build where the bundled registry does not
+// fire, that switched off the only hooks the CLI has — see the module header. Duplicates are
 // collapsed at read time now, on the event's own id, so there is nothing left for a hook process to
 // arbitrate.
 //

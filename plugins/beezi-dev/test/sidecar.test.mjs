@@ -281,3 +281,33 @@ test('the guard is what stops afterFileEdit and postToolUse counting one write t
   assert.equal(changes.files_changed, 1);
   assert.equal(changes.lines_added, 1, 'one write, counted once');
 });
+
+// ---------------------------------------------------------------------------
+// The model a generation line names: the base id, with the slug kept beside it
+// ---------------------------------------------------------------------------
+
+test('a slug-only payload writes the base id and keeps the slug as the variant', () => {
+  // The Cursor CLI sends only `model` (plan evidence E2), so without this every effort level
+  // became its own model downstream.
+  const [gen] = eventsFromHookPayload({
+    hook_event_name: 'postToolUse', model: 'claude-opus-5-thinking-high', generation_id: 'g1',
+  }).filter((e) => e.ev === 'gen');
+  assert.equal(gen.model, 'claude-opus-5');
+  assert.equal(gen.model_variant, 'claude-opus-5-thinking-high');
+});
+
+test('model_id still wins when the payload carries it', () => {
+  const [gen] = eventsFromHookPayload({
+    model_id: 'kimi-k3', model: 'kimi-k3-max', generation_id: 'g1',
+  }).filter((e) => e.ev === 'gen');
+  assert.equal(gen.model, 'kimi-k3');
+  assert.equal(gen.model_variant, 'kimi-k3-max');
+});
+
+test('the Auto placeholder is written as it came, with no variant', () => {
+  // Resolving `default` needs the CLI store and belongs to the reader; the writer runs on the
+  // postToolUse hot path and records only what the payload said.
+  const [gen] = eventsFromHookPayload({ model: 'default', generation_id: 'g1' }).filter((e) => e.ev === 'gen');
+  assert.equal(gen.model, 'default');
+  assert.equal('model_variant' in gen, false);
+});

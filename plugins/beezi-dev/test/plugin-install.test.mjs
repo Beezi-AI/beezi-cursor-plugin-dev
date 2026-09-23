@@ -91,9 +91,9 @@ test('bundled hooks proven alive: the user-scope registry stays exactly where it
   assert.equal(result.source, 'plugin-hooks');
   assert.deepEqual(result.actions, [], 'a proven bundled registry is not a reason to touch anything');
 
-  // This used to delete the file. `cursor-agent` does not run a plugin's bundled hooks at all, so
-  // these entries are the CLI's only ones — removing them on the strength of an IDE session having
-  // fired is what silently stopped every CLI session on the machine from reporting.
+  // This used to delete the file. Older `cursor-agent` builds run no plugin-bundled hook, so
+  // there these entries are the CLI's only ones — removing them on the strength of an IDE
+  // session having fired is what silently stopped every CLI session on the machine from reporting.
   const registry = readJson(path.join(dir, 'hooks.json'));
   assert.deepEqual(Object.keys(registry.hooks).sort(), BEEZI_HOOKS.map((h) => h.event).sort());
 });

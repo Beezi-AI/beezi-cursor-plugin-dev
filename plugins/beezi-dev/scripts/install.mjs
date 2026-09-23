@@ -57,15 +57,19 @@ function reportProject(dir) {
   console.log(`  Source: ${status.entry.gitUrl}@${status.entry.gitRef == null ? DEFAULT_GIT_REF : status.entry.gitRef}`);
 }
 
-// The bundled registry, which covers the Cursor IDE and only the Cursor IDE.
+// The bundled registry, which covers the Cursor IDE, and of the CLI builds only those that run
+// plugin hooks (2026.09.18 does; older builds did not).
 //
 // This block used to RETURN. If a plugin hook had been seen firing it printed "no install needed",
 // skipped the registry report entirely, and — when the user scope did have entries — offered to
-// remove them. Every one of those three lines is now wrong: `cursor-agent` does not run a plugin's
-// hooks at all (Cursor staff, forum 163890), so on a machine that uses both hosts, "no install
-// needed" was printed while every CLI session recorded nothing whatsoever, and the removal note
-// described deleting the CLI's only coverage. lib/plugin-install.mjs no longer performs that
-// removal, and this report no longer stops at the half of the answer that looked healthy.
+// remove them. Every one of those three lines is now wrong: older `cursor-agent` builds ran no
+// plugin hook at all (Cursor staff, forum 163890, Jun–Aug 2026), so on a machine that uses both
+// hosts, "no install needed" was printed while every CLI session recorded nothing whatsoever, and
+// the removal note described deleting the CLI's only coverage. CLI 2026.09.18 runs the bundled
+// hooks too (observed on Windows), but the launchers are still what an older build, or a machine
+// without Node on PATH, falls back on.
+// lib/plugin-install.mjs no longer performs that removal, and this report no longer stops at the
+// half of the answer that looked healthy.
 function reportBundled() {
   const probe = readHookSource();
   if (pluginHooksAlive({ probe })) {
@@ -74,18 +78,19 @@ function reportBundled() {
     console.log(`  Plugin:    ${probe.pluginRoot}`);
   } else {
     console.log("• Beezi: the plugin's own bundled hooks have not been seen firing on this machine.");
-    console.log('  Expected on a machine that only uses `cursor-agent`, and until Cursor has run one');
+    console.log('  Normal on older `cursor-agent` builds, without `node` on PATH, or before the first');
     console.log('  session with the plugin enabled. The registry below is what matters either way.');
   }
   console.log('');
 }
 
-// The installable registry — and, under `cursor-agent`, the only one there is.
+// The installable registry — and, under an older `cursor-agent` build that ignores plugin hooks,
+// the only one there is.
 function reportRegistry(status) {
   // True only of the user scope. `--scope plugin` is the legacy local materialization, which the CLI
   // does not read either, so claiming it covers cursor-agent would be the same mistake in reverse.
   const cliNote = status.scope === HookScope.USER
-    ? '  This is the registry `cursor-agent` reads — a plugin\'s own hooks never fire under the CLI.'
+    ? '  `cursor-agent` reads this registry; older CLI builds read no other.'
     : null;
 
   if (status.state === 'installed') {
@@ -98,8 +103,9 @@ function reportRegistry(status) {
   }
 
   if (status.state === 'absent') {
-    // No longer "correct when the bundled hooks are alive". An absent user scope means the CLI is
-    // uncovered, whatever the IDE is doing, and it is a missing install every single time.
+    // No longer "correct when the bundled hooks are alive". An absent user scope leaves an older CLI
+    // build, or a machine without `node` on PATH, uncovered whatever the IDE is doing, and it is a
+    // missing install every single time.
     console.log(`⚠ Beezi: analytics hooks are NOT installed (${status.scope} scope).`);
     if (cliNote) console.log(cliNote);
     console.log(`  Registry: ${status.hooksFile}`);

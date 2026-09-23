@@ -59,10 +59,12 @@ export async function linkStatus(deps = {}) {
 // those users "run install" while analytics were flowing, and following the advice re-added entries
 // the next session would strip again.
 //
-// It is actively harmful now, on exactly the machines that need the answer. The Cursor CLI does not
-// run hooks that come from an installed plugin, marketplace or local; only `~/.cursor/hooks.json`
-// and `<project>/.cursor/hooks.json` fire under `cursor-agent` (Cursor staff, forum 163890, still
-// open). The two registries are not substitutes — they cover different HOSTS. So a live bundled
+// It is actively harmful now, on exactly the machines that need the answer. Older CLI builds ran no
+// hook that came from an installed plugin, marketplace or local; only `~/.cursor/hooks.json` and
+// `<project>/.cursor/hooks.json` fired under `cursor-agent` (Cursor staff, forum 163890, Jun–Aug
+// 2026). CLI 2026.09.18 runs both registries, but the launchers stay the fallback for
+// older builds and for machines without Node on PATH (docs/host-boundaries.md, "The Cursor CLI").
+// The two registries are not substitutes — they cover different HOSTS. So a live bundled
 // registry says nothing whatsoever about whether `cursor-agent` reports, and answering "nothing
 // needs installing" on the strength of it hid a completely uncovered CLI behind a green tick. The
 // self-installer no longer removes the user scope either (lib/plugin-install.mjs), so an `absent`
@@ -117,21 +119,22 @@ export function describeReporting(status) {
     return 'Could not verify the link, so whether analytics are reporting is unknown. Queued reports are retried automatically once the API is reachable.';
   }
   // Two registries, two hosts, and only one of them can be repaired. The bundled registry covers the
-  // Cursor IDE and nothing else — `cursor-agent` does not run a plugin's hooks at all (Cursor staff,
-  // forum 163890) — so the USER scope is what every line below leads with: it is the half that can
-  // be wholly missing while the IDE looks perfectly healthy, and it is the half `install` fixes.
+  // Cursor IDE, and of the CLI builds only those that run plugin hooks (2026.09.18 does; older
+  // `cursor-agent` builds ran none, Cursor staff, forum 163890) — so the USER scope is what every
+  // line below leads with: it is the half that can be wholly missing while the IDE looks perfectly
+  // healthy, and it is the half `install` fixes.
   // What the bundled one is doing is reported after it, never instead of it, so a green tick can
   // never again be read as "both hosts are covered".
   const { bundled, user } = status.hooks;
   const ide = bundled
     ? " The plugin's own bundled hooks are firing too, which covers the Cursor IDE."
-    : " The plugin's own bundled hooks have not been seen firing here — normal on a machine that only uses the CLI.";
+    : " The plugin's own bundled hooks have not been seen firing here — normal on older CLI builds, without `node` on PATH, or before the first session with the plugin enabled.";
 
   switch (user.state) {
     case 'installed':
       return `Analytics hooks are installed in the user-scope registry, which is what covers \`cursor-agent\`.${ide} If nothing is arriving, ${RELOAD_STEP}.`;
     case 'absent':
-      return `Analytics are NOT being reported for \`cursor-agent\`: the user-scope hooks are not installed, and that registry is the only one the Cursor CLI reads.${ide} Run ${installCommand()}, then ${RELOAD_STEP}.`;
+      return `Analytics are NOT being reported for \`cursor-agent\`: the user-scope hooks are not installed, and older Cursor CLI builds read no other registry.${ide} Run ${installCommand()}, then ${RELOAD_STEP}.`;
     case 'stale':
       return `Analytics are NOT being reported for \`cursor-agent\`: the user-scope hooks point at an older plugin version.${ide} Run ${installCommand()}, then ${RELOAD_STEP}.`;
     case 'partial':

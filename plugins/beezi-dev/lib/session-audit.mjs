@@ -937,6 +937,8 @@ export async function runSync(deps = {}, options = {}) {
   const loadSyncStateImpl = deps.loadSyncStateImpl == null ? _loadSyncState : deps.loadSyncStateImpl;
   const saveSyncStateImpl = deps.saveSyncStateImpl == null ? _saveSyncState : deps.saveSyncStateImpl;
   const readTracking = deps.readTrackingStateImpl == null ? readTrackingState : deps.readTrackingStateImpl;
+  // The same seam, and the same default, as the one-time backfill's (runAudit above).
+  const computeSessionTimeline = deps.computeSessionTimelineImpl == null ? _computeSessionTimeline : deps.computeSessionTimelineImpl;
   const fetchImpl = deps.fetchImpl == null ? resolveFetch() : deps.fetchImpl;
   const onProgress = deps.onProgress == null ? (() => {}) : deps.onProgress;
   const now = deps.now == null ? (() => Date.now()) : deps.now;
@@ -1000,6 +1002,10 @@ export async function runSync(deps = {}, options = {}) {
     // Suffixes whose priced-overage cost was marked unknown rather than re-counted.
     overageUnavailable: 0,
     timelines: 0,
+    // The backfill's two client-side twins of `timelines`: how many this run attached, and how many
+    // a server that refused the in-band field made the flush strip (audit-flush retries without them).
+    timelinesOffered: 0,
+    timelinesDropped: 0,
     coverageKnown: false,
     lastError: null,
   };
@@ -1229,10 +1235,30 @@ export async function runSync(deps = {}, options = {}) {
           });
           if (overageMarked) result.overageUnavailable += 1;
 
+          // The session's timeline travels in its own group, exactly as the backfill's does. Without
+          // it a session first seen by sync had no periods and no subagent lanes until some later
+          // live checkpoint happened to post a timeline — and for a Cursor CLI session, whose lanes
+          // exist only through the chat-store enrichment inside computeSessionTimeline, that could be
+          // never. Whole-session and upserted by sessionId, so a resumed suffix still ships the full
+          // timeline. Best-effort: a timeline that fails to compute never blocks the usage upload.
+          let timeline = null;
+          try {
+            const computed = computeSessionTimeline(sessionId);
+            if (
+              computed &&
+              (computed.periods.length > 0 || computed.subagents.length > 0 || computed.plan_events.length > 0)
+            ) {
+              timeline = { sessionId, ...computed };
+              result.timelinesOffered += 1;
+            }
+          } catch { /* best-effort */ }
+
+          // Counted in `bytes`, which is what planChunks and the flush size the request by.
           const group = {
             sessionId,
             reports: staged,
-            bytes: Buffer.byteLength(JSON.stringify({ reports: staged }), 'utf-8'),
+            timeline,
+            bytes: Buffer.byteLength(JSON.stringify({ reports: staged, timeline }), 'utf-8'),
           };
           result.plannedReports += staged.length;
 
@@ -1257,6 +1283,7 @@ export async function runSync(deps = {}, options = {}) {
           result.reportsStored += flushed.stored;
           result.reportsSkipped += flushed.skipped;
           result.timelines += flushed.timelines;
+          result.timelinesDropped += flushed.timelinesDropped == null ? 0 : flushed.timelinesDropped;
           result.itemErrors += flushed.itemErrors;
           result.unattributed += flushed.unattributed;
           result.permanentRejections += flushed.permanentRejections;

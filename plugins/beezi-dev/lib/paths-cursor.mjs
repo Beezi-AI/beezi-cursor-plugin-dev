@@ -54,6 +54,27 @@ export function pendingBatchFile(name) {
   return path.join(pendingDir(), `${name}.json`);
 }
 
+// The session-timeline outbox: one `<name>.json` per conversation, holding the newest timeline body
+// that has not yet been confirmed by the server. Written BEFORE the timeline POST and deleted on a
+// 2xx; every later hook's flush drains what is left (lib/timeline-outbox.mjs).
+//
+// It exists because a Cursor CLI session gets one turn-end at most (`agent -p` fires exactly one
+// sessionEnd, an interactive exit may fire none), and "retry at the next turn-end" meant a single
+// failed POST lost that session's timeline for good (plan E11).
+//
+// Its OWN directory, not a file under queue/: deliverQueue POSTs every `.json` in queue/ to the
+// REPORT route, where a timeline body 400s and is deleted as a permanent rejection. Not state/
+// either, which is committed truth. Swept by lib/prune.mjs on the same clock as everything else.
+export function timelineOutboxDir() {
+  return path.join(beeziCursorHome(), 'timelines');
+}
+
+// Takes an ALREADY-SANITIZED name, the same contract (and for the same cycle reason) as
+// `pendingBatchFile` above.
+export function timelineOutboxFile(name) {
+  return path.join(timelineOutboxDir(), `${name}.json`);
+}
+
 // One conversation's live state (cursor, anchor, account stamp, covered intervals).
 //
 // Takes an ALREADY-SANITIZED name, not a raw conversation id, and that split is deliberate. The

@@ -119,6 +119,9 @@ function makeDeps(overrides = {}) {
     saveLedgerImpl: () => { throw new Error('sync wrote the one-time ledger'); },
     loadLedgerImpl: () => { throw new Error('sync read the one-time ledger'); },
     runCheckpointImpl: () => { throw new Error('sync must not nest runCheckpoint under its own lock'); },
+    // The real timeline reads the real sidecar dir (and the real CLI chat store); no test here wants
+    // that unless it says so.
+    computeSessionTimelineImpl: () => null,
     ...overrides,
   };
   return { deps, order, lock, saved, syncState };
@@ -1026,3 +1029,107 @@ test('injecting a plain withLock drops the fence — which is why the default mu
 // The work is not lost (the cursor stands still and the next hook re-examines the window), but the
 // checkpoint IS skipped, and no test here can turn that into a failure because it is the intended
 // behaviour of both halves. Bounding the held section belongs to whoever owns sync's throughput.
+
+// ─── the timeline rides with the group (R6 / R11) ───────────────────────────
+//
+// A session first seen by sync used to upload reports with no timeline, so it had no periods and no
+// subagent lanes (Cursor CLI lanes included — those are recovered inside computeSessionTimeline)
+// until some later live checkpoint happened to post one. Sync now carries it exactly as the
+// one-time backfill does: best-effort, inside the group, counted in `bytes`.
+
+const laneTimeline = {
+  periods: [{ state: 'working', started_at: '2026-01-01T00:00:00.000Z', ended_at: '2026-01-01T00:01:00.000Z' }],
+  plan_events: [],
+  subagents: [{ agent_id: 'k1', agent_type: 'generalPurpose', started_at: '2026-01-01T00:00:10.000Z', ended_at: '2026-01-01T00:00:40.000Z' }],
+  started_at: '2026-01-01T00:00:00.000Z',
+  ended_at: '2026-01-01T00:01:00.000Z',
+  generated_at: '2026-01-01T00:02:00.000Z',
+};
+
+test('the uploaded group carries the session timeline, lanes and all, and its bytes count it', async () => {
+  const asked = [];
+  let sent = null;
+  const { deps } = makeDeps({
+    computeSessionTimelineImpl: (id) => { asked.push(id); return laneTimeline; },
+    flushBackfillChunksImpl: async (groups) => {
+      sent = groups;
+      return flushResult({ bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED }])) });
+    },
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(result.timelinesOffered, 1);
+  assert.deepEqual(asked, ['s1']);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].timeline, { sessionId: 's1', ...laneTimeline });
+  assert.deepEqual(sent[0].timeline.subagents.map((s) => s.agent_id), ['k1']);
+  assert.equal(
+    sent[0].bytes,
+    Buffer.byteLength(JSON.stringify({ reports: sent[0].reports, timeline: sent[0].timeline }), 'utf-8'),
+  );
+});
+
+test('an empty timeline is not attached', async () => {
+  let sent = null;
+  const { deps } = makeDeps({
+    computeSessionTimelineImpl: () => ({ ...laneTimeline, periods: [], subagents: [] }),
+    flushBackfillChunksImpl: async (groups) => {
+      sent = groups;
+      return flushResult({ bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED }])) });
+    },
+  });
+
+  await runSync(deps, {});
+
+  assert.equal(sent[0].timeline, null);
+});
+
+test('a timeline that throws never blocks the upload', async () => {
+  let sent = null;
+  const { deps } = makeDeps({
+    computeSessionTimelineImpl: () => { throw new Error('unparseable sidecar'); },
+    flushBackfillChunksImpl: async (groups) => {
+      sent = groups;
+      return flushResult({ bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED }])) });
+    },
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.sessionsImported, 1);
+  assert.equal(sent[0].reports.length, 1);
+  assert.equal(sent[0].timeline, null);
+});
+
+test('a session that ships nothing never pays for a timeline', async () => {
+  let calls = 0;
+  const { deps } = makeDeps({
+    computeSessionTimelineImpl: () => { calls += 1; return laneTimeline; },
+    extractAuditReports: async () => ({ reports: [], sessionErrors: [], deltaFailed: false }),
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.empty, 1);
+  assert.equal(calls, 0);
+});
+
+test('timelines the server refused are counted, so a silent strip is visible', async () => {
+  // audit-flush retries a chunk without its timelines when the route 400s on the field; the
+  // usage still lands, and only this counter says the lanes did not.
+  const { deps } = makeDeps({
+    computeSessionTimelineImpl: () => laneTimeline,
+    flushBackfillChunksImpl: async (groups) => flushResult({
+      timelinesDropped: 1,
+      bySession: new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED }])),
+    }),
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.timelinesOffered, 1);
+  assert.equal(result.timelinesDropped, 1);
+  assert.equal(result.timelines, 0);
+});

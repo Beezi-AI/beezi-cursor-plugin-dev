@@ -1,5 +1,6 @@
 import { readEvents } from './sidecar-read.mjs';
 import { correlateSubagents, timestampOf } from './subagents-cursor.mjs';
+import { withCliSubagents } from './cli-subagents-cursor.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import * as hostDelta from './delta-cursor.mjs';
 import * as hostTiming from './timing.mjs';
@@ -19,7 +20,9 @@ import * as hostHttp from './http.mjs';
 // (a confirmed host bug) and no sub-transcript exists anywhere on disk, so the hook events are the
 // only evidence a subagent ever ran. Five shipped portal surfaces read this array — the Tool
 // Attribution tree, the tokens-by-mode bar, the Session detail Subagents card, the Overview
-// "Tokens by Subagent" panel and this timeline's own gantt lanes.
+// "Tokens by Subagent" panel and this timeline's own gantt lanes. The one exception is the Cursor
+// CLI, which fires no subagent hooks at all: its lines are rebuilt from the CLI's own chat store
+// (lib/cli-subagents-cursor.mjs) before correlation.
 //
 // The turn boundary is `stop`. `afterAgentResponse` / `afterAgentThought` are a staff-acknowledged
 // bug in the CLI (they do not fire), so nothing here may depend on them.
@@ -118,7 +121,15 @@ export const WAITING_SUBTYPE = Object.freeze({ COMMAND_APPROVAL: 'command_approv
 // outranks the idle threshold, so a mistaken member here no longer mislabels gaps under five
 // minutes only — it mislabels every gap up to BREAK_MS, six hours of parent work drawn as the user
 // sitting there.
-const TURN_END_EVENTS = new Set(['stop', 'end', 'session_end']);
+//
+// `session_start` IS in here, although it ends no turn: it is the boundary after which the first
+// move is the human's. A session is opened (the CLI's `agent`, an IDE composer) before anyone types,
+// and the gap up to the first tool or generation is the user reading, thinking, writing a prompt.
+// Left out, that gap was an agent-side gap, and one over five minutes drew as `idle` — which the
+// portal labels "Subagents working" — at the very start of a session that had delegated nothing.
+// Billing is unaffected: delta-cursor's SESSION_LIFECYCLE_EVENTS keeps `session_start` out of the
+// timing anchors, so this only decides how the gap is DRAWN, never whether it is billed.
+const TURN_END_EVENTS = new Set(['stop', 'end', 'session_end', 'session_start']);
 
 // Re-exported from the dependency-free module that owns it — same function, one implementation. See
 // the note there for why it lives on that side of the import.
@@ -308,7 +319,16 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
   // collapse here" — which is the case the withheld-subagents branch below exists for, and a
   // `== null` test would quietly replace it with the module's own.
   const dedupe = 'dedupeEvents' in deps ? deps.dedupeEvents : dedupeEvents;
-  const window = dedupe ? dedupe(events).events : events;
+  // Cursor CLI sessions: the workers come from the CLI's chat store, not from hooks (see
+  // lib/cli-subagents-cursor.mjs). Enriched here, before the span is measured, so every caller —
+  // the checkpoint, backfill, sync — draws the same lanes from the same stream. A no-op on a stream
+  // that already has subagent lines, which covers every IDE session with delegation AND the
+  // checkpoint, whose array arrives enriched already. Only with a collapse: with none the subagent
+  // list is withheld below anyway, and reading the store for it would be pure cost.
+  //
+  // `deps` goes through whole: `deadline`, `chatsDir`, `sqlite` and the `listCliSubagents` seam are
+  // the chat-store reader's, and the checkpoint forwards its hook deadline in them.
+  const window = dedupe ? withCliSubagents(conversationId, dedupe(events).events, deps) : events;
 
   let minTs = Infinity;
   let maxTs = -Infinity;

@@ -32,14 +32,16 @@ Report the output verbatim, then act on what it says.
 
 **Two registries, two hosts. Read both lines of the status output before saying anything.**
 
-- The plugin's own **bundled** hooks cover the Cursor IDE. `✓ … the Cursor IDE is covered` is good
-  news, and `•  … have not been seen firing` is not a fault — it is normal on a machine that only
-  uses `cursor-agent`, and nothing can install it.
-- The **user-scope registry** (`~/.cursor/hooks.json`) is the one `install` writes, and it is the
-  ONLY registry the Cursor CLI reads: `cursor-agent` never runs hooks that came from an installed
-  plugin, marketplace or local. Anything other than `✓ … are installed` here means CLI sessions
-  report nothing, and it needs the install command — including when the bundled line above says the
-  IDE is covered. A healthy IDE says nothing at all about the CLI.
+- The plugin's own **bundled** hooks cover the Cursor IDE, and current `cursor-agent` builds
+  (2026.09.18) run them too. `✓ … the Cursor IDE is covered` is good news, and `•  … have not been
+  seen firing` is not a fault — it is normal on older `cursor-agent` builds, on a machine without
+  `node` on PATH, or before the first session with the plugin enabled, and nothing can install it.
+- The **user-scope registry** (`~/.cursor/hooks.json`) is the one `install` writes. Older Cursor CLI
+  builds read no other registry, and it is the one that works without `node` on PATH, so anything
+  other than `✓ … are installed` here can mean CLI sessions report nothing. It needs the install
+  command — including when the bundled line above says the IDE is covered.
+- On Windows, `agent` launched from **Git Bash** runs no hooks at all; launch it from PowerShell or
+  cmd. Neither registry can fix that.
 
 So `⚠ Beezi: analytics hooks are NOT installed` printed underneath a firing bundled registry is a
 real problem to fix, not a contradiction. Run the install. Both registries are meant to stay

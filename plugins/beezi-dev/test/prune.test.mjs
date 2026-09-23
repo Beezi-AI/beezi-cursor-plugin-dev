@@ -179,3 +179,22 @@ test('pruneStale runs the capture sweep even on a machine where capture is switc
 
   assert.equal(fs.existsSync(stale), false, 'the nested replay the mtime loop cannot see is swept');
 });
+
+test('pruneStale collects an expired timeline outbox entry and keeps a fresh one', (t) => {
+  // The outbox holds a CLI session's timeline until a later hook delivers it. An entry recorded
+  // under another account is deliberately left in place by the drain (sending one tenant's
+  // timeline under another's credentials is worse than one orphaned file), so, like pending/,
+  // nothing else on the machine ever deletes it.
+  const home = makeTmpDir(t);
+  setHome(home);
+  const dir = path.join(home, 'timelines');
+  const old = writeFile(dir, 'conv-old.json', '{"v":1}');
+  const fresh = writeFile(dir, 'conv-new.json', '{"v":1}');
+  const now = Date.now();
+  ageFile(old, 31 * 24 * 60 * 60 * 1000, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(old), false, 'an undeliverable timeline is not immortal');
+  assert.equal(fs.existsSync(fresh), true, 'a timeline awaiting the next hook survives');
+});

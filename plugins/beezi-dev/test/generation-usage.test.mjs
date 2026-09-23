@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { eventsFromHookPayload } from '../lib/sidecar-events.mjs';
 import { computeDelta } from '../lib/delta-cursor.mjs';
+import { clearCliChatCache } from '../lib/cli-chats-cursor.mjs';
 
 // Cursor's `stop` payload carries the turn's model, its generation_id, and its
 // aiserver.v1.TokenUsage. The plugin used to record only a bare `{ev:'stop'}` marker, so a turn
@@ -248,4 +252,374 @@ test('one model run at two settings sums both price records under the one model'
   assert.equal(delta.entries[0].billing_pool, 'credits');
   assert.equal(delta.entries[0].requests, 2);
   assert.equal(delta.entries[0].cost_usd, 0.67);
+});
+
+// ---------------------------------------------------------------------------
+// Cursor CLI: one model per generation, and Auto (`default`) resolved from the CLI chat store
+// ---------------------------------------------------------------------------
+//
+// The CLI sends only the slug, and changes it WITHIN one generation: `default` on some lines, the
+// bare model on postToolUse, the thinking/effort slug on `stop` (plan evidence E2/E3). Every spelling
+// used to be its own model and its own request.
+
+// Epoch milliseconds: a number below 1e12 is read as seconds by timestampOf.
+const T = 1790000000000;
+
+// `cliMeta: null, cliStoreFacts: null` keeps these tests off the real ~/.cursor: undefined would
+// make computeDelta read the CLI store from disk. `extra` is merged over the defaults.
+const computeDeltaFor = (events, extra = {}) =>
+  computeDelta('conv-1', 0, {
+    readEvents: () => events,
+    readUsageData: () => null,
+    cliMeta: null,
+    cliStoreFacts: null,
+    ...extra,
+  });
+
+const factsOf = (replyModels, complete = true) => ({ replyModels, childAgentIds: [], complete });
+const requestsOf = (delta) => delta.entries.reduce((n, e) => n + e.requests, 0);
+const tokenInputOf = (delta) => delta.entries.reduce((n, e) => n + (e.token_input ?? 0), 0);
+const modelsOf = (delta) => [...new Set(delta.entries.map((e) => e.model))];
+const TOKENS = (input) => ({ token_input: input, token_output: 1, token_cache_read: 0, token_cache_write: 0 });
+const rowsOf = (delta) => delta.entries.map((e) => [e.model, e.billing_pool, e.requests, e.cost_usd]);
+
+test('a CLI generation with default + variant lines is ONE request on the base model', () => {
+  const events = [
+    { ts: T + 1000, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' },
+    { ts: T + 1001, ev: 'tool', tool: 'Read', bytes: 10, ms: 5, eid: 't1' },
+    { ts: T + 1002, ev: 'gen', model: 'claude-opus-5', gen_id: 'g1', eid: 'g1' },
+    { ts: T + 2000, ev: 'gen', model: 'claude-opus-5-thinking-high', gen_id: 'g1', eid: 'g1', ...TOKENS(100) },
+    { ts: T + 2001, ev: 'stop' },
+  ];
+  const delta = computeDeltaFor(events);
+  assert.deepEqual(modelsOf(delta), ['claude-opus-5']);
+  assert.equal(requestsOf(delta), 1);
+  assert.equal(tokenInputOf(delta), 100);
+  // Resolved inside the window: nothing was left for the store to answer.
+  assert.equal(delta.diagnostics.unresolvedAuto, 0);
+});
+
+test('print mode: slug spellings of one model under gen_id == conversation id are one request', () => {
+  // `agent -p` stamps every turn with the conversation id (E7), so this is also what a multi-turn
+  // headless session looks like. One request per session there is a host limitation, recorded in
+  // the plan; what this pins is that the two spellings no longer read as two models.
+  const events = [
+    { ts: T + 1000, ev: 'gen', model: 'claude-opus-5', gen_id: 'conv', eid: 'conv' },
+    { ts: T + 5000, ev: 'gen', model: 'claude-opus-5-thinking-high', gen_id: 'conv', eid: 'conv' },
+  ];
+  const delta = computeDeltaFor(events);
+  assert.equal(requestsOf(delta), 1);
+  assert.deepEqual(modelsOf(delta), ['claude-opus-5']);
+});
+
+test('the carried generation keys keep the `model\\ngen_id` format, on the base id', () => {
+  const events = [
+    { ts: T + 1000, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' },
+    { ts: T + 2000, ev: 'gen', model: 'claude-opus-5-thinking-high', gen_id: 'g1', eid: 'g1' },
+  ];
+  // One key: the placeholder line was rewritten, so it is not a second identity to persist.
+  assert.deepEqual(computeDeltaFor(events).countedGenerations, ['claude-opus-5\ng1']);
+});
+
+test('a generation split across two windows is billed once, whatever model each window saw', () => {
+  const w1 = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' }];
+  const d1 = computeDeltaFor(w1, { cliStoreFacts: factsOf(['model-a']) });
+  assert.deepEqual(modelsOf(d1), ['model-a']);
+  const w2 = [{ ts: T + 9, ev: 'gen', model: 'claude-opus-5-thinking-high', gen_id: 'g1', eid: 'g1', ...TOKENS(10) }];
+  const d2 = computeDeltaFor(w2, {
+    countedGenerations: d1.countedGenerations,
+    cliStoreFacts: factsOf(['model-b', 'model-b']),
+  });
+  assert.equal(requestsOf(d1) + requestsOf(d2), 1);
+  // The id was billed in window 1, so window 2 carries the tokens on a zero-request row of the
+  // model ITS line named, rather than dropping them or counting the turn again.
+  assert.equal(tokenInputOf(d2), 10);
+  assert.deepEqual(d2.entries.map((e) => [e.model, e.requests]), [['claude-opus-5', 0]]);
+});
+
+test('carried generation keys written with a raw slug are honoured after the upgrade', () => {
+  // A state file from the previous release holds the slug; the line is read under the base id now.
+  const events = [
+    { ts: T + 3000, ev: 'gen', model: 'claude-opus-5-thinking-high', gen_id: 'g9', eid: 'g9' },
+  ];
+  const delta = computeDeltaFor(events, { countedGenerations: ['claude-opus-5-thinking-high\ng9'] });
+  assert.equal(requestsOf(delta), 0);
+  // And the persisted list does not grow a second spelling of the same identity.
+  assert.deepEqual(delta.countedGenerations, ['claude-opus-5\ng9']);
+});
+
+test('a carried key with no separator is kept as-is and bills nothing away', () => {
+  const events = [{ ts: T + 1, ev: 'gen', model: 'm', gen_id: 'g1', eid: 'g1' }];
+  const delta = computeDeltaFor(events, { countedGenerations: ['g1'] });
+  assert.equal(requestsOf(delta), 1, 'a malformed key names no generation');
+  assert.deepEqual(delta.countedGenerations, ['g1', 'm\ng1']);
+});
+
+test('an IDE stream with only the slug still finds its slug-keyed price record', () => {
+  // Older IDE builds send `model: "kimi-k3-max"` with no model_id (E4). The request now buckets
+  // under kimi-k3, and the raw slug is what still finds Cursor's per-slug price record.
+  const delta = computeDeltaFor(
+    [{ ts: T + 1, ev: 'gen', model: 'kimi-k3-max', gen_id: 'g1', eid: 'g1' }],
+    { readUsageData: () => ({ 'kimi-k3-max': { amount: 3, costInCents: 12 } }) },
+  );
+  assert.deepEqual(rowsOf(delta), [['kimi-k3', 'credits', 3, 0.12]]);
+});
+
+test('delayed slug pricing with no gen line in the window is one row on the base id', () => {
+  const delta = computeDeltaFor([{ ts: T + 1, ev: 'tool', tool: 'Read', bytes: 1, ms: 1 }], {
+    readUsageData: () => ({
+      'kimi-k3-max': { amount: 1, costInCents: 10 },
+      'kimi-k3-high': { amount: 2, costInCents: 5 },
+    }),
+  });
+  assert.deepEqual(rowsOf(delta), [['kimi-k3', 'credits', 3, 0.15]]);
+});
+
+test('a slug price record the window never named merges into its base model row', () => {
+  const delta = computeDeltaFor(
+    [{ ts: T + 1, ev: 'gen', model: 'kimi-k3', gen_id: 'g1', eid: 'g1' }],
+    { readUsageData: () => ({ 'kimi-k3-max': { amount: 1, costInCents: 20 } }) },
+  );
+  assert.deepEqual(rowsOf(delta), [['kimi-k3', 'credits', 1, 0.2]]);
+});
+
+test('a resolved default generation never prices usage under a second model', () => {
+  // The rewritten line has no slug of its own to match, so the concrete slug's price record is a
+  // leftover; bucketed by base id it lands on the resolved model instead of a second row.
+  const delta = computeDeltaFor(
+    [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' }],
+    {
+      cliStoreFacts: factsOf(['cursor-grok-4.5-high']),
+      readUsageData: () => ({ 'cursor-grok-4.5-high': { amount: 1, costInCents: 40 } }),
+    },
+  );
+  assert.deepEqual(rowsOf(delta), [['cursor-grok-4.5', 'credits', 1, 0.4]]);
+});
+
+test('a placeholder is never a price variant of the model it resolved to', () => {
+  // Were `default` recorded as a variant, a `default` price record would be folded into the
+  // resolved model's spend. The resolved model keeps only what was priced under its own names.
+  const delta = computeDeltaFor(
+    [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' },
+      { ts: T + 2, ev: 'gen', model: 'claude-opus-5', gen_id: 'g1', eid: 'g1' }],
+    { readUsageData: () => ({ default: { amount: 1, costInCents: 7 } }) },
+  );
+  const opus = rowsOf(delta).filter((row) => row[0] === 'claude-opus-5');
+  assert.deepEqual(opus, [['claude-opus-5', 'subscription', 1, 0]]);
+});
+
+// ── Auto resolution (plan Task 5 / Revision 3, R3) ──
+
+test('an Auto session takes the model from unanimous CLI replies', () => {
+  const events = [
+    { ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g', ...TOKENS(5) },
+    { ts: T + 2, ev: 'stop' },
+  ];
+  const delta = computeDeltaFor(events, {
+    cliMeta: { lastUsedModel: 'default' },
+    cliStoreFacts: factsOf(['cursor-grok-4.5-high', 'cursor-grok-4.5']),
+  });
+  assert.deepEqual(delta.entries.map((e) => e.model), ['cursor-grok-4.5']);
+  assert.equal(delta.diagnostics.unresolvedAuto, 0);
+});
+
+test('lastUsedModel is used only when concrete, the scan is complete and no reply named a model', () => {
+  const events = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }];
+  const used = computeDeltaFor(events, {
+    cliMeta: { lastUsedModel: 'claude-opus-5-thinking-high' },
+    cliStoreFacts: factsOf([]),
+  });
+  assert.deepEqual(modelsOf(used), ['claude-opus-5']);
+
+  const incomplete = computeDeltaFor(events, {
+    cliMeta: { lastUsedModel: 'claude-opus-5' },
+    cliStoreFacts: factsOf([], false),
+  });
+  assert.deepEqual(modelsOf(incomplete), ['default']);
+
+  const placeholder = computeDeltaFor(events, { cliMeta: { lastUsedModel: 'default' }, cliStoreFacts: factsOf([]) });
+  assert.deepEqual(modelsOf(placeholder), ['default']);
+
+  // Replies that disagree are not overruled by the session's last pick.
+  const mixed = computeDeltaFor(events, {
+    cliMeta: { lastUsedModel: 'claude-opus-5' },
+    cliStoreFacts: factsOf(['model-a', 'model-b']),
+  });
+  assert.deepEqual(modelsOf(mixed), ['default']);
+});
+
+test('mixed replies keep default and report it as unresolved', () => {
+  const events = [
+    { ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' },
+    { ts: T + 2, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1', ...TOKENS(3) },
+    { ts: T + 9, ev: 'gen', model: 'default', gen_id: 'g2', eid: 'g2' },
+  ];
+  const delta = computeDeltaFor(events, { cliStoreFacts: factsOf(['model-a-high', 'model-b']) });
+  assert.deepEqual(modelsOf(delta), ['default']);
+  // Per generation, not per line: two generations were left unnamed.
+  assert.equal(delta.diagnostics.unresolvedAuto, 2);
+  // A diagnostic, never a report field: an unknown key on an entry 400s the report.
+  for (const entry of delta.entries) assert.equal('unresolvedAuto' in entry, false);
+});
+
+test('an incomplete store scan keeps default, even when the replies it saw agree', () => {
+  const events = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }];
+  const delta = computeDeltaFor(events, { cliStoreFacts: factsOf(['model-a'], false) });
+  assert.deepEqual(modelsOf(delta), ['default']);
+  assert.equal(delta.diagnostics.unresolvedAuto, 1);
+});
+
+test('with no CLI store the placeholder is kept, never invented', () => {
+  const events = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }];
+  const delta = computeDeltaFor(events);
+  assert.deepEqual(modelsOf(delta), ['default']);
+  assert.equal(delta.diagnostics.unresolvedAuto, 1);
+});
+
+test('a pulse window and the later turn-end window resolve one generation identically', () => {
+  const pulse = computeDeltaFor([{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' }], {
+    cliStoreFacts: factsOf(['cursor-grok-4.5-high']),
+  });
+  const turnEnd = computeDeltaFor(
+    [{ ts: T + 60000, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1', ...TOKENS(50) }],
+    {
+      countedGenerations: pulse.countedGenerations,
+      cliStoreFacts: factsOf(['cursor-grok-4.5-high', 'cursor-grok-4.5-high']),
+    },
+  );
+  assert.deepEqual(modelsOf(pulse), ['cursor-grok-4.5']);
+  assert.deepEqual(modelsOf(turnEnd), ['cursor-grok-4.5']);
+  assert.equal(requestsOf(pulse) + requestsOf(turnEnd), 1);
+  assert.equal(tokenInputOf(turnEnd), 50);
+});
+
+test('the turn-end window keeps the pulse window’s answer when the store has since drifted', () => {
+  // By turn end the store can have outgrown the scan caps (complete:false) or gained a reply routed
+  // elsewhere. The carried key already names the model this generation was billed under, and that
+  // answer wins over a second look at the store, so the tokens do not land on a `default` row.
+  const pulse = computeDeltaFor([{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1' }], {
+    cliStoreFacts: factsOf(['model-a']),
+  });
+  const turnEnd = computeDeltaFor(
+    [{ ts: T + 60000, ev: 'gen', model: 'default', gen_id: 'g1', eid: 'g1', ...TOKENS(50) }],
+    { countedGenerations: pulse.countedGenerations, cliStoreFacts: factsOf(['model-a'], false) },
+  );
+  assert.deepEqual(turnEnd.entries.map((e) => [e.model, e.requests, e.token_input]), [['model-a', 0, 50]]);
+  assert.equal(turnEnd.diagnostics.unresolvedAuto, 0);
+});
+
+test('the CLI store is not consulted when no placeholder survives the window', () => {
+  let reads = 0;
+  const spy = { get replyModels() { reads += 1; return []; }, childAgentIds: [], complete: true };
+  computeDeltaFor(
+    [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' },
+      { ts: T + 2, ev: 'gen', model: 'claude-opus-5', gen_id: 'g', eid: 'g' }],
+    { cliStoreFacts: spy },
+  );
+  assert.equal(reads, 0);
+});
+
+// ── the disk path: deadline forwarding and the reader's own contract ──
+
+const sqlite = process.getBuiltinModule?.('node:sqlite') ?? null;
+
+function tmpChatsRoot(t) {
+  clearCliChatCache();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-auto-'));
+  t.after(() => {
+    clearCliChatCache();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return root;
+}
+
+// A CLI store laid out as CLI 2026.09.18 writes it: blobs(id, data) and meta(key, value hex JSON).
+function makeCliStore(root, chatId, blobs) {
+  const dir = path.join(root, 'workspacehash', chatId);
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new sqlite.DatabaseSync(path.join(dir, 'store.db'));
+  db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)');
+  const meta = { name: 'New Agent', lastUsedModel: 'default', createdAt: T, blobEncryptionKey: 'SECRET' };
+  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('0', Buffer.from(JSON.stringify(meta)).toString('hex'));
+  const ins = db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)');
+  blobs.forEach((b, i) => ins.run(`b${i}`, Buffer.from(JSON.stringify(b), 'utf8')));
+  db.close();
+}
+
+const reply = (modelName, padding = '') => ({
+  role: 'assistant',
+  content: [
+    { type: 'reasoning', text: padding, providerOptions: { cursor: { modelName } } },
+    { type: 'text', text: 'ok' },
+  ],
+});
+
+// Only the disk seams are given: cliMeta/cliStoreFacts are left undefined, so computeDelta reads.
+const fromDisk = (events, extra) => computeDelta('conv-1', 0, {
+  readEvents: () => events,
+  readUsageData: () => null,
+  ...extra,
+});
+
+test('the deadline is forwarded to the CLI store readers', (t) => {
+  const root = tmpChatsRoot(t);
+  const dir = path.join(root, 'workspacehash', 'conv-1');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'store.db'), 'placeholder');
+  let opens = 0;
+  const spySqlite = { DatabaseSync: function () { opens += 1; throw new Error('open'); } };
+  const events = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }];
+
+  const expired = fromDisk(events, { chatsDir: root, sqlite: spySqlite, deadline: 0 });
+  assert.equal(opens, 0, 'an expired deadline opens nothing');
+  assert.deepEqual(modelsOf(expired), ['default']);
+  assert.equal(expired.diagnostics.unresolvedAuto, 1);
+
+  clearCliChatCache();
+  fromDisk(events, { chatsDir: root, sqlite: spySqlite });
+  assert.ok(opens > 0, 'the control run does reach the store, so the zero above is the deadline');
+});
+
+test('the deadline is forwarded to the CLI meta reader too', (t) => {
+  // A complete scan with no replies is the one case that asks for lastUsedModel, so the facts are
+  // injected and only the meta read goes to disk.
+  const root = tmpChatsRoot(t);
+  const dir = path.join(root, 'workspacehash', 'conv-1');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'store.db'), 'placeholder');
+  let opens = 0;
+  const spySqlite = { DatabaseSync: function () { opens += 1; throw new Error('open'); } };
+  const events = [{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }];
+  const seams = { chatsDir: root, sqlite: spySqlite, cliStoreFacts: factsOf([]) };
+
+  const expired = fromDisk(events, { ...seams, deadline: 0 });
+  assert.equal(opens, 0, 'an expired deadline opens nothing');
+  assert.deepEqual(modelsOf(expired), ['default']);
+
+  clearCliChatCache();
+  fromDisk(events, seams);
+  assert.ok(opens > 0, 'the control run does reach the store, so the zero above is the deadline');
+});
+
+test('Auto resolves end to end from a CLI store on disk', { skip: !sqlite }, (t) => {
+  const root = tmpChatsRoot(t);
+  makeCliStore(root, 'conv-1', [
+    { role: 'user', content: 'go' },
+    reply('cursor-grok-4.5-high'),
+    reply('cursor-grok-4.5-high'),
+  ]);
+  const delta = fromDisk([{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }], { chatsDir: root });
+  assert.deepEqual(modelsOf(delta), ['cursor-grok-4.5']);
+});
+
+test('an oversized assistant row makes the store incomplete, so Auto stays default (R9)', { skip: !sqlite }, (t) => {
+  // The skipped reply may have been routed elsewhere, so the one small reply is not a unanimous answer.
+  const root = tmpChatsRoot(t);
+  makeCliStore(root, 'conv-1', [
+    reply('model-a-high'),
+    reply('model-a-high', 'x'.repeat(300 * 1024)),
+  ]);
+  const delta = fromDisk([{ ts: T + 1, ev: 'gen', model: 'default', gen_id: 'g', eid: 'g' }], { chatsDir: root });
+  assert.deepEqual(modelsOf(delta), ['default']);
+  assert.equal(delta.diagnostics.unresolvedAuto, 1);
 });

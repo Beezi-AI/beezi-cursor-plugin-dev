@@ -18,10 +18,10 @@ dumpHookPayload(stdin == null ? undefined : stdin.raw);
 
 // Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
-// This hook is the worst place the old stand-down could have fired, and under `cursor-agent` it
-// fired here every time: no bundled hook runs in the CLI at all (Cursor staff, forum 163890), so a
-// launcher that stood down because an IDE session had been recorded took the turn's token counts,
-// the turn boundary and the checkpoint with it.
+// This hook is the worst place the old stand-down could have fired, and under a `cursor-agent`
+// build that runs no bundled hook (Cursor staff, forum 163890; 2026.09.18 does run them) it fired
+// here every time, so a launcher that stood down because an IDE session had been recorded took the
+// turn's token counts, the turn boundary and the checkpoint with it.
 if (!claimHookRun()) process.exit(0);
 
 // Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.

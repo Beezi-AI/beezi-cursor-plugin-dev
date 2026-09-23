@@ -22,6 +22,11 @@ import { sessionLockPath, withLock } from './lock.mjs';
 import { deliverQueue } from './queue-delivery.mjs';
 import { postSessionError } from './session-error-report.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline-cursor.mjs';
+import {
+  drainTimelineOutbox, dropTimelineOutbox, readTimelineOutbox, takeAuthSnapshot, timelineSigOf,
+  timelineStatusOf, writeTimelineOutbox,
+} from './timeline-outbox.mjs';
+import { withCliSubagents } from './cli-subagents-cursor.mjs';
 import { cursorVersionAt } from './sidecar-events.mjs';
 import { planAttributionRuns } from './attribution-cursor.mjs';
 import { detectBillingSource } from './billing.mjs';
@@ -606,6 +611,9 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // is a `reports.push` that cannot throw. So the number was written where nobody looked and
   // looked for where it could never be written.
   let deltaFailed = false;
+  // The session whose timeline POST this run just made and lost (for any reason but a 401), handed
+  // to the flush so its outbox drain does not repeat that POST moments later. See the POST site.
+  let timelineOutboxSkip = null;
   const emptyResult = () => ({ enqueued: 0, flush: null, sessionErrors: collectedErrors, deltaFailed });
   // session_id here is Cursor's `conversation_id` — normalizeHookInput maps it. Nothing downstream
   // needs a transcript: the sidecar is keyed on this id and is the source of truth.
@@ -613,6 +621,29 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const now = deps.now == null ? Date.now : deps.now;
   const deadline = options.budgetMs ? now() + options.budgetMs : null;
   const timeLeft = () => (deadline === null ? null : deadline - now());
+  // The Cursor CLI chat-store reads (session name, Auto model, subagents) all run inside this hook's
+  // budget, so each one is handed the same deadline and stops opening stores once it has passed.
+  // An absolute epoch-ms instant, compared against the wall clock by lib/cli-chats-cursor.mjs.
+  const deadlineDeps = deadline === null ? {} : { deadline };
+  // `sqlite` and `chatsDir` are the chat-store reader's own seams (a test spy, a fixture root) and
+  // go ONLY to the subagent enrichment and the timeline, which read nothing but the CLI store. The
+  // name and delta readers also open the IDE's state.vscdb through a `sqlite` of the same name, so
+  // handing it to them would point a spy meant for one store at the other.
+  //
+  // `onEnrichment` collects whether every CLI subagent listing in THIS run ran to the end. The
+  // enrichment can run twice (the shared stream below, then inside computeSessionTimeline when the
+  // first found nobody), and one cut short by the deadline is enough to make the lanes suspect: it
+  // answers exactly like a session with fewer workers. Codex review (DO NOT SHIP): an exhausted
+  // checkpoint's zero-lane timeline overwrote a queued one-lane outbox entry, and a later drain
+  // delivered it. See the timeline POST site for what an incomplete run may and may not do.
+  let enrichmentComplete = true;
+  const cliDeps = {
+    ...deadlineDeps,
+    ...(deps.sqlite === undefined ? {} : { sqlite: deps.sqlite }),
+    ...(typeof deps.chatsDir === 'string' ? { chatsDir: deps.chatsDir } : {}),
+    onEnrichment: (info) => { if (info == null || info.complete !== true) enrichmentComplete = false; },
+  };
+  const resolveSessionNameImpl = deps.resolveSessionName == null ? resolveSessionName : deps.resolveSessionName;
   const getAccessToken = deps.getAccessToken == null ? _getAccessToken : deps.getAccessToken;
   const gitImpl = deps.gitImpl == null ? git : deps.gitImpl;
   const computeDelta = deps.computeDelta == null ? _computeDelta : deps.computeDelta;
@@ -629,9 +660,27 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // governed by the server's one-time-pull rules rather than by this file's cursor.
   const durable = !freshState && options.sink == null;
 
+  // The login this run acts for, read ONCE, here, alongside the token: the auth epoch first (the
+  // queue's fence order — a same-account refresh inside getAccessToken does not move the epoch, only
+  // a login or logout does, lib/token.mjs `authEpoch`), then the token, then the account key. The
+  // flush at the end of this run is handed THIS snapshot rather than taking its own: `token` is
+  // resolved here, a whole hook budget before the flush, and a snapshot of the epoch taken only at
+  // flush time would pair a login switch's NEW epoch and account with this OLD token — Codex's
+  // cross-tenant finding, with the whole checkpoint as the window. An epoch that cannot be read
+  // leaves the flush to take its own, exactly as before.
+  let loginEpoch = null;
+  let epochRead = false;
+  try {
+    loginEpoch = await (deps.auth == null ? _authEpoch({}) : deps.auth.authEpoch());
+    epochRead = true;
+  } catch { epochRead = false; }
   let token = null;
   try { token = await getAccessToken(); } catch { return emptyResult(); }
   if (!token) return emptyResult();
+  let loginAccount = null;
+  try { loginAccount = currentAccountKey(); } catch { loginAccount = null; }
+  const authSnapshot = epochRead ? { epoch: loginEpoch, token, account: loginAccount } : null;
+  const snapshotDeps = authSnapshot === null ? {} : { authSnapshot };
 
   // The tenant policy gate, deliberately ABOVE every line that reads a sidecar, computes a delta or
   // writes a queue file. Refusing to DELIVER is not enough on its own: without this, a tenant with
@@ -656,14 +705,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // is the same answer the gate gives everything else.
   if (!auditMode && !isLiveTrackingAllowed()) {
     const flush = await flushQueue(token, {
-      fetchImpl, now, ...(deadline === null ? {} : { deadline }),
+      fetchImpl, now, ...(deadline === null ? {} : { deadline }), ...snapshotDeps,
     });
     return { enqueued: 0, flush, sessionErrors: collectedErrors, deltaFailed: false };
   }
 
   // Both below the token gate: skip this work entirely on an unlinked machine.
   let resolvedSessionName = null;
-  try { resolvedSessionName = resolveSessionName(session_id); } catch { /* enrichment only */ }
+  try { resolvedSessionName = resolveSessionNameImpl(session_id, deadlineDeps); } catch { /* enrichment only */ }
 
   // The account this machine reports under right now (portal base + login email, from the local
   // tracking cache — currentAccountKey is called with no whoami because a hook must not touch the
@@ -849,7 +898,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // 7.5 s budget. That is "already collapsed", which is a different statement from the explicit
     // `null` that module accepts to mean "there is no collapse available" — that one withholds the
     // subagent list entirely rather than risk doubling it.
-    const dedupedEvents = sharedEvents ? dedupeEvents(sharedEvents.events).events : null;
+    //
+    // Cursor CLI sessions: the workers come from the CLI's chat store, not from hooks
+    // (lib/cli-subagents-cursor.mjs). Added to the collapsed stream so the subagent segments AND the
+    // timeline lanes both see them; a no-op on any stream that already has hook subagent lines.
+    // Never to the raw `sharedEvents`: the delta slices that by absolute line index.
+    const dedupedEvents = sharedEvents
+      ? withCliSubagents(session_id, dedupeEvents(sharedEvents.events).events, cliDeps)
+      : null;
 
     let delta;
     try {
@@ -892,6 +948,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         // DIFFERENT account. Seeding one tenant's import from another tenant's carry would
         // attribute imported work to a checkout the importing account never told us about.
         previousAttribution: (freshState || state.attribution == null) ? null : state.attribution,
+        // The hook budget, for the CLI chat-store reads that resolve an Auto (`default`) model.
+        ...deadlineDeps,
       });
     } catch {
       // Abandon the whole checkpoint, flush included — `null` is the sentinel for that, and it is
@@ -1560,29 +1618,74 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
             // full pass inside the same 7.5 s budget. NOT `dedupeEvents: null`, which that module
             // reads as "no collapse is available" and answers by withholding the subagent list
             // entirely; the two look alike and mean opposite things.
-            ? { readEvents: () => dedupedEvents, dedupeEvents: (events) => ({ events }), onSubagentDiagnostics }
-            : { onSubagentDiagnostics },
+            //
+            // `cliDeps` carries the deadline (and the store seams) to the CLI subagent enrichment the
+            // timeline runs; on the first branch the array is already enriched and that is a no-op.
+            ? { readEvents: () => dedupedEvents, dedupeEvents: (events) => ({ events }), onSubagentDiagnostics, ...cliDeps }
+            : { onSubagentDiagnostics, ...cliDeps },
           // GATED (CAPABILITIES.breakState). `false` is what that module already assumes when the
           // third argument is omitted, so this is a no-op today — the seam is wired now rather than
           // added later under time pressure.
           { allowBreakState: CAPABILITIES.breakState },
         );
         if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
-          const sig = `${JSON.stringify(timeline.periods)}|${JSON.stringify(timeline.subagents)}|${JSON.stringify(timeline.plan_events)}`;
-          // Skipped rather than started when the budget is already gone: the signature is only
-          // recorded on a confirmed send, so the next turn re-derives and retries this same payload.
-          if (sig !== state.sentTimelineSig && (timeLeft() === null || timeLeft() > 0)) {
-            const remaining = timeLeft();
-            const { reported } = await postSessionTimeline(
-              { sessionId: session_id, ...timeline },
-              token,
-              { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
-            );
-            // Only remember the signature on a confirmed send, so a failed post retries next turn.
-            if (reported) {
-              state.sentTimelineSig = sig;
-              timelineDirty = true;
+          const sig = timelineSigOf(timeline);
+          if (sig !== state.sentTimelineSig && !enrichmentComplete) {
+            // The deadline cut the CLI subagent listing short, so this timeline may be missing
+            // lanes it would otherwise have. It is NEVER POSTed: the server upserts by sessionId,
+            // so a lane-less body would erase lanes an earlier turn-end already delivered, whether
+            // or not an outbox entry exists. It never overwrites an existing entry either (the
+            // Codex reproduction: one lane became zero, and a later drain sent that). With no
+            // entry it is kept flagged `partial`, and the drain rebuilds it with a fresh deadline
+            // and sends only a complete rebuild — for a CLI session this sessionEnd may be the
+            // only turn-end there is. `sentTimelineSig` is untouched: nothing was sent.
+            // An incomplete listing means the deadline has passed, so this is the budget talking.
+            const queued = readTimelineOutbox(session_id);
+            if (queued === null) {
+              writeTimelineOutbox(session_id, { sig, body: { sessionId: session_id, ...timeline }, account: accountStamp, partial: true }, { now });
+            } else if (queued.partial !== true) {
+              // An entry queued by an EARLIER turn keeps its lanes, but it is now older than the
+              // session: this checkpoint saw later activity it could not finish enriching. Left as
+              // it was, the drain would send that stale body and delete it — the final stretch of
+              // the timeline lost (Codex re-review: delivered timeline ended 16 s before the
+              // session did). Marking it partial makes the drain rebuild from the sidecar first.
+              writeTimelineOutbox(session_id, { sig: queued.sig, body: queued.body, account: queued.account, partial: true }, { now });
             }
+            state.timelineLastStatus = 'no-budget';
+            timelineDirty = true;
+          } else if (sig !== state.sentTimelineSig) {
+            const body = { sessionId: session_id, ...timeline };
+            // The outbox entry goes to disk BEFORE the POST (lib/timeline-outbox.mjs, plan E11).
+            // "Retried at the next turn-end" is no retry at all for a Cursor CLI session, which gets
+            // one sessionEnd at most, so a failed or killed POST must leave the body where ANY later
+            // hook's flush can deliver it. Written even when the budget skips the POST below: a
+            // sessionEnd that ran out of time is exactly the CLI's one chance.
+            writeTimelineOutbox(session_id, { sig, body, account: accountStamp }, { now });
+            let status = 'no-budget';
+            // Skipped rather than started when the budget is already gone. The signature is only
+            // recorded on a confirmed send, so the entry above stays for the next flush.
+            if (timeLeft() === null || timeLeft() > 0) {
+              const remaining = timeLeft();
+              const outcome = await postSessionTimeline(
+                body,
+                token,
+                { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
+              );
+              status = timelineStatusOf(outcome);
+              if (outcome.reported) {
+                state.sentTimelineSig = sig;
+                dropTimelineOutbox(session_id);
+              }
+              // The flush below drains the outbox too. A 401 is the one failure it should retry
+              // straight away, because it can force a token refresh and this POST cannot; anything
+              // else would just repeat against the same unhappy server inside the same budget.
+              if (!outcome.reported && status !== 401) timelineOutboxSkip = session_id;
+            }
+            // Always recorded, the answer as well as the attempt: the status used to be discarded,
+            // which is why E11 ("attempted, never confirmed") took a simulation to diagnose. A local
+            // key only — nothing spreads session state onto a wire payload.
+            state.timelineLastStatus = status;
+            timelineDirty = true;
           }
         }
       } catch { /* best-effort */ }
@@ -1612,9 +1715,19 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 
   // The backfill owns its own batched delivery, so it must not drain the live queue per session —
   // that would add unrelated HTTP calls mid-import and muddy its summary.
+  //
+  // `auth` is forwarded only when a caller injected one (tests); otherwise flushQueue builds the real
+  // seam from lib/token.mjs exactly as before.
   const flush = skipFlush
     ? null
-    : await flushQueue(token, { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
+    : await flushQueue(token, {
+      fetchImpl,
+      now,
+      ...(deadline === null ? {} : { deadline }),
+      ...(deps.auth == null ? {} : { auth: deps.auth }),
+      ...(timelineOutboxSkip === null ? {} : { timelineOutboxSkip }),
+      ...snapshotDeps,
+    });
   return { enqueued: enqueuedCount, flush, sessionErrors: collectedErrors, deltaFailed };
 }
 
@@ -1651,6 +1764,10 @@ export async function extractAuditReports(input, deps = {}, options = {}) {
 // `quarantined` / `quarantineFailed`. `sent` is an ALIAS of `flushed`, not a replacement, so
 // nothing downstream had to change on the same commit.
 //
+// One key is added on top, `timelines`: the outbox drain's counts (sent / dropped / kept / foreign
+// / contended / skipped / deferred). Additive, and absent when the flush was gated, so every reader
+// of the fields above sees exactly what it saw before.
+//
 // `token` is already resolved by the caller, so `getToken` hands it straight back. `forceRefresh`
 // and `authEpoch` are the REAL seams from lib/token.mjs (CONTRACTS §2) — not the inert fallbacks
 // the extraction shipped with. That is what makes two of deliverQueue's guarantees live rather
@@ -1664,12 +1781,71 @@ export async function flushQueue(token, deps = {}) {
         authEpoch: () => _authEpoch({}),
       }
     : deps.auth;
-  return deliverQueue({
-    auth,
-    deadlineAt: deps.deadline == null ? null : deps.deadline,
+  const deadlineAt = deps.deadline == null ? null : deps.deadline;
+  // ONE snapshot of the login — epoch, token, account — taken before anything is sent, and used by
+  // BOTH stages. Codex review (DO NOT SHIP), the blocking finding: the report stage kept account
+  // A's token while the timeline drain took a FRESH epoch and account after it, so a login switch
+  // to B in between let B's queued timelines pass the account check and go out as `Bearer token-A`.
+  // The drain now fences against this snapshot and never re-reads it (lib/timeline-outbox.mjs).
+  // A snapshot that cannot be taken leaves the report stage exactly as before and skips the drain:
+  // a drain with no fence to hold is the leak this exists to close.
+  //
+  // `deps.authSnapshot` is runCheckpoint's, read where its token was resolved (see there): a caller
+  // whose token is older than this call must hand over the epoch and account read WITH it.
+  let snapshot = deps.authSnapshot == null ? null : deps.authSnapshot;
+  if (snapshot === null) {
+    try {
+      snapshot = await takeAuthSnapshot(auth, deps.currentAccountKey == null ? {} : { currentAccountKey: deps.currentAccountKey });
+    } catch { snapshot = null; }
+  }
+  // The report stage runs under the same snapshot. deliverQueue (lib/queue-delivery.mjs, not ours
+  // to change here) takes its fence from its FIRST `authEpoch()` call and its token from its one
+  // `getToken()` call, so pinning those two answers to the snapshot is what makes it one snapshot
+  // rather than two taken a few awaits apart. Every later `authEpoch()` is live: those are its
+  // fence CHECKS, and a pinned answer there would blind them. This depends on that call order; if
+  // deliverQueue ever reads the epoch before its fence, this pin moves with it.
+  let fencePinned = false;
+  const reportAuth = snapshot === null
+    ? auth
+    : {
+        getToken: async () => snapshot.token,
+        forceRefresh: (options) => auth.forceRefresh(options),
+        authEpoch: () => {
+          if (!fencePinned) { fencePinned = true; return snapshot.epoch; }
+          return auth.authEpoch();
+        },
+      };
+  const result = await deliverQueue({
+    auth: reportAuth,
+    deadlineAt,
     // The diagnostics sink. Lazy on purpose: lib/telemetry.mjs pulls child_process and http, and
     // this default must not put them on the import graph of a module a hook evaluates. A machine
     // that has not consented has nothing to load and the recorder stays silent.
     deps: deps.recordIssue == null ? { ...deps, recordIssue: lazyRecordIssue } : deps,
   });
+  // Then the session-timeline outbox (lib/timeline-outbox.mjs, plan E11): here because every hook
+  // and session start already calls this, and a Cursor CLI session gets no later turn-end of its own
+  // to retry at. AFTER the reports, which carry the billing, and behind the same gates: a tenant
+  // with tracking off has its timelines held exactly like its reports, and the deadline is the same
+  // absolute instant. `outboxDir`, not `dir` — `deps.dir` is the REPORT queue's directory.
+  if (!result.gated && !result.trackingDisabled && snapshot !== null) {
+    try {
+      result.timelines = await drainTimelineOutbox({
+        auth,
+        snapshot,
+        deadlineAt,
+        skipSessionId: deps.timelineOutboxSkip == null ? null : deps.timelineOutboxSkip,
+        // A partial entry is rebuilt by the drain; it must classify exactly as this module's own
+        // timeline does, and every caller of flushQueue (hooks, track, session start) gets that.
+        timelineOptions: { allowBreakState: CAPABILITIES.breakState },
+        deps: {
+          ...(deps.now == null ? {} : { now: deps.now }),
+          ...(deps.fetchImpl == null ? {} : { fetchImpl: deps.fetchImpl }),
+          ...(deps.outboxDir == null ? {} : { outboxDir: deps.outboxDir }),
+          ...(deps.currentAccountKey == null ? {} : { currentAccountKey: deps.currentAccountKey }),
+        },
+      });
+    } catch { /* best-effort: the drain never throws, and this flush's result must not either */ }
+  }
+  return result;
 }

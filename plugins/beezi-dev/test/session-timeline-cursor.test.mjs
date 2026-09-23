@@ -464,3 +464,94 @@ test('classification is timezone independent — the same instants classify the 
   assert.deepEqual(plus14, utc);
   assert.deepEqual(utc, ['working', 'break']);
 });
+
+// ─── Cursor CLI: subagents recovered from the chat store (A6) ───────────────
+//
+// The CLI fires no subagent hooks; lib/cli-subagents-cursor.mjs rebuilds the lines from the CLI's
+// own chat store. The timeline enriches too — not only the checkpoint — so backfill and sync, which
+// call this with the raw reader, draw the lanes as well. Epoch MILLISECONDS (timestampOf reads a
+// number below 1e12 as seconds).
+const T = 1790000000000;
+const cliKids = [
+  { agentId: 'k1', typeName: 'generalPurpose', toolCallId: 't1', startMs: T + 2000, endMs: T + 9000 },
+  { agentId: 'k2', typeName: 'generalPurpose', toolCallId: 't2', startMs: T + 2100, endMs: T + 6000 },
+];
+const cliStream = [
+  { ts: T, ev: 'gen', model: 'claude-opus-5', gen_id: 'g1' },
+  { ts: T + 1000, ev: 'tool', tool: 'Read', bytes: 10 },
+  { ts: T + 10000, ev: 'stop' },
+];
+
+test('a CLI session gets its subagent lanes from the chat store', () => {
+  const seen = [];
+  const tl = computeSessionTimeline('parent', {
+    readEvents: () => cliStream,
+    deadline: T + 123,
+    listCliSubagents: (id, deps) => { seen.push([id, deps.deadline]); return cliKids; },
+  });
+  assert.deepEqual(tl.subagents.map((s) => [s.agent_id, s.agent_type]), [['k1', 'generalPurpose'], ['k2', 'generalPurpose']]);
+  assert.equal(tl.subagents[0].ended_at, new Date(T + 9000).toISOString());
+  assert.equal(tl.subagents[1].ended_at, new Date(T + 6000).toISOString());
+  // The deps (and the checkpoint's deadline in them) reach the chat-store reader.
+  assert.deepEqual(seen, [['parent', T + 123]]);
+});
+
+test('an already-enriched stream (the checkpoint path) is not enriched twice', () => {
+  let calls = 0;
+  const enriched = [
+    ...cliStream,
+    { ts: T + 2000, ev: 'subagent_start', sid: 'k1', stype: 'generalPurpose' },
+    { ts: T + 9000, ev: 'subagent_stop', sid: 'k1', stype: 'generalPurpose', status: 'completed' },
+  ];
+  const tl = computeSessionTimeline('parent', {
+    readEvents: () => enriched,
+    dedupeEvents: (events) => ({ events }),
+    listCliSubagents: () => { calls += 1; return cliKids; },
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(tl.subagents.map((s) => s.agent_id), ['k1']);
+});
+
+test('with the collapse withheld the chat store is not read either', () => {
+  let calls = 0;
+  const tl = computeSessionTimeline('parent', {
+    readEvents: () => cliStream,
+    dedupeEvents: null,
+    listCliSubagents: () => { calls += 1; return cliKids; },
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(tl.subagents, []);
+});
+
+test('a chat-store reader that throws leaves the timeline as it was', () => {
+  const tl = computeSessionTimeline('parent', {
+    readEvents: () => cliStream,
+    listCliSubagents: () => { throw new Error('locked'); },
+  });
+  assert.deepEqual(tl.subagents, []);
+  assert.ok(tl.periods.length > 0);
+});
+
+// ─── session_start is a boundary: the gap after it is the user's ───────────
+//
+// The CLI (and an IDE composer) opens a session before anyone types. Without this, a user who thinks
+// for more than five minutes before the first prompt got an `idle` period, which the portal draws as
+// "Subagents working".
+const sessionStart = (ms) => ({ ts: T + ms, ev: 'session_start' });
+const toolAt = (ms) => ({ ts: T + ms, ev: 'tool', tool: 'Read', bytes: 10 });
+
+test('the gap after session_start is waiting_user', () => {
+  const tl = computeSessionTimeline('s', { readEvents: () => [sessionStart(0), toolAt(17000)] });
+  assert.deepEqual(tl.periods, [{
+    state: 'waiting_user',
+    started_at: new Date(T).toISOString(),
+    ended_at: new Date(T + 17000).toISOString(),
+  }]);
+});
+
+test('a long gap after session_start is waiting_user, never idle', () => {
+  const tl = computeSessionTimeline('s', { readEvents: () => [sessionStart(0), toolAt(400000)] });
+  assert.ok(400000 > IDLE_GAP_MS);
+  assert.deepEqual(tl.periods.map((p) => p.state), ['waiting_user']);
+  assert.equal(tl.started_at, new Date(T).toISOString());
+});

@@ -17,6 +17,7 @@ import {
   installHooks,
   launcherBody,
   launcherName,
+  stableNodePath,
   materializePlugin,
   mergeHooks,
   PLUGIN_ROOT,
@@ -137,8 +138,9 @@ test('buildHookEntries lists handlers directly under the event, with no matcher'
 test('the user scope declares the same timeout the bundled registry does', () => {
   // `timeout` is a real, documented, per-handler field measured in SECONDS. It used to be omitted
   // here on the belief that Cursor had no such field, so every hook installed into the user scope —
-  // the only registry `cursor-agent` reads — ran against Cursor's undocumented default while
-  // hooks/hooks.json declared 10s for the same script. lib/checkpoint.mjs budgets against the 10.
+  // the only registry older `cursor-agent` builds read — ran against Cursor's undocumented default
+  // while hooks/hooks.json declared 10s for the same script. lib/checkpoint.mjs budgets against the
+  // 10.
   const entries = buildHookEntries({ launcherDir: '/h', platform: 'linux' });
   assert.equal(Object.keys(entries).length, BEEZI_HOOKS.length);
   for (const [event, handlers] of Object.entries(entries)) {
@@ -166,9 +168,9 @@ test('a permission hook gets half the deadline an analytics hook does', () => {
 
 test('BOTH registries declare the same per-event deadline', () => {
   // The parity assertion. The bundled hooks/hooks.json is the registry the IDE discovers and the
-  // user-scope one is the only registry `cursor-agent` reads (Cursor staff, forum 163890) — the same
-  // script runs under both, so a deadline that lives in one of them is a script written to two
-  // different budgets. This is the test that fails if a timeout is changed in one place only.
+  // user-scope one is the only registry older `cursor-agent` builds read (Cursor staff, forum
+  // 163890; CLI 2026.09.18 runs both) — the same script runs under both, so a deadline that lives
+  // in one of them is a script written to two different budgets. This is the test that fails if a timeout is changed in one place only.
   const bundled = JSON.parse(
     fs.readFileSync(path.join(PLUGIN_ROOT, 'hooks', 'hooks.json'), 'utf-8'),
   );
@@ -722,4 +724,168 @@ test('the failure a permission hook leaves on stdout is nothing at all', () => {
   // test/plugin-manifest.test.mjs pin, so the deviation is deliberate and recorded in the handoff.
   // Pinned here because it is a one-character change with the user's blocked tool call downstream.
   assert.equal(PERMISSION_FAILURE_OUTPUT, '');
+});
+
+// ── launchers that survive a CLI update ───────────────────────────────────────────────────────────
+//
+// Under `cursor-agent` the installer runs on the CLI's own Node, which lives in
+// `%LOCALAPPDATA%\cursor-agent\versions\<version>\node.exe` — a folder the CLI replaces on update.
+// A launcher that names only that path points at nothing after the next update, and every hook then
+// fails at spawn. These launchers try the recorded Node first and fall back to PATH `node`.
+
+test('launcher falls back when the recorded node is gone (win32)', () => {
+  const body = launcherBody('C:\\p\\stop.mjs', {
+    nodePath: 'C:\\cli\\versions\\1\\node.exe', platform: 'win32', fallbacks: ['node'],
+  });
+  assert.equal(body, [
+    '@echo off',
+    'if not exist "C:\\cli\\versions\\1\\node.exe" goto beezi_fallback_1',
+    '"C:\\cli\\versions\\1\\node.exe" --no-warnings "C:\\p\\stop.mjs" %*',
+    // On its own line, so cmd expands %errorlevel% after node ran rather than when it parsed a block.
+    'exit /b %errorlevel%',
+    ':beezi_fallback_1',
+    'node --no-warnings "C:\\p\\stop.mjs" %*',
+    '',
+  ].join('\r\n'));
+});
+
+test('launcher falls back when the recorded node is gone (posix)', () => {
+  const body = launcherBody('/p/stop.mjs', { nodePath: '/cli/versions/1/node', platform: 'linux', fallbacks: ['node'] });
+  assert.equal(body, [
+    '#!/bin/sh',
+    'if [ -x "/cli/versions/1/node" ]; then exec "/cli/versions/1/node" --no-warnings "/p/stop.mjs" "$@"; fi',
+    'exec node --no-warnings "/p/stop.mjs" "$@"',
+    '',
+  ].join('\n'));
+});
+
+test('every fallback but the last is guarded, and a path-shaped one is quoted', () => {
+  // Only the last candidate may be a bare command name: `if exist node` tests the cwd, not PATH.
+  const win = launcherBody('C:\\p\\stop.mjs', {
+    nodePath: 'C:\\a\\node.exe', platform: 'win32', fallbacks: ['C:\\b c\\node.exe', 'node'],
+  });
+  assert.ok(win.includes('\r\n:beezi_fallback_1\r\nif not exist "C:\\b c\\node.exe" goto beezi_fallback_2\r\n'));
+  assert.ok(win.includes('\r\n"C:\\b c\\node.exe" --no-warnings "C:\\p\\stop.mjs" %*\r\nexit /b %errorlevel%\r\n'));
+  assert.ok(win.endsWith('\r\n:beezi_fallback_2\r\nnode --no-warnings "C:\\p\\stop.mjs" %*\r\n'));
+
+  const posix = launcherBody('/p/stop.mjs', { nodePath: '/a/node', platform: 'linux', fallbacks: ['/b c/node', 'node'] });
+  assert.ok(posix.includes('\nif [ -x "/b c/node" ]; then exec "/b c/node" --no-warnings "/p/stop.mjs" "$@"; fi\n'));
+  assert.ok(posix.endsWith('\nexec node --no-warnings "/p/stop.mjs" "$@"\n'));
+});
+
+test('no fallbacks keeps the launcher byte-identical to today', () => {
+  // Every install that is not running on the CLI's versioned Node must rewrite nothing on upgrade.
+  const win = launcherBody('C:\\p\\stop.mjs', { nodePath: 'C:\\n\\node.exe', platform: 'win32' });
+  assert.equal(win, ['@echo off', '"C:\\n\\node.exe" --no-warnings "C:\\p\\stop.mjs" %*', ''].join('\r\n'));
+  assert.equal(launcherBody('C:\\p\\stop.mjs', { nodePath: 'C:\\n\\node.exe', platform: 'win32', fallbacks: [] }), win);
+
+  const posix = launcherBody('/p/stop.mjs', { nodePath: '/n/node', platform: 'linux' });
+  assert.equal(posix, ['#!/bin/sh', 'exec "/n/node" --no-warnings "/p/stop.mjs" "$@"', ''].join('\n'));
+});
+
+test('a versioned cursor-agent node gets PATH node as fallback', () => {
+  const win = 'C:\\Users\\u\\AppData\\Local\\cursor-agent\\versions\\2026.09.18-9a7762b\\node.exe';
+  assert.deepEqual(stableNodePath(win, {}), { nodePath: win, fallbacks: ['node'] });
+  const posix = '/home/u/.local/share/cursor-agent/versions/2026.09.18-9a7762b/node';
+  assert.deepEqual(stableNodePath(posix, {}), { nodePath: posix, fallbacks: ['node'] });
+});
+
+test('an IDE or system node gets no fallbacks', () => {
+  assert.deepEqual(stableNodePath('C:\\Program Files\\nodejs\\node.exe', {}).fallbacks, []);
+  assert.deepEqual(stableNodePath('C:\\Users\\u\\AppData\\Local\\Programs\\cursor\\resources\\app\\resources\\helpers\\node.exe', {}).fallbacks, []);
+  assert.deepEqual(stableNodePath('/usr/bin/node', {}).fallbacks, []);
+});
+
+test('stableNodePath never throws on a missing or odd execPath', () => {
+  assert.deepEqual(stableNodePath(undefined), { nodePath: undefined, fallbacks: [] });
+  assert.deepEqual(stableNodePath(null, null), { nodePath: null, fallbacks: [] });
+});
+
+// A real file standing in for the CLI's bundled Node, so hooksStatus's existence check sees it.
+function fakeCliNode(root) {
+  const nodePath = path.join(root, 'cursor-agent', 'versions', '1', 'node');
+  fs.mkdirSync(path.dirname(nodePath), { recursive: true });
+  fs.writeFileSync(nodePath, '', 'utf-8');
+  return nodePath;
+}
+
+function scriptsFixture(root) {
+  const scriptsDir = path.join(root, 'plugin', 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  for (const { script } of BEEZI_HOOKS) fs.writeFileSync(path.join(scriptsDir, script), '', 'utf-8');
+  return scriptsDir;
+}
+
+test('an install on the CLI node writes fallback launchers and reads as installed', () => {
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'hooks.json');
+  const launcherDir = path.join(root, 'l');
+  const scriptsDir = scriptsFixture(root);
+  const nodePath = fakeCliNode(root);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath });
+  const body = fs.readFileSync(path.join(launcherDir, 'beezi-stop.sh'), 'utf-8');
+  assert.ok(body.includes(`if [ -x "${nodePath}" ]`), 'the recorded CLI node is tried first');
+  assert.ok(body.includes(`exec node --no-warnings "${path.join(scriptsDir, 'stop.mjs')}" "$@"`), 'PATH node is the fallback');
+  assert.equal(hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir }).state, 'installed');
+});
+
+test('a CLI update reads as stale, and the repair converges without a reinstall loop', () => {
+  // Stale on purpose even though the PATH fallback would still run: `stale` is what makes
+  // ensureInstalled point the launchers at the new CLI's Node, instead of leaning on a PATH `node`
+  // that a CLI-only machine may not have.
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'hooks.json');
+  const launcherDir = path.join(root, 'l');
+  const scriptsDir = scriptsFixture(root);
+  const nodePath = fakeCliNode(root);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath });
+  fs.rmSync(path.join(root, 'cursor-agent'), { recursive: true, force: true });
+  const stale = hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir });
+  assert.equal(stale.state, 'stale');
+  assert.equal(stale.staleLaunchers.length, BEEZI_HOOKS.length);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath: process.execPath });
+  assert.equal(hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir }).state, 'installed');
+  const registry = fs.readFileSync(hooksFile, 'utf-8');
+  const launcher = fs.readFileSync(path.join(launcherDir, 'beezi-stop.sh'), 'utf-8');
+  install({ scriptsDir, hooksFile, launcherDir, nodePath: process.execPath });
+  assert.equal(fs.readFileSync(hooksFile, 'utf-8'), registry, 'a second repair rewrote the registry');
+  assert.equal(fs.readFileSync(path.join(launcherDir, 'beezi-stop.sh'), 'utf-8'), launcher);
+  assert.equal(hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir }).state, 'installed');
+});
+
+test('an older launcher on the CLI node without a fallback is migrated once', () => {
+  // Launchers written before fallbacks existed name the versioned Node alone. They still work today
+  // and would break at the next CLI update, so they read as stale now, while the fix is still cheap.
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'hooks.json');
+  const launcherDir = path.join(root, 'l');
+  const scriptsDir = scriptsFixture(root);
+  const nodePath = fakeCliNode(root);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath });
+  for (const { script } of BEEZI_HOOKS) {
+    const launcher = path.join(launcherDir, launcherName(script, 'linux'));
+    fs.writeFileSync(launcher, launcherBody(path.join(scriptsDir, script), { nodePath, platform: 'linux' }), 'utf-8');
+  }
+  const old = hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir });
+  assert.equal(old.state, 'stale');
+  assert.equal(old.staleLaunchers.length, BEEZI_HOOKS.length);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath });
+  assert.equal(hooksStatus({ scriptsDir, platform: 'linux', hooksFile, launcherDir }).state, 'installed');
+});
+
+test('a Windows fallback launcher still names its script and its node for hooksStatus', () => {
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'hooks.json');
+  const launcherDir = path.join(root, 'l');
+  const scriptsDir = scriptsFixture(root);
+  const nodePath = fakeCliNode(root);
+
+  install({ scriptsDir, hooksFile, launcherDir, nodePath, platform: 'win32' });
+  assert.ok(fs.readFileSync(path.join(launcherDir, 'beezi-stop.cmd'), 'utf-8').includes('goto beezi_fallback_1'));
+  assert.equal(hooksStatus({ scriptsDir, platform: 'win32', hooksFile, launcherDir }).state, 'installed');
 });

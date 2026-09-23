@@ -107,8 +107,9 @@ Claude Code hooks disabled (thirdPartyExtensibilityEnabled off)
 
 The plugin loads, the skill appears, and the bundled `hooks/hooks.json` is read and thrown away. The
 user-scope registry below is not a workaround for a hypothetical — it is the path that carries
-analytics on any machine with that setting off, *and* on every `cursor-agent` session whatever the
-setting says. `install status` names the setting so the state is legible.
+analytics on any machine with that setting off, *and* on every session of a `cursor-agent` build
+that ignores plugin hooks (the builds of Jun–Aug 2026), whatever the setting says. `install status`
+names the setting so the state is legible.
 
 ### What a marketplace install cannot carry
 
@@ -117,16 +118,17 @@ the MCP server's startup and the `sessionStart` hook. Either alone knows where t
 both are started by Cursor from the installed directory, which is what a git-sha-named path requires
 — but the MCP server is a subsystem the user can disable on its own, and it is spawned by the IDE. A
 machine that leans on `cursor-agent` could therefore go indefinitely without ever writing
-`~/.cursor/hooks.json`, which is the only registry the CLI reads. Running it from the hook too means
+`~/.cursor/hooks.json`, which is the only registry older CLI builds read. Running it from the hook too means
 an ordinary IDE session — the thing that does happen on such a machine — installs and keeps repairing
 the registry the CLI depends on. It is cheap enough for a per-session path by construction: the shim
 is rewritten only when its content differs, and `hooksStatus` short-circuits the install once the
 state is `installed`, so a no-op run is a handful of stats.
 
 1. **The user-scope hook registry.** Launchers are written to `~/.beezi-cursor/hooks` and merged
-   into `~/.cursor/hooks.json`, and then **left there permanently** — it is the only registry the
-   `cursor-agent` CLI reads. It is not a fallback for the bundled one; the two cover different
-   hosts. See [Which registry runs](#which-registry-runs).
+   into `~/.cursor/hooks.json`, and then **left there permanently** — it is the only registry older
+   `cursor-agent` builds read (forum 163890, Jun–Aug 2026), and the only one that works on a machine
+   without Node on `PATH`. It is not a spare the installer may drop once the bundled one fires; the two
+   cover different hosts and CLI builds. See [Which registry runs](#which-registry-runs).
 2. **`~/.beezi-cursor/bin/beezi.mjs`** — a shim that forwards to whichever copy is installed, so a
    human has one stable path to type. Nothing the plugin ships depends on it any more: the install
    directory is named after a git sha, so a shim that has not been written yet used to mean every
@@ -191,10 +193,16 @@ than clobbered — merging onto `{}` would silently delete every hook, and every
 > The Cursor CLI does not run hooks that come from an installed plugin, marketplace or local, even
 > though it does load that plugin's rules and skills. Only `~/.cursor/hooks.json` and
 > `<project>/.cursor/hooks.json` fire under `cursor-agent`. — Cursor staff,
-> [forum 163890](https://forum.cursor.com/t/163890), still open as of Aug 2026.
+> [forum 163890](https://forum.cursor.com/t/163890), about the CLI builds of Jun–Aug 2026.
 
-So the bundled `hooks/hooks.json` covers the IDE (when third-party extensibility is on), the
-user-scope launchers cover the CLI, and on a machine that uses both, each host needs its own.
+CLI `2026.09.18` no longer behaves that way (observed on Windows, 2026-09-23): it runs the plugin's
+bundled hooks as well, so under it both registries fire — twice per event, three times when `agent`
+runs from the home directory — and the reader's `eid` dedupe below collapses them. See
+[The Cursor CLI](../../docs/host-boundaries.md#the-cursor-cli).
+
+So the bundled `hooks/hooks.json` covers the IDE (when third-party extensibility is on) and CLI
+2026.09.18, the user-scope launchers cover older CLI builds and any machine without Node on `PATH`,
+and on a machine that uses both hosts, each needs its own.
 
 This used to be arbitrated instead. A launcher run stood down and exited 0 whenever a bundled run
 had been recorded within the last 14 days, and the next session's self-install deleted the
@@ -238,9 +246,11 @@ with a separate entry per registry so one cannot overwrite the other's:
 - `install status`, `me` and the session banner read that record to report which registry has
   actually been seen doing the work.
 
-Nothing is gated on it. It is the difference between "nothing is installed" and "the CLI is the only
-host on this machine", which is the one signal that tells a CLI-only install apart from a broken
-one.
+Nothing is gated on it. On the CLI builds of Jun–Aug 2026, "no bundled hook seen" was how a
+CLI-only machine told itself apart from a broken install. CLI 2026.09.18 runs the bundled hooks too,
+so it no longer means that: on a current build it can also mean `node` is not on `PATH`, or no
+session has run with the plugin enabled yet. See
+[The Cursor CLI](../../docs/host-boundaries.md#the-cursor-cli).
 
 ### Signing in
 
@@ -306,17 +316,24 @@ ten fails silently on whichever one it dropped.
 | `afterFileEdit` | `file-edit.mjs` | `edit` lines only — the sole source of `code_changes` without `ai-code-tracking.db` | staff-confirmed |
 | `postToolUseFailure` | `stop-failure.mjs` | session-error report, free text redacted at the transport | unconfirmed |
 | `beforeMCPExecution` | `mcp-before.mjs` | **permission hook.** one non-countable `mcp_server` identity line | unconfirmed |
-| `subagentStart` | `subagent-start.mjs` | **permission hook.** opens a subagent span | unconfirmed |
-| `subagentStop` | `subagent-stop.mjs` | closes one — carries no `subagent_id`, so the pairing is a read-time heuristic | unconfirmed |
+| `subagentStart` | `subagent-start.mjs` | **permission hook.** opens a subagent span | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
+| `subagentStop` | `subagent-stop.mjs` | closes one — carries no `subagent_id`, so the pairing is a read-time heuristic | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
 
-The last column is about the EVENT, not about this plugin's registry: under `cursor-agent` a
-plugin's bundled hooks never run at all, so every row there is carried by the user-scope launchers.
+The last column is about the EVENT, not about this plugin's registry: under older `cursor-agent`
+builds (Jun–Aug 2026) a plugin's bundled hooks never run, so every row there is carried by the
+user-scope launchers; CLI 2026.09.18 runs both registries.
 "staff-confirmed" is the list Cursor staff have said the CLI fires — `sessionStart`, `sessionEnd`,
-`stop`, `postToolUse`, `beforeShellExecution`, `afterShellExecution`, `afterFileEdit`. The four
+`stop`, `postToolUse`, `beforeShellExecution`, `afterShellExecution`, `afterFileEdit`. The two
 marked unconfirmed are not known to be broken; nobody has said either way, and each one's reader has
 a fallback that costs exactly what the plugin had before the hook existed. For MCP that fallback is
-the `mcp_<server>_<tool>` prefix split in `lib/operations-cursor.mjs`; for subagents it is an empty
-`subagents[]`, which is a visible absence rather than a wrong number.
+the `mcp_<server>_<tool>` prefix split in `lib/operations-cursor.mjs`.
+
+The two subagent hooks do not fire under CLI 2026.09.18 (observed on Windows). Each CLI worker gets
+its own chat in the CLI's store, so the plugin rebuilds the same `subagent_start` / `subagent_stop`
+lines from `~/.cursor/chats` at read time (`lib/cli-chats-cursor.mjs`,
+`lib/cli-subagents-cursor.mjs`). That needs `node:sqlite`; without it a CLI session shows no
+subagents, a visible absence rather than a wrong number. See
+[The Cursor CLI](../../docs/host-boundaries.md#the-cursor-cli).
 
 `postToolUse` fires on every tool call, so `tool-event.mjs` is deliberately tiny. `afterFileEdit`
 fires several times a turn and its `old_string`/`new_string` can be megabytes, so it is held to the
@@ -362,8 +379,8 @@ The `--via` flag is what lets a script record which registry started it. It deci
 
 None of that matters on a machine with third-party extensibility off: the bundled registry is
 discarded before it is ever consulted, and the launcher registry is the only one that runs. That is
-one of the two hosts the launchers exist for; the other is `cursor-agent`, which ignores a plugin's
-bundled hooks whatever the setting says.
+one of the two hosts the launchers exist for; the other is a `cursor-agent` build before
+2026.09.18, which ignores a plugin's bundled hooks whatever the setting says.
 
 The user-scope registry uses a **launcher** instead — `~/.beezi-cursor/hooks/beezi-*.cmd|.sh`, one
 absolute path baked in per hook. A launcher is a single-token executable, so that registry's
@@ -832,8 +849,9 @@ are accepted and everything below is worth doing.
 ### The script
 
 Once through in the **IDE**, once through under **`cursor-agent`**, because they are different hosts
-with different registries and the whole point of the launchers is that the CLI does not run the
-bundled ones. In one session each:
+with different registries, and which of them fires under the CLI depends on its build: the Jun–Aug
+2026 builds run only the launchers, 2026.09.18 runs both. On Windows, launch `agent` from PowerShell or cmd, not
+Git Bash, which runs no hooks at all. In one session each:
 
 1. a plain question, no tools — a turn-end with no tool call at all;
 2. a read and a grep — `postToolUse` on two different built-in tools;
@@ -930,9 +948,9 @@ list at once.
 1. **Whether the bundled `hooks/hooks.json` fires in the IDE on a machine with third-party
    extensibility ON.** Discovery is confirmed — Cursor parses the registry and reports the plugin's
    hooks as a component — but every observation so far comes from a machine with the setting off,
-   where the parsed hooks are cleared before they can run. (For `cursor-agent` the question is
-   settled and the answer is no; see the table below.) *If it never fires anywhere:* nothing is
-   needed from the user and nothing changes. The user-scope registry is written at the first
+   where the parsed hooks are cleared before they can run. (For `cursor-agent` the answer depends
+   on the build: no on the Jun–Aug 2026 builds, yes on 2026.09.18, other builds unknown; see the
+   table below.) *If it never fires anywhere:* nothing is needed from the user and nothing changes. The user-scope registry is written at the first
    session and left in place regardless, so it carries every host either way; the recorded hook
    source is diagnostics only.
 2. **Whether Cursor's loader accepts all ten event names.** Six are known to be parsed. The four
@@ -947,12 +965,13 @@ list at once.
    / `model` each event actually carries is still read defensively rather than known. The registry
    schema is settled too: `version: 1`, handlers directly under the event, `command` / `timeout` /
    `matcher` / `failClosed` per handler.
-4. **Whether `postToolUseFailure`, `beforeMCPExecution`, `subagentStart` and `subagentStop` fire
-   under `cursor-agent`.** Staff have named seven CLI events and said nothing about these. *If they
-   do not:* MCP calls fall back to the prefix split forever on CLI-only machines, and `subagents[]`
-   stays empty there — both are the state the plugin was already in, and both are counted rather
-   than assumed (`mcpAliased` / `mcpInferred` in `computeOperations`, and the subagent diagnostics
-   in `correlateSubagents`).
+4. **Whether `postToolUseFailure` and `beforeMCPExecution` fire under `cursor-agent`.** Staff have
+   named seven CLI events and said nothing about these. *If they do not:* MCP calls fall back to
+   the prefix split forever on CLI-only machines, which is the state the plugin was already in, and
+   it is counted rather than assumed (`mcpAliased` / `mcpInferred` in `computeOperations`).
+   `subagentStart` and `subagentStop` are answered: they do not fire under CLI 2026.09.18, and the
+   workers are recovered from `~/.cursor/chats` instead; see
+   [The Cursor CLI](../../docs/host-boundaries.md#the-cursor-cli).
 5. **The string values `cursorAuth/stripeMembershipType` emits.** *If wrong:* the `--plan`
    self-report path is already built and is what the `beezi-login` skill uses.
 6. **`composerData.usageData` shape, and the semantics of `amount`** — the split between the
@@ -988,7 +1007,7 @@ On a machine that does run Cursor, and against the shipped bundle
 | hook environment | `CURSOR_PROJECT_DIR`, `CLAUDE_PROJECT_DIR`, `CURSOR_VERSION`, `CURSOR_PLUGIN_ROOT`, and `CURSOR_TRANSCRIPT_PATH` when a transcript exists |
 | hook handler fields | `command`, `type`, `timeout`, `matcher`, `failClosed`, `loop_limit` |
 | plugin hook source | always reported as `claude-plugin`, whatever the marketplace |
-| plugin hooks in the CLI | **never run.** `cursor-agent` loads a plugin's rules and skills but not its hooks, marketplace or local; only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` fire there (Cursor staff, [forum 163890](https://forum.cursor.com/t/163890), open) |
+| plugin hooks in the CLI | **depends on the build.** Builds of Jun–Aug 2026 load a plugin's rules and skills but not its hooks, marketplace or local; only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` fire there (Cursor staff, [forum 163890](https://forum.cursor.com/t/163890)). CLI 2026.09.18 runs them too, so both registries fire (observed on Windows; [host-boundaries](../../docs/host-boundaries.md#the-cursor-cli)) |
 | skill substitution | **none** — a skill body is inlined verbatim under its `Path:` line, so `${CURSOR_PLUGIN_ROOT}` reaches the model as a literal |
 | hook payload identity | `session_id`, which Cursor sets to `session_id ?? conversation_id` on every event but `workspaceOpen` |
 | `workspace_roots` | **URI paths** (`folders.map(f => f.uri.path)`), so a Windows workspace reads `/c:/Users/you/project` and cannot be used as a cwd |
@@ -1023,7 +1042,7 @@ them, so this table is a map rather than the only copy.
 | **`summary` and `modified_files` are documented and absent** | They are in the docs and not in real payloads. |
 | **`agent_transcript_path` is always null** | There is no sub-transcript on disk, ever. The hook events are the only evidence a subagent ran — which is why this plugin's `subagents[]` is derived from them and not, like the Claude Code plugin's, from transcripts. |
 | **`description` on `subagentStop` holds the PARENT's task title** | Not the subagent's. It is deliberately not recorded: a field named for the subagent that in fact describes its parent is worse than an absent field, because a later reader will believe it. |
-| **A plugin's bundled hooks never fire under `cursor-agent`** | [forum 163890](https://forum.cursor.com/t/163890), still open. The CLI loads a plugin's rules and skills but not its hooks, marketplace or local; only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` run there. This is why the user-scope launchers are installed permanently and why nothing arbitrates between the two registries — see [Which registry runs](#which-registry-runs). |
+| **A plugin's bundled hooks never fire under older `cursor-agent` builds** | [forum 163890](https://forum.cursor.com/t/163890), Jun–Aug 2026. Those builds load a plugin's rules and skills but not its hooks, marketplace or local; only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` run there. CLI 2026.09.18 runs the bundled hooks as well, so both registries fire and the `eid` dedupe collapses them (observed on Windows; [host-boundaries](../../docs/host-boundaries.md#the-cursor-cli)). This is why the user-scope launchers are installed permanently (they are the fallback for older builds and for machines without Node on `PATH`) and why nothing arbitrates between the two registries — see [Which registry runs](#which-registry-runs). |
 | **Hook return values are validated and then discarded** | [forum 155689](https://forum.cursor.com/t/155689), open since 2026-03-23: `additional_context` is accepted and never injected. So there is nothing to be gained by writing a hook response and a hook-shaped failure to be had by writing it wrong. |
 | **Windows delivers the payload through a BOM-carrying PowerShell pipeline** | See [above](#windows-delivers-the-payload-through-powershell-with-a-bom). `readHookInput` decodes the byte stream itself rather than handing raw bytes to `JSON.parse`. |
 | **`workspace_roots` holds URI paths, not filesystem paths** | `/c:/Users/you/project` on Windows, which is not a directory anything can run in. `toFilesystemPath` normalizes before any of it is used as a cwd. |

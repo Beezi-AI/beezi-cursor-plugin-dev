@@ -12,11 +12,14 @@ import { PLUGIN_ROOT, pluginHooksAlive, readHookSource } from './hook-source.mjs
 //
 //   1. The bundled `hooks/hooks.json` reaches only some of the hosts, and nothing readable says
 //      whether it reached this one: Cursor discards a plugin's hooks entirely when third-party
-//      extensibility is off, and says so only in an output channel — and `cursor-agent` never runs
-//      them at all, whatever the setting (Cursor staff, forum 163890). So the user-scope registry is
-//      installed and then LEFT installed, permanently, because it is the only registry the CLI
-//      reads. The two overlap on a machine that runs both, and the duplicate sidecar lines that
-//      produces are collapsed by the reader on the host's own event id — see lib/delta-cursor.mjs.
+//      extensibility is off, and says so only in an output channel — and older `cursor-agent`
+//      builds never ran them at all, whatever the setting (Cursor staff, forum 163890, Jun–Aug
+//      2026). So the user-scope registry is installed and then LEFT installed, permanently, because
+//      it is the only registry those CLI builds read, and the only one that works on a machine
+//      without Node on PATH. The two overlap on a machine that runs both, and under CLI 2026.09.18
+//      itself (observed on Windows; docs/host-boundaries.md, "The Cursor CLI"); the duplicate
+//      sidecar lines that produces are collapsed by the reader on the host's own event id — see
+//      lib/delta-cursor.mjs.
 //   2. `~/.beezi-cursor/bin/beezi.mjs`, a shim forwarding to whichever copy is installed, so a
 //      human has one stable path to type. Nothing the plugin ships depends on it — the skills name
 //      `${CURSOR_PLUGIN_ROOT}/scripts/…` directly, which Cursor expands for them, and which works
@@ -115,11 +118,11 @@ export function ensureInstalled({
     //
     // This used to remove it the moment a bundled hook was seen to fire, on the reasoning that two
     // registries mean two copies of every hook. They do — but they are not two copies of the same
-    // COVERAGE: `cursor-agent` does not run a plugin's bundled hooks at all, so the entries deleted
-    // here were the CLI's only ones. One IDE session was enough to trigger the removal, and every
-    // CLI session on that machine afterwards reported nothing, silently, with the plugin's own
-    // status output insisting the hooks were fine. The duplicate lines the overlap produces are
-    // collapsed at read time now, on the id the host stamps on the event itself.
+    // COVERAGE: older `cursor-agent` builds ran no plugin-bundled hook at all, so the
+    // entries deleted here were the CLI's only ones. One IDE session was enough to trigger the
+    // removal, and every CLI session on that machine afterwards reported nothing, silently, with the
+    // plugin's own status output insisting the hooks were fine. The duplicate lines the overlap
+    // produces are collapsed at read time now, on the id the host stamps on the event itself.
     const status = hooksStatus({ scope: HookScope.USER, scriptsDir: path.join(pluginRoot, 'scripts'), ...statusDeps });
     if (status.state !== 'installed') {
       installHooks({ scope: HookScope.USER, materialize: false, sourceRoot: pluginRoot, ...installDeps });

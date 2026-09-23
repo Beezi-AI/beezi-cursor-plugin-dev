@@ -223,3 +223,46 @@ test('an aliased tool that is not mcp_-prefixed is still an MCP call', () => {
   assert.equal(moved.file.count, 1);
   assert.equal(moved.mcp.count, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Cursor CLI tool names. The CLI names its builtins in PascalCase (observed on 2026.09.18: Read,
+// Write, Grep, Shell), so before this mapping every CLI tool call landed in `other`.
+
+test('Cursor CLI PascalCase tool names are categorised', () => {
+  assert.equal(categoryOf('Read'), 'file');
+  assert.equal(categoryOf('Write'), 'file');
+  assert.equal(categoryOf('StrReplace'), 'file');
+  assert.equal(categoryOf('Delete'), 'file');
+  assert.equal(categoryOf('LS'), 'file');
+  assert.equal(categoryOf('Grep'), 'search');
+  assert.equal(categoryOf('Glob'), 'search');
+  assert.equal(categoryOf('Shell'), 'shell');
+  assert.equal(categoryOf('WebSearch'), 'internet');
+  assert.equal(categoryOf('WebFetch'), 'internet');
+  assert.equal(categoryOf('mcp_x_y'), 'mcp');
+  assert.equal(categoryOf('CallDynamicTool'), 'other');
+});
+
+test('a CLI session is bucketed and counted as matched, not reported as unrecognized', () => {
+  // Shape of sidecar 323cf93b, where all 35 tool calls used to land in `other`.
+  const ops = computeOperations([tool('Read', 40), tool('Write'), tool('Grep', 8), tool('Shell', 400)]);
+  assert.equal(ops.file.count, 2);
+  assert.equal(ops.file.est_tokens, 10);
+  assert.equal(ops.search.count, 1);
+  assert.equal(ops.shell.count, 1);
+  assert.equal(ops.shell.est_tokens, 100);
+  assert.equal(ops.other.count, 0);
+  assert.equal(ops.diagnostics.matched, 4);
+  assert.deepEqual(ops.diagnostics.unrecognized, []);
+});
+
+test('CLI and IDE names are matched exactly, never by case folding', () => {
+  // The map is case-sensitive on purpose: an odd casing is an unobserved name and must surface in
+  // the diagnostics rather than be guessed into a bucket.
+  assert.equal(categoryOf('READ'), 'other');
+  assert.equal(categoryOf('shell'), 'other');
+  assert.equal(categoryOf('Read_file'), 'other');
+  // The IDE's lowercase names still resolve as before.
+  assert.equal(categoryOf('write'), 'file');
+  assert.equal(categoryOf('grep'), 'search');
+});

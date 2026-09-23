@@ -45,11 +45,12 @@ test('a bundled run records itself and always owns the run', () => {
 //
 // A launcher run used to exit 0 without doing anything whenever a bundled run had been recorded in
 // the last PROBE_TTL_MS, on the reasoning that the bundled registry was already covering the
-// machine. It is not: `cursor-agent` does not run hooks that come from an installed plugin at all,
-// only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` (Cursor staff, forum 163890). The
-// launchers ARE the CLI's only registry, so one IDE session was enough to switch the CLI's analytics
-// off for a fortnight — and lib/plugin-install.mjs then deleted the launchers outright, making it
-// permanent. Nothing about that was visible: the hooks reported as installed the whole time.
+// machine. It is not: older `cursor-agent` builds (Jun–Aug 2026) ran no hook that came from an
+// installed plugin, only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` (Cursor staff,
+// forum 163890). On those builds the launchers ARE the CLI's only registry, so one IDE session was
+// enough to switch the CLI's analytics off for a fortnight — and lib/plugin-install.mjs then deleted
+// the launchers outright, making it permanent. Nothing about that was visible: the hooks reported
+// as installed the whole time.
 
 test('a launcher run does the work even while the bundled registry is alive', () => {
   const file = probeFile();

@@ -17,9 +17,9 @@ dumpHookPayload(stdin == null ? undefined : stdin.raw);
 // Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // The stand-down this line used to perform assumed a live bundled registry made the launcher
-// redundant, and the Cursor CLI runs no plugin-bundled hook at all (Cursor staff, forum 163890) —
-// so on a machine that used both, the queue flush and prune below stopped running under
-// `cursor-agent` entirely, for as long as the IDE kept being used.
+// redundant, and the Cursor CLI then ran no plugin-bundled hook at all (Cursor staff, forum 163890;
+// 2026.09.18 does) — so on a machine that used both, the queue flush and prune below stopped
+// running under `cursor-agent` entirely, for as long as the IDE kept being used.
 if (!claimHookRun()) process.exit(0);
 
 // Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.
@@ -32,8 +32,14 @@ runHook({
   // any of those can throw while being evaluated. Dynamic, so that failure is a contained exit 0
   // rather than a failed hook in Cursor's execution log on every session the user opens.
   load: () => import('../lib/session-start.mjs'),
+  // `sessionStartLine` is the timeline's first sidecar anchor. Its `ts` is the runner's occurrence
+  // instant (an ISO string, so parsed back to the epoch ms every sidecar line carries), taken before
+  // runSessionStart spends seconds on the token and the network; its `cwd` is the stampable one
+  // every other hook stamps, so the two registries' copies collapse. See lib/session-start.mjs.
   handle: (mod, ctx) =>
-    mod.runSessionStart(ctx.input).then((msg) => {
+    mod.runSessionStart(ctx.input, {
+      sessionStartLine: { ts: Date.parse(ctx.occurredAt), cwd: ctx.cwd },
+    }).then((msg) => {
       // The banner is the only stdout this plugin emits, and it is best-effort: Cursor forum #155689
       // reports that a hook's return value is validated and then dropped, so nothing may depend on
       // it. Routed through ctx.emit so the runner owns the stream — see lib/hook-runner.mjs.

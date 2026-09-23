@@ -18,8 +18,8 @@ dumpHookPayload(stdin == null ? undefined : stdin.raw);
 // A stand-down here was unrecoverable rather than merely lossy: `sessionEnd` is the LAST checkpoint
 // a conversation gets, so a run that exited 0 because some IDE session had been recorded left that
 // conversation's final segment in the sidecar with nothing ever coming back for it. Under
-// `cursor-agent`, where no bundled hook runs at all (Cursor staff, forum 163890), that was every
-// session on the machine.
+// a `cursor-agent` build that runs no bundled hook at all (Cursor staff, forum 163890; 2026.09.18
+// does run them), that was every session on the machine.
 if (!claimHookRun()) process.exit(0);
 
 // Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.

@@ -136,15 +136,23 @@ function rmDir(dir) {
 
 // Run `fn(db)` against a read-only handle on `dbFile`. Returns fn's value, or null when the database
 // cannot be opened or fn throws. Never throws.
+//
+// `deps.noSnapshot === true` turns the temp-copy fallback off on BOTH branches (open failure and the
+// query-failure retry): the direct read-only open answers, or the result is null. The Cursor CLI's
+// store.db needs this, because its meta row and WAL carry `blobEncryptionKey`, and a snapshot is a
+// copy of that key on disk that a hook killed at its deadline never cleans up. A direct `?mode=ro`
+// open was verified to read a live CLI store's WAL-resident rows, so nothing is lost by refusing.
 export function withDatabase(dbFile, fn, deps = {}) {
   const sqlite = loadSqlite(deps);
   if (!sqlite || typeof dbFile !== 'string' || dbFile === '') return null;
   const exists = deps.exists == null ? ((p) => fs.existsSync(p)) : deps.exists;
   if (!exists(dbFile)) return null;
+  const allowSnapshot = deps.noSnapshot !== true;
 
   let handle = openDirect(sqlite, dbFile);
   let snapshotDir = null;
   if (!handle) {
+    if (!allowSnapshot) return null;
     const snap = openSnapshot(sqlite, dbFile, deps);
     if (!snap) return null;
     handle = snap.db;
@@ -155,8 +163,9 @@ export function withDatabase(dbFile, fn, deps = {}) {
     return fn(handle);
   } catch {
     // A query failure on a live database is usually the WAL: retry once against a snapshot before
-    // giving up, so a running Cursor does not silently cost us every enrichment read.
-    if (!snapshotDir) {
+    // giving up, so a running Cursor does not silently cost us every enrichment read. Not when the
+    // caller refused snapshots: the same copy would be made here.
+    if (!snapshotDir && allowSnapshot) {
       try {
         handle.close();
       } catch {

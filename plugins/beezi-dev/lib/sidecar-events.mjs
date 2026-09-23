@@ -10,13 +10,16 @@ import { payloadCursorVersion, sanitizeCursorVersion } from './hook-input-cursor
 // `pickString` and not `firstString`: `firstString` in hook-input-cursor.mjs is varargs and does
 // not trim, so reusing that name here would give one name two behaviours.
 import { pickString } from './pick-field.mjs';
+// Pure and import-free like pick-field.mjs, so the same hot-path argument holds for it.
+import { baseModelId } from './model-name-cursor.mjs';
 
 // Cursor hook payload → sidecar event lines.
 //
 // Kept out of both `sidecar.mjs` (the writer, which must not know about hook shapes) and
 // `scripts/tool-event.mjs` (a hot path that has to stay tiny and testable-by-proxy). It imports only
-// lib/hook-input-cursor.mjs and lib/pick-field.mjs — neither reaches the reporting engine — so the
-// postToolUse hook can import it without dragging `node:sqlite` onto the hot path.
+// lib/hook-input-cursor.mjs, lib/pick-field.mjs and lib/model-name-cursor.mjs — none reaches the
+// reporting engine — so the postToolUse hook can import it without dragging `node:sqlite` onto the
+// hot path.
 //
 // The event kinds are the vocabulary `delta-cursor` / `operations-cursor` / `code-changes-cursor`
 // read back:
@@ -110,11 +113,16 @@ const MODEL_VARIANT_FIELDS = ['model', 'model_name', 'modelName'];
 // machine through the bundled `hooks/hooks.json` AND through the launchers merged into
 // `~/.cursor/hooks.json`, and on a machine that has both, one tool call fires both and writes two
 // identical sidecar lines. That used to be arbitrated at write time — a launcher run stood down for
-// a fortnight after any bundled run — which blinded `cursor-agent` completely, because the CLI does
-// not run a plugin's bundled hooks at all and the launchers were the only registry it had (Cursor
-// staff, forum 163890). Stamping the id the payload already carries moves the decision to the
-// reader, where it is a fact about the event instead of a guess about which registry is alive; see
-// dedupeEvents in lib/delta-cursor.mjs.
+// a fortnight after any bundled run — which blinded `cursor-agent` completely, because the CLI
+// builds of the time (Jun–Aug 2026) ran no plugin-bundled hook at all and the launchers were the
+// only registry they had (Cursor staff, forum 163890). Stamping the id the payload already carries
+// moves the decision to the reader, where it is a fact about the event instead of a guess about
+// which registry is alive; see dedupeEvents in lib/delta-cursor.mjs.
+//
+// CLI 2026.09.18 runs both registries, so under `cursor-agent` every event now arrives twice, and
+// three times when the CLI runs in the home directory, where `~/.cursor/hooks.json` loads as both
+// the user and the project registry (forum 157184). This id is what the reader collapses them on;
+// copies that land on either side of a checkpoint boundary still escape it, a known gap.
 //
 // Snake_case first, camelCase after, the way every other reader in this plugin takes Cursor's
 // payloads (see hook-input-cursor.mjs) — the same field genuinely arrives under both spellings from
@@ -491,7 +499,10 @@ export function eventsFromHookPayload(payload, options = {}) {
   // client, on those two events, and recording it here is what makes the numbers real.
   const variant = pickString(payload, MODEL_VARIANT_FIELDS);
   const modelId = pickString(payload, MODEL_ID_FIELDS);
-  const model = modelId == null ? variant : modelId;
+  // `model_id` when the build sends it; otherwise the slug with its parameters stripped (see
+  // lib/model-name-cursor.mjs). The CLI sends only the slug, so without this every effort level
+  // became its own model downstream. The slug itself survives as `model_variant` just below.
+  const model = modelId == null ? baseModelId(variant) : modelId;
   if (model !== null) {
     const gen = { ev: 'gen', model };
     // Only when it actually differs: a build that sends one field, or sends both identically, must

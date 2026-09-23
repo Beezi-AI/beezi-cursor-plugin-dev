@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { eventsDir, pendingDir, queueDir, stateDir } from './paths-cursor.mjs';
+import { eventsDir, pendingDir, queueDir, stateDir, timelineOutboxDir } from './paths-cursor.mjs';
 import { captureDir } from './hook-dump.mjs';
 import { applyCaptureRetention } from './capture-retention.mjs';
 import { RETENTION_WINDOW_MS } from './retention-window.mjs';
@@ -18,8 +18,12 @@ import { RETENTION_WINDOW_MS } from './retention-window.mjs';
 // under the current credentials, or advancing this account's cursor over work reported to a
 // different one, are both worse than one orphaned file) — so nothing else on the machine ever
 // deletes it. It is a flat directory of immediate files, which is all this sweep can clean.
+// `timelines/` (the session-timeline outbox) joins for the same reason: the drain deliberately
+// leaves an entry recorded under a different account in place, and keeps one the server keeps
+// answering 5xx, so without this a timeline that can never land would sit on disk forever. The
+// drain never rewrites an entry, so its mtime is the age of the newest body for that session.
 export function pruneStale(now = Date.now(), maxAgeMs = RETENTION_WINDOW_MS) {
-  for (const dir of [stateDir(), queueDir(), eventsDir(), pendingDir()]) {
+  for (const dir of [stateDir(), queueDir(), eventsDir(), pendingDir(), timelineOutboxDir()]) {
     let files;
     try { files = fs.readdirSync(dir); } catch { continue; } // dir missing → skip
     for (const file of files) {

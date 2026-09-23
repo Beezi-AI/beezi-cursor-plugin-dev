@@ -109,7 +109,8 @@ test('every hook script claims the run before doing any work', () => {
   // `claimHookRun()` always returns true: both registries stay installed, both fire, and the
   // duplicate lines are collapsed by the READER on the host's own event id (dedupeEvents in
   // lib/delta-cursor.mjs). The stand-down this line used to perform is exactly what blinded
-  // `cursor-agent`, which runs no plugin-bundled hook at all — see lib/hook-source.mjs.
+  // the `cursor-agent` builds that run no plugin-bundled hook (Jun–Aug 2026) — see
+  // lib/hook-source.mjs.
   //
   // What the call still does is RECORD which registry started the run, per registry, in
   // ~/.beezi-cursor/state/hook-source.json. Nothing is gated on it; `install status`, `me` and the

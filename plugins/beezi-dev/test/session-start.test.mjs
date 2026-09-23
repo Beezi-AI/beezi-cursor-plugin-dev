@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { CHECKIN_TIMEOUT_MS, REVOKE_CHECK_TIMEOUT_MS, runSessionStart } from '../lib/session-start.mjs';
 import { ensureInstalled } from '../lib/plugin-install.mjs';
-import { safeName } from '../lib/sidecar.mjs';
+import { eventsFileFor, safeName } from '../lib/sidecar.mjs';
 import { POST_TIMEOUT_MS } from '../lib/http.mjs';
 import { withLoopAlive } from './helpers/loop-alive.mjs';
 
@@ -275,7 +275,8 @@ test('a session id that would escape the state directory is sanitized, not obeye
 test('session start installs the user-scope registry, and skips the work once it is there', async (t) => {
   // ensureInstalled used to run from scripts/mcp.mjs's startup and nowhere else. That is the IDE's
   // MCP server — a separately disableable subsystem — so `~/.cursor/hooks.json` could go unwritten
-  // indefinitely, and it is the ONLY registry `cursor-agent` reads (Cursor staff, forum 163890).
+  // indefinitely, and it is the ONLY registry older `cursor-agent` builds read (Cursor staff, forum
+  // 163890).
   const home = tmpHome(t);
   let calls = 0;
   let actions = null;
@@ -908,4 +909,81 @@ test('the marker is read from the file the check-in’s own scope names', async 
   assert.equal(seen[0].file, '/state/beezi-user.json');
   assert.deepEqual(seen[0].scope, { env: '', beeziAccount: 'beezi-user' });
   assert.equal(typeof seen[0].now, 'number', 'the due stamp is evaluated against the hook clock');
+});
+
+// ── The session_start sidecar line: the timeline's first anchor ──
+//
+// Without it a session's activity timeline starts at its first tool call, and everything the user
+// did before that — reading the prompt, thinking, typing — is simply missing (14–270 s on real CLI
+// sessions). The line is timing-only, so the properties pinned here are the timing ones: the stamp
+// is the one the hook was handed, the cwd is the stampable one, and nothing about it can fail a start.
+
+function sessionStartLines(id) {
+  const file = eventsFileFor(id);
+  if (file === null || !fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.ev === 'session_start');
+}
+
+test('a session_start line is written with the hook-start ts and the stampable cwd', async (t) => {
+  tmpHome(t);
+  // A stamp far from the hook clock, so a line stamped at WRITE time cannot pass by coincidence:
+  // the hook spends seconds before most of its work, and a late stamp would sort into the turn.
+  const ts = Date.UTC(2026, 8, 18, 14, 12, 27);
+  await runSessionStart(
+    { session_id: 'conv-start', cwd: '/not-the-stampable-one' },
+    linkedDeps({ sessionStartLine: { ts, cwd: '/repo' } }),
+  );
+  assert.deepEqual(sessionStartLines('conv-start'), [{ cwd: '/repo', ts, ev: 'session_start' }]);
+});
+
+test('an unlinked machine still records session_start, like every other sidecar line', async (t) => {
+  // The sidecar is local and reporting is gated elsewhere: the login-time backfill attributes a
+  // conversation recorded before the machine was linked, and it needs the same start anchor.
+  tmpHome(t);
+  const ts = Date.UTC(2026, 8, 18, 14, 12, 27);
+  const msg = await runSessionStart(
+    { session_id: 'conv-unlinked', cwd: '/repo' },
+    linkedDeps({ getAccessToken: async () => null, sessionStartLine: { ts, cwd: '/repo' } }),
+  );
+  assert.match(msg, /not linked/i);
+  assert.equal(sessionStartLines('conv-unlinked').length, 1);
+});
+
+test('without sessionStartLine nothing is written to the sidecar', async (t) => {
+  tmpHome(t);
+  await runSessionStart({ session_id: 'conv-none', cwd: '/repo' }, linkedDeps());
+  assert.deepEqual(sessionStartLines('conv-none'), []);
+});
+
+test('a start stamp that is not a finite number falls back to the append-time stamp', async (t) => {
+  // `{ ts: undefined }` spread over appendEvent's own stamp would erase it, and JSON.stringify
+  // would then drop the key: a line with no time at all, which the timeline cannot place.
+  tmpHome(t);
+  const before = Date.now();
+  await runSessionStart(
+    { session_id: 'conv-nan', cwd: '/repo' },
+    linkedDeps({ sessionStartLine: { ts: Number.NaN, cwd: '/repo' } }),
+  );
+  const lines = sessionStartLines('conv-nan');
+  assert.equal(lines.length, 1);
+  assert.equal(typeof lines[0].ts, 'number');
+  assert.ok(lines[0].ts >= before);
+});
+
+test('an append that throws never breaks a session start', async (t) => {
+  tmpHome(t);
+  let appended = 0;
+  const msg = await runSessionStart(
+    { session_id: 'conv-throw', cwd: '/repo' },
+    linkedDeps({
+      sessionStartLine: { ts: Date.now(), cwd: '/repo' },
+      appendEvent: () => { appended += 1; throw new Error('disk full'); },
+      gitImpl: gitWithoutOrigin,
+    }),
+  );
+  assert.equal(appended, 1, 'the seam was reached, so the throw really happened');
+  // The whole hook ran on past it, to the banner at its end.
+  assert.match(msg, /no "origin" remote/);
 });

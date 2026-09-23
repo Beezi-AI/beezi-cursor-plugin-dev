@@ -1252,3 +1252,115 @@ test('a 200-char SSO id is OMITTED, never truncated, while the rest of the repor
   // The rest of the report is unaffected: the whole point of omitting is that nothing else is lost.
   assert.ok(payload.models, 'the report itself must still be intact');
 });
+
+// ── R5: the hook deadline reaches every Cursor CLI chat-store read ─────────────────────────
+//
+// The CLI keeps its own per-chat store (`chats/<hash>/<chatId>/store.db`) and three readers open it
+// inside this hook's budget: the session name, Auto-model resolution in the delta, and the subagent
+// enrichment. Each must be handed the checkpoint's deadline, and past it open nothing. The subagent
+// read is driven against a real fixture store through a `sqlite` spy the checkpoint forwards; the
+// name and delta readers are seams here (another module owns them), so what is asserted for those is
+// that the deadline ARRIVES.
+
+const nodeSqlite = process.getBuiltinModule?.('node:sqlite') ?? null;
+const CLI_KID = '11111111-2222-4333-8444-555555555555';
+
+function writeCliStore(file, meta, blobs = []) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const db = new nodeSqlite.DatabaseSync(file);
+  db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)');
+  db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('0', Buffer.from(JSON.stringify(meta), 'utf8').toString('hex'));
+  const ins = db.prepare('INSERT INTO blobs (id, data) VALUES (?, ?)');
+  blobs.forEach((blob, i) => ins.run(`b${i}`, Buffer.from(JSON.stringify(blob), 'utf8')));
+  db.close();
+}
+
+// A parent chat `conv-1` whose store names one CLI subagent, and that subagent's own store pointing
+// back at it — the shape observed on CLI 2026.09.18 (plan evidence E6). A fresh root per test: the
+// adapter caches the chat-dir lookup per process, keyed by root.
+function cliChats(t, kidStartMs) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cli-chats-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  writeCliStore(path.join(root, 'h', 'conv-1', 'store.db'), { name: 'New Agent', createdAt: kidStartMs - 1000 }, [{
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'toolu_1', toolName: 'CallDynamicTool', result: `done\nAgent ID: ${CLI_KID}` }],
+  }]);
+  writeCliStore(path.join(root, 'h', CLI_KID, 'store.db'), {
+    name: 'New Agent',
+    createdAt: kidStartMs,
+    subagentInfo: { parentAgentId: 'conv-1', rootParentAgentId: 'conv-1', toolCallId: 'toolu_1', typeName: 'generalPurpose' },
+  });
+  return root;
+}
+
+// Counts every store the checkpoint opens through the forwarded `sqlite`, delegating to the real one.
+function sqliteSpy() {
+  const opened = [];
+  function DatabaseSync(file, opts) {
+    opened.push(String(file));
+    return opts === undefined ? new nodeSqlite.DatabaseSync(file) : new nodeSqlite.DatabaseSync(file, opts);
+  }
+  return { sqlite: { DatabaseSync }, opened };
+}
+
+function cliRun(t, spy, seen) {
+  const home = tmpHome(t);
+  const t0 = Date.now() - 60_000;
+  writeSidecar(home, [
+    { ts: t0, ev: 'gen', model: 'claude-opus-5', gen_id: 'g1' },
+    { ts: t0 + 1000, ev: 'tool', tool: 'Read', bytes: 10 },
+    { ts: t0 + 30_000, ev: 'stop' },
+  ]);
+  return deps({
+    sqlite: spy.sqlite,
+    chatsDir: cliChats(t, t0 + 2000),
+    resolveSessionName: (id, d) => { seen.name = d; return null; },
+    computeDelta: (id, from, resolvers) => { seen.delta = resolvers; return delta(); },
+  });
+}
+
+test('a live deadline lets the checkpoint recover a CLI subagent from the chat store', { skip: !nodeSqlite }, async (t) => {
+  // The CONTROL for the expired case below: without it, "zero opens" would also be what an
+  // unwired checkpoint produces.
+  const spy = sqliteSpy();
+  const seen = {};
+  const d = cliRun(t, spy, seen);
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, d, { emitTimeline: true, budgetMs: 60_000 });
+
+  assert.ok(spy.opened.length > 0, 'the forwarded sqlite must be the one the enrichment opened');
+  const subagent = queued().find((payload) => payload.is_subagent === true);
+  assert.ok(subagent, 'the CLI worker is billed as a subagent segment');
+  assert.equal(subagent.segmentId, `conv-1:${CLI_KID}`);
+  // The same absolute deadline reaches the name and delta readers.
+  assert.equal(typeof seen.name.deadline, 'number');
+  assert.equal(seen.delta.deadline, seen.name.deadline);
+  // The IDE-side readers never get the CLI store seams.
+  assert.equal('sqlite' in seen.name, false);
+  assert.equal('sqlite' in seen.delta, false);
+});
+
+test('an expired deadline through runCheckpoint opens no CLI store at all', { skip: !nodeSqlite }, async (t) => {
+  const spy = sqliteSpy();
+  const seen = {};
+  const d = cliRun(t, spy, seen);
+  // A negative budget is the simplest expired deadline: `now() + budgetMs` lands in the past on the
+  // same wall clock lib/cli-chats-cursor.mjs checks it against. (A faked `deps.now` would not: the
+  // chat-store reader keeps its own clock.)
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, d, { emitTimeline: true, budgetMs: -1 });
+
+  assert.deepEqual(spy.opened, []);
+  assert.equal(queued().some((payload) => payload.is_subagent === true), false);
+  assert.ok(seen.name.deadline <= Date.now(), 'the name reader was handed the expired deadline');
+  assert.equal(seen.delta.deadline, seen.name.deadline);
+  // The main segment is unaffected: a late budget costs the enrichment, never the report.
+  assert.ok(queued().some((payload) => payload.is_subagent !== true));
+});
+
+test('with no budget no deadline is invented for the CLI readers', { skip: !nodeSqlite }, async (t) => {
+  const spy = sqliteSpy();
+  const seen = {};
+  const d = cliRun(t, spy, seen);
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, d, { emitTimeline: true });
+  assert.equal('deadline' in seen.name, false);
+  assert.equal('deadline' in seen.delta, false);
+});

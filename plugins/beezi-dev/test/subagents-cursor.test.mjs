@@ -267,3 +267,73 @@ test('subagentIntervals hands the billing path half-open pairs and drops empty s
   assert.deepEqual(subagentIntervals([]), []);
   assert.deepEqual(subagentIntervals(undefined), []);
 });
+
+// ─── precedence 0: a stop that names its worker ─────────────────────────────
+//
+// Hook stops never carry `sid` (the host bug above); the CLI chat-store adapter
+// (lib/cli-subagents-cursor.mjs) writes both halves from one record, so its stops do.
+// Epoch MILLISECONDS: timestampOf reads any number below 1e12 as SECONDS.
+const T = 1790000000000;
+
+test('a stop carrying sid closes the start with that sid, not LIFO', () => {
+  const { subagents, diagnostics } = correlateSubagents([
+    { ts: T + 1, ev: 'subagent_start', sid: 'A', stype: 't' },
+    { ts: T + 2, ev: 'subagent_start', sid: 'B', stype: 't' },
+    { ts: T + 3, ev: 'subagent_stop', sid: 'A', stype: 't', status: 'completed' },
+    { ts: T + 9, ev: 'subagent_stop', sid: 'B', stype: 't', status: 'completed' },
+  ]);
+  assert.equal(diagnostics.ambiguous, 0);
+  assert.equal(diagnostics.matched, 2);
+  const a = subagents.find((s) => s.agent_id === 'A');
+  const b = subagents.find((s) => s.agent_id === 'B');
+  assert.equal(a.ended_ms - a.started_ms, 2);
+  assert.equal(b.ended_ms - b.started_ms, 7);
+});
+
+test('a sid match survives surrounding whitespace, the way open starts store it', () => {
+  const { subagents, diagnostics } = correlateSubagents([
+    { ts: T + 1, ev: 'subagent_start', sid: 'A' },
+    { ts: T + 2, ev: 'subagent_start', sid: 'B' },
+    { ts: T + 3, ev: 'subagent_stop', sid: ' A ' },
+    { ts: T + 9, ev: 'subagent_stop', sid: 'B' },
+  ]);
+  assert.equal(diagnostics.ambiguous, 0);
+  assert.equal(subagents.find((s) => s.agent_id === 'A').ended_ms, T + 3);
+});
+
+test('a stop whose sid matches no open start falls back to the existing rules', () => {
+  const { subagents, diagnostics } = correlateSubagents([
+    { ts: T + 1, ev: 'subagent_start', sid: 'A' },
+    { ts: T + 2, ev: 'subagent_start', sid: 'B' },
+    { ts: T + 3, ev: 'subagent_stop', sid: 'Z' },
+  ]);
+  // LIFO, flagged — exactly what a stop with no sid at all gets.
+  assert.equal(diagnostics.ambiguous, 1);
+  assert.equal(subagents.find((s) => s.agent_id === 'B').ended_ms, T + 3);
+});
+
+test('a sid shared by two open starts is not a match; the existing rules decide', () => {
+  const { subagents, diagnostics } = correlateSubagents([
+    { ts: T + 1, ev: 'subagent_start', sid: 'A', task: 'one' },
+    { ts: T + 2, ev: 'subagent_start', sid: 'A', task: 'two' },
+    { ts: T + 3, ev: 'subagent_stop', sid: 'A', task: 'one' },
+  ]);
+  // The task string (precedence 1) picks the first start, not LIFO.
+  assert.equal(diagnostics.ambiguous, 0);
+  const closed = subagents.filter((s) => !s.synthetic);
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].started_ms, T + 1);
+});
+
+test('hook stops, which never carry sid, pair exactly as before', () => {
+  const { subagents, diagnostics } = correlateSubagents([
+    { ts: T + 1, ev: 'subagent_start', sid: 'A' },
+    { ts: T + 2, ev: 'subagent_start', sid: 'B' },
+    { ts: T + 3, ev: 'subagent_stop' },
+    { ts: T + 9, ev: 'subagent_stop' },
+  ]);
+  assert.equal(diagnostics.ambiguous, 1);
+  // LIFO: the later start (B) takes the first stop.
+  assert.equal(subagents.find((s) => s.agent_id === 'B').ended_ms, T + 3);
+  assert.equal(subagents.find((s) => s.agent_id === 'A').ended_ms, T + 9);
+});

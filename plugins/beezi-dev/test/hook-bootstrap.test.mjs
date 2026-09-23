@@ -32,9 +32,11 @@ const KILL_MS = 20000;
 
 // One business module per script, and the export its handler actually calls.
 //
-// `lib/sidecar.mjs` is the common one by construction: nine of the ten append at least one line, and
-// it is reached only through `load`, never through the four bootstrap imports at the top of a hook
-// entry. `session-start.mjs` has no sidecar work of its own, so its own engine module stands in.
+// `lib/sidecar.mjs` is the common one by construction: all ten append at least one line, and it is
+// reached only through `load`, never through the four bootstrap imports at the top of a hook entry.
+// `session-start.mjs` is the exception anyway: its one `session_start` line is appended inside its
+// own try/catch, so a throwing appendEvent never reaches the runner, and its own engine module
+// stands in.
 const BROKEN = Object.freeze({
   'session-start.mjs': { module: 'session-start.mjs', symbol: 'runSessionStart' },
   'checkpoint.mjs': { module: 'sidecar.mjs', symbol: 'appendEvent' },

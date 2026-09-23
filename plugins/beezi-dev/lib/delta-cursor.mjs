@@ -8,6 +8,8 @@ import * as hostTiming from './timing.mjs';
 // copy; lib/subagents-cursor.mjs imports nothing, so reading it from there cannot make a cycle.
 import { timestampOf } from './subagents-cursor.mjs';
 import { pickString } from './pick-field.mjs';
+import { baseModelId, isPlaceholderModel } from './model-name-cursor.mjs';
+import { readCliChatMeta, readCliStoreFacts } from './cli-chats-cursor.mjs';
 
 // Turn the sidecar into one reportable segment and split its requests across the two money streams.
 //
@@ -194,6 +196,77 @@ const GEN_KEY_SEP = '\n';
 const genKey = (model, id) => `${model}${GEN_KEY_SEP}${id}`;
 const modelOfGenKey = (key) => key.slice(0, key.indexOf(GEN_KEY_SEP));
 
+// A generation's id, or null for a line that has none (an older sidecar, or an unstamped event).
+const genIdOf = (event) => (typeof event.gen_id === 'string' && event.gen_id !== '' ? event.gen_id : null);
+
+// A carried key with its model half reduced to the base id. State written by the previous release
+// holds the raw slug ("claude-opus-5-thinking-high\ng1"); normalizing on the way through keeps the
+// persisted list from growing a second spelling of the same identity. The format itself stays
+// `model\ngen_id`, so a downgraded plugin can still read what this one wrote. A key with no
+// separator names no generation and passes through untouched.
+function normalizeCarriedKey(key) {
+  const cut = key.indexOf(GEN_KEY_SEP);
+  if (cut < 0) return key;
+  const base = baseModelId(key.slice(0, cut));
+  return `${base === null ? key.slice(0, cut) : base}${key.slice(cut)}`;
+}
+
+// Only the CLI-reader deps the caller actually set: an absent key must stay absent, because
+// lib/cli-chats-cursor.mjs reads `sqlite: undefined` as "use the real one and cache" and anything
+// else as an injected reader.
+function cliReaderDeps(resolvers) {
+  const deps = {};
+  for (const name of ['deadline', 'chatsDir', 'sqlite']) {
+    if (resolvers[name] !== undefined) deps[name] = resolvers[name];
+  }
+  return deps;
+}
+
+// Cursor's Auto: a generation whose every line said `default` (plan evidence E3), with no concrete
+// line of the same generation in this window or an earlier one to fold it into. The IDE's usageData
+// names the routed model per price record, but a CLI chat has none; the CLI's own chat store names it
+// per reply. Plan Revision 3 (R3) steps 2-4, in order:
+//
+//   1. unanimous replies  every `modelName` in a COMPLETE scan has one base id. Complete matters: a
+//                          scan the caps or the deadline cut short may have skipped the one reply
+//                          that was routed elsewhere, so a partial agreement is not an answer.
+//   2. lastUsedModel       only when concrete, the scan is complete, and no reply named a model.
+//   3. nothing             null; the caller keeps `default` and counts it as `unresolvedAuto`.
+//
+// No per-turn mapping and no majority vote: the store carries no reply→generation link we have
+// verified, and a guessed model is worse than an honest `default`. Mixed routing within one session
+// is a recorded limitation (plan Follow-ups).
+//
+// KNOWN LIMITATION: the store puts `modelName` only on a reply's REASONING parts, so a reply that did
+// no reasoning is invisible here. "Unanimous" therefore means "every reply that reasoned", and an
+// empty `replyModels` can mean "no reply reasoned" rather than "no reply" — which is why step 2 also
+// requires `lastUsedModel` to be a concrete pick of the user's rather than the router's `default`.
+//
+// `resolvers.cliStoreFacts` / `resolvers.cliMeta` are the test seams: undefined reads the store from
+// disk, null means "no store". Never cli-config.json: that is the user's model NOW, not the one this
+// session ran on. The deadline is forwarded so a slow store cannot run the hook past its budget.
+function resolveAutoModel(conversationId, resolvers) {
+  const deps = cliReaderDeps(resolvers);
+  const facts = resolvers.cliStoreFacts !== undefined
+    ? resolvers.cliStoreFacts
+    : readCliStoreFacts(conversationId, deps);
+  if (facts == null || facts.complete !== true || !Array.isArray(facts.replyModels)) return null;
+  if (facts.replyModels.length > 0) {
+    let agreed = null;
+    for (const raw of facts.replyModels) {
+      const base = baseModelId(raw);
+      if (base === null || isPlaceholderModel(base)) return null;
+      if (agreed === null) agreed = base;
+      else if (agreed !== base) return null;
+    }
+    return agreed;
+  }
+  const meta = resolvers.cliMeta !== undefined ? resolvers.cliMeta : readCliChatMeta(conversationId, deps);
+  const last = meta == null ? null : meta.lastUsedModel;
+  if (typeof last !== 'string' || isPlaceholderModel(last)) return null;
+  return baseModelId(last);
+}
+
 // Keep the largest value seen for each count within one generation.
 //
 // The same generation can be described by several sidecar lines, and only the turn-end one carries
@@ -282,9 +355,9 @@ function activeIntervalsOf(timestamps) {
 // That used to be arbitrated at WRITE time — a launcher run stood down whenever a bundled run had
 // been recorded in the last fortnight, and the self-installer deleted the user-scope registry
 // outright once a bundled hook had been seen to fire. Both rested on the premise "the bundled
-// registry is alive, so the launcher is redundant", and the premise is false: `cursor-agent` does
-// not run hooks that come from an installed plugin at all, only `~/.cursor/hooks.json` and
-// `<project>/.cursor/hooks.json` (Cursor staff, forum 163890). A single IDE session was therefore
+// registry is alive, so the launcher is redundant", and the premise is false: older `cursor-agent`
+// builds (Jun–Aug 2026) ran no hook that came from an installed plugin, only `~/.cursor/hooks.json`
+// and `<project>/.cursor/hooks.json` (Cursor staff, forum 163890). A single IDE session was therefore
 // enough to delete the CLI's only registry, after which every CLI session on that machine reported
 // nothing — silently, and for as long as the IDE kept being used.
 //
@@ -421,14 +494,38 @@ function computePricing(requestsByModel, variantsByModel, usage, priorUsage) {
   }
 
   // Priced models with no observed `gen` event in this window - a dropped hook must not drop spend.
-  for (const model of Object.keys(usage)) {
-    if (requestsByModel.has(model) || pricedSeen.has(model)) continue;
-    const prior = sumUsage(priorUsage, matchUsageKeys(priorUsage, [model]));
-    const record = usage[model];
+  //
+  // Bucketed by base id (plan amendment A4). Cursor keys price records by slug, and a slug the window
+  // never named would otherwise report as a model of its own: a delayed "kimi-k3-max" record beside
+  // the "kimi-k3" row, or the routed slug of an Auto generation, whose rewritten line carries no slug
+  // to match on. A leftover whose base id this window billed joins that model's priced increment;
+  // the rest are summed into ONE row per base id. The baseline is still looked up by the raw key,
+  // because that is the spelling the snapshot stored it under.
+  const leftoverByModel = new Map();
+  for (const key of Object.keys(usage)) {
+    if (requestsByModel.has(key) || pricedSeen.has(key)) continue;
+    const prior = sumUsage(priorUsage, matchUsageKeys(priorUsage, [key]));
+    const record = usage[key];
     const amount = Math.max(0, num(record == null ? undefined : record.amount) - prior.amount);
     const cents = Math.max(0, num(record == null ? undefined : record.costInCents) - prior.costInCents);
-    if (amount > 0 || cents > 0) leftovers.push({ model, amount, cents });
+    if (amount <= 0 && cents <= 0) continue;
+    const base = baseModelId(key);
+    const model = base === null ? key : base;
+    const billed = perModel.get(model);
+    if (billed !== undefined) {
+      billed.amount += amount;
+      billed.cents += cents;
+      continue;
+    }
+    const pending = leftoverByModel.get(model);
+    if (pending === undefined) {
+      leftoverByModel.set(model, { model, amount, cents });
+    } else {
+      pending.amount += amount;
+      pending.cents += cents;
+    }
   }
+  for (const leftover of leftoverByModel.values()) leftovers.push(leftover);
   return { perModel, leftovers };
 }
 
@@ -932,11 +1029,66 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
   // per-variant price records Cursor wrote for a model that was run at more than one setting.
   const variantsByModel = new Map();
   const seenGenerations = new Set();
+  // The ids behind `seenGenerations`: whether a line is a repeat is a question about the generation,
+  // not about which model a line of it happened to name.
+  const seenGenIds = new Set();
   // Generations the CALLER says were already billed a request in an earlier window. Absent (null) is
   // the pre-existing behaviour: every window counts for itself.
-  const carriedGenerations = Array.isArray(resolvers.countedGenerations)
-    ? new Set(resolvers.countedGenerations)
-    : null;
+  //
+  // Decided on the generation id ALONE. The model half of a carried key is whatever an earlier window
+  // resolved, and a mid-turn pulse can see only a generation's `default` lines while the next window
+  // sees its turn-end line with the real slug: comparing whole keys billed that turn twice. A carried
+  // id that reappears under another model merges its tokens there with zero requests (poolRows gives
+  // them a zero-request row). Keys from the previous release hold the raw slug; only their id half is
+  // read here, so they are honoured as they are.
+  const carriedIds = Array.isArray(resolvers.countedGenerations) ? new Set() : null;
+  // id -> the concrete model an earlier window billed it under. What a placeholder line of a carried
+  // generation resolves to, ahead of a second look at the CLI store: the store may have grown past
+  // the scan caps, or gained a reply routed elsewhere, since the pulse that billed it — and one
+  // generation must resolve the same in every window.
+  const carriedModelOfId = new Map();
+  if (carriedIds !== null) {
+    for (const key of resolvers.countedGenerations) {
+      if (typeof key !== 'string') continue;
+      const cut = key.indexOf(GEN_KEY_SEP);
+      if (cut < 0) continue;
+      const id = key.slice(cut + 1);
+      carriedIds.add(id);
+      const carriedModel = baseModelId(key.slice(0, cut));
+      if (carriedModel !== null && carriedModel !== UNKNOWN_MODEL && !isPlaceholderModel(carriedModel)) {
+        carriedModelOfId.set(id, carriedModel);
+      }
+    }
+  }
+  // One generation, one model. The CLI stamps the same generation with `default` on some lines and a
+  // concrete slug on others (plan evidence E2/E3), and every spelling used to be its own request. A
+  // placeholder line is REWRITTEN to the concrete model another line of its generation named.
+  const concreteModelOfGen = new Map();
+  for (const event of window) {
+    if (event == null || typeof event.ev !== 'string' || !GEN_EVENTS.has(event.ev)) continue;
+    const id = genIdOf(event);
+    const raw = pickString(event, MODEL_FIELDS);
+    if (id === null || raw === null || concreteModelOfGen.has(id)) continue;
+    // Tested on the base id, as the main loop does, so the two passes agree on what a placeholder is.
+    const base = baseModelId(raw);
+    if (base !== null && !isPlaceholderModel(base)) concreteModelOfGen.set(id, base);
+  }
+  // The CLI store's answer for Auto, asked at most once per window and only when a placeholder
+  // survives everything above: the blob scan is the expensive part, and most windows never need it.
+  let autoModel;
+  const autoModelOnce = () => {
+    if (autoModel !== undefined) return autoModel;
+    try {
+      autoModel = resolveAutoModel(conversationId, resolvers);
+    } catch {
+      autoModel = null;
+    }
+    return autoModel;
+  };
+  // Generations left as `default` because nothing could name them. Diagnostics only: the portal
+  // still sees the `default` row, and the count says how often Auto went unresolved.
+  const unresolvedGenIds = new Set();
+  let unresolvedAnonymous = 0;
   // Identified generation keys this window saw, in order, to hand back for the next one. Anonymous
   // keys are deliberately NOT carried: `#0` means "the first generation in THIS window", and
   // carrying it would suppress an unrelated generation next time.
@@ -978,10 +1130,32 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
     else unrecognized.add('(missing ev)');
 
     if (typeof ev !== 'string' || !GEN_EVENTS.has(ev)) continue;
+    const genId = genIdOf(event);
     const pickedModel = pickString(event, MODEL_FIELDS);
-    const model = pickedModel == null ? UNKNOWN_MODEL : pickedModel;
-    const variant = pickString(event, VARIANT_FIELDS);
-    if (variant !== null && variant !== model) {
+    // The base id, applied again at read time so sidecars written before the writer did it (and IDE
+    // builds that send no model_id, E4) collapse the same way.
+    const pickedBase = pickedModel == null ? null : baseModelId(pickedModel);
+    let model = pickedBase === null ? UNKNOWN_MODEL : pickedBase;
+    if (isPlaceholderModel(model)) {
+      // R3 step 1, this window and then earlier ones; after that, the CLI store.
+      if (genId !== null && concreteModelOfGen.has(genId)) {
+        model = concreteModelOfGen.get(genId);
+      } else if (genId !== null && carriedModelOfId.has(genId)) {
+        model = carriedModelOfId.get(genId);
+      } else {
+        const auto = autoModelOnce();
+        if (auto !== null) model = auto;
+        else if (genId !== null) unresolvedGenIds.add(genId);
+        else unresolvedAnonymous += 1;
+      }
+    }
+    // Filled only AFTER resolution, and never with a placeholder (plan amendment A4): a `default`
+    // variant would pull a `default` price record into whatever model the line resolved to. The raw
+    // slug stands in for a missing `model_variant`, because usageData prices per slug and a
+    // slug-only line would otherwise leave its price record unmatched.
+    const pickedVariant = pickString(event, VARIANT_FIELDS);
+    const variant = pickedVariant !== null ? pickedVariant : pickedModel;
+    if (variant !== null && variant !== model && !isPlaceholderModel(baseModelId(variant))) {
       const known = variantsByModel.get(model);
       const variants = known == null ? new Set() : known;
       variants.add(variant);
@@ -994,21 +1168,26 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
     // the difference against `usageData.amount`. Collapse on the id; a line without one (an older
     // sidecar, or an event Cursor did not stamp) is still counted on its own, which is the
     // pre-existing behaviour.
-    const genId = typeof event.gen_id === 'string' && event.gen_id !== '' ? event.gen_id : null;
     // A line without an id is its own generation — that is the pre-existing behaviour, and the
     // counter runs in stream order so the keys are stable between this pass and any re-read.
     const key = genId === null ? genKey(model, `#${anonymousGen++}`) : genKey(model, genId);
     // A later line for the same generation may be the one carrying the token counts: `stop` has
-    // them, `postToolUse` does not. It is merged, but it is not a second request.
-    const repeat = genId !== null && seenGenerations.has(key);
+    // them, `postToolUse` does not. It is merged, but it is not a second request. Keyed on the id,
+    // like the carry below; the tokens still merge into the line's own (model, id) bucket.
+    //
+    // In print mode (`agent -p`) generation_id IS the conversation id (E7), so every turn of a
+    // headless session shares one id and bills as one request. That is a host limitation (no
+    // per-turn id), recorded in the plan rather than papered over with the model half of the key.
+    const repeat = genId !== null && seenGenIds.has(genId);
     if (genId !== null) {
+      seenGenIds.add(genId);
       if (!seenGenerations.has(key)) identifiedGenerations.push(key);
       seenGenerations.add(key);
     }
     // Already billed in an earlier window: merge whatever counts this line carries, count no second
     // request. The model can then end this window with tokens and zero requests, which `poolRows`
     // answers with a zero-request row rather than dropping the counts.
-    const alreadyBilled = genId !== null && carriedGenerations !== null && carriedGenerations.has(key);
+    const alreadyBilled = genId !== null && carriedIds !== null && carriedIds.has(genId);
     mergeTokens(tokensByGeneration, key, event);
     if (genTrace !== null) {
       genTrace.push({
@@ -1097,8 +1276,10 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
     const out = [];
     const seen = new Set();
     const prior = Array.isArray(resolvers.countedGenerations) ? resolvers.countedGenerations : [];
-    for (const key of prior.concat(identifiedGenerations)) {
-      if (typeof key !== 'string' || seen.has(key)) continue;
+    for (const raw of prior.concat(identifiedGenerations)) {
+      if (typeof raw !== 'string') continue;
+      const key = normalizeCarriedKey(raw);
+      if (seen.has(key)) continue;
       seen.add(key);
       out.push(key);
     }
@@ -1232,6 +1413,10 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
       // reports as zero activity, which is invisible in production unless it is said out loud.
       schemaMiss: window.length > 0 && recognized === 0,
       usageRead: usage !== null,
+      // Generations that stayed `default` because neither the sidecar nor the CLI store could name
+      // the model Auto routed them to (R3). Here and never on an entry: the report's schema has no
+      // such key, and an unknown key 400s the report.
+      unresolvedAuto: unresolvedGenIds.size + unresolvedAnonymous,
       operations: operations.diagnostics,
       code_changes: code_changes == null || code_changes.diagnostics == null
         ? null

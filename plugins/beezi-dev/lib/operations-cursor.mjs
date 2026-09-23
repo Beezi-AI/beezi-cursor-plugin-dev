@@ -59,6 +59,20 @@ const SHELL_TOOLS = new Set(['run_terminal_cmd', 'run_command']);
 // Interactive / bookkeeping builtins that are not work against the repo.
 const OTHER_BUILTINS = new Set(['todo_write', 'update_memory', 'create_diagram']);
 
+// The Cursor CLI names the same builtins in PascalCase (observed on 2026.09.18: Read, Write, Grep,
+// Shell; the rest are the CLI's documented tool names, unobserved). Mapped explicitly rather than by
+// lowercasing, so an IDE name and a CLI name can never collide into the wrong bucket by accident:
+// lowercasing would also silently change how the IDE's existing `write` is matched.
+// `CallDynamicTool` (the CLI's subagent `Task` wrapper) is deliberately absent. It is not work
+// against the repo, and no `postToolUse` fires for it anyway, so it stays in `other`.
+const CLI_TOOL_CATEGORY = new Map([
+  ['Read', 'file'], ['Write', 'file'], ['StrReplace', 'file'], ['Edit', 'file'],
+  ['MultiEdit', 'file'], ['Delete', 'file'], ['LS', 'file'], ['ReadLints', 'file'],
+  ['Grep', 'search'], ['Glob', 'search'], ['SemanticSearch', 'search'],
+  ['Shell', 'shell'],
+  ['WebSearch', 'internet'], ['WebFetch', 'internet'],
+]);
+
 // Cursor namespaces MCP server tools as `mcp_<server>_<tool>` — unlike Codex, which surfaces them
 // bare and therefore has to treat every unknown name as MCP. Here the prefix is the evidence, so an
 // unknown *unprefixed* name is genuinely unknown and belongs in `other`.
@@ -108,6 +122,9 @@ export function categoryOf(name) {
   if (INTERNET_TOOLS.has(name)) return 'internet';
   if (SHELL_TOOLS.has(name)) return 'shell';
   if (OTHER_BUILTINS.has(name)) return 'other';
+  // Checked after the IDE sets, whose names are all lowercase, so the two vocabularies cannot
+  // shadow each other; the order only matters if a future IDE build adopts a PascalCase name.
+  if (CLI_TOOL_CATEGORY.has(name)) return CLI_TOOL_CATEGORY.get(name);
   return 'other';
 }
 

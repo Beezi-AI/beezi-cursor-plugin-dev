@@ -11,14 +11,16 @@ import { eventsFromHookPayload } from '../lib/sidecar-events.mjs';
 // deleted the user-scope registry outright once a bundled hook had been seen to fire. Both rested on
 // "bundled registry alive ⇒ launcher redundant".
 //
-// That premise is false. `cursor-agent` does not run hooks that come from an installed plugin at
-// all — only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` fire under the CLI (Cursor
-// staff, forum 163890). So on any machine that used both the IDE and the CLI, one IDE session
-// deleted the CLI's only registry and every CLI session afterwards reported nothing at all,
+// That premise is false. Older `cursor-agent` builds (Jun–Aug 2026) ran no hook that came from an
+// installed plugin — only `~/.cursor/hooks.json` and `<project>/.cursor/hooks.json` fired under the
+// CLI (Cursor staff, forum 163890). So on any machine that used both the IDE and such a CLI, one IDE
+// session deleted the CLI's only registry and every CLI session afterwards reported nothing at all,
 // silently, while the plugin's own status output said the hooks were installed and working.
 //
 // Both registries now stay installed forever and the duplicate lines they write are collapsed here,
-// at read time, on the identity of the event itself.
+// at read time, on the identity of the event itself. CLI 2026.09.18 fires both as well — twice per
+// event, three times when run from the home directory — and the same collapse covers it (observed
+// on Windows; docs/host-boundaries.md, "The Cursor CLI").
 
 const CONV = 'conv-dedupe';
 const T0 = Date.parse('2026-01-01T00:00:00.000Z');

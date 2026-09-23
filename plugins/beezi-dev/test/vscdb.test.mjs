@@ -188,6 +188,68 @@ test('the database is opened read-only — a hook can never mutate Cursor state'
   assert.equal(wrote, false);
 });
 
+// ─── noSnapshot (CLI chat stores) ───────────────────────────────────────────
+//
+// The Cursor CLI's store.db carries `blobEncryptionKey` in its meta row, and its WAL holds the same
+// data. The snapshot fallback copies .db + -wal + -shm into a temp directory, and a hook killed at
+// its deadline leaves that copy behind. `noSnapshot: true` makes a failure a plain null instead.
+
+test('noSnapshot: an open failure returns null without calling the callback or copying', () => {
+  const copies = [];
+  let calls = 0;
+  const value = withDatabase('/some/store.db', () => { calls += 1; return 'x'; }, {
+    sqlite: { DatabaseSync: function DatabaseSync() { throw new Error('open'); } },
+    exists: () => true,
+    mkdtemp: (prefix) => { copies.push(prefix); throw new Error('no snapshot expected'); },
+    noSnapshot: true,
+  });
+  assert.equal(value, null);
+  assert.equal(calls, 0);
+  assert.deepEqual(copies, []);
+});
+
+test('noSnapshot: a file that is not a database returns null without copying', { skip: !sqlite }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-vscdb-'));
+  const file = path.join(dir, 'store.db');
+  // SQLite opens lazily, so garbage usually "opens" and fails at the first query; either branch
+  // must end in null with no temp copy.
+  fs.writeFileSync(file, 'this is not a sqlite database, only text padding it out. '.repeat(40));
+  const copies = [];
+  const value = withDatabase(file, (db) => db.prepare('SELECT count(*) AS n FROM blobs').get().n, {
+    mkdtemp: (prefix) => { copies.push(prefix); throw new Error('no snapshot expected'); },
+    noSnapshot: true,
+  });
+  assert.equal(value, null);
+  assert.deepEqual(copies, []);
+});
+
+test('noSnapshot: a query failure after a good open is not retried against a copy', { skip: !sqlite }, () => {
+  const file = makeDb({ [composerKey('conv-1')]: { name: 'A' } });
+  const copies = [];
+  let calls = 0;
+  const value = withDatabase(file, (db) => {
+    calls += 1;
+    // No `blobs` table in this database: the query throws after a successful open.
+    return db.prepare('SELECT count(*) AS n FROM blobs').get().n;
+  }, {
+    mkdtemp: (prefix) => { copies.push(prefix); throw new Error('no snapshot expected'); },
+    noSnapshot: true,
+  });
+  assert.equal(value, null);
+  assert.equal(calls, 1);
+  assert.deepEqual(copies, []);
+});
+
+test('without noSnapshot the IDE path still retries a failed query against a copy', { skip: !sqlite }, () => {
+  const file = makeDb({ [composerKey('conv-1')]: { name: 'A' } });
+  let copies = 0;
+  const value = withDatabase(file, () => { throw new Error('locked'); }, {
+    mkdtemp: (prefix) => { copies += 1; return fs.mkdtempSync(prefix); },
+  });
+  assert.equal(value, null);
+  assert.equal(copies, 1);
+});
+
 // ─── bounded key enumeration (08-C) ─────────────────────────────────────────
 //
 // `readKeys` decodes every matching VALUE, which for the bare `composerData:` prefix is the whole

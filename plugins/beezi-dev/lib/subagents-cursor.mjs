@@ -95,6 +95,13 @@ function lastActivityOf(events) {
 // Which still-open start does this stop belong to?
 //
 // PRECEDENCE, and the reasoning for the order:
+//   0. Exact `sid` match, when the stop carries one and exactly one open start has it. Hook stops
+//      NEVER carry a `sid` — that is the host bug this whole function exists for — so on an IDE
+//      stream this rule is unreachable and everything below behaves exactly as it always has. The
+//      Cursor CLI fires no subagent hooks at all; lib/cli-subagents-cursor.mjs rebuilds both halves
+//      of each worker from one chat-store record, so its stop knows its own id, and a CLI fan-out
+//      that finishes out of order must not be re-paired by LIFO. Zero or several matches fall
+//      through: an id we cannot pin to one start proves nothing.
 //   1. Exact `task` match. Primary because a parallel fan-out gets distinct tasks BY CONSTRUCTION —
 //      that is what makes a fan-out a fan-out — so on the case that actually breaks LIFO (several
 //      workers open at once, finishing out of order) the task string is exactly the discriminator
@@ -109,7 +116,13 @@ function lastActivityOf(events) {
 //   4. Nothing open — an orphan stop. Dropped and counted; see the note at the call site.
 //
 // Returns { index, ambiguous } or null.
-function matchOpenStart(open, stopTask) {
+function matchOpenStart(open, stopTask, stopSid) {
+  // Both sides trimmed the same way (see where starts are pushed), so a padded id still matches.
+  if (stopSid !== null) {
+    const bySid = [];
+    for (let i = 0; i < open.length; i++) if (open[i].sid === stopSid) bySid.push(i);
+    if (bySid.length === 1) return { index: bySid[0], ambiguous: false };
+  }
   if (stopTask !== null) {
     const candidates = [];
     for (let i = 0; i < open.length; i++) if (open[i].task === stopTask) candidates.push(i);
@@ -240,7 +253,8 @@ export function correlateSubagents(events, options = {}) {
       continue;
     }
 
-    const match = matchOpenStart(open, trimmedString(mark.event.task));
+    // The stop's `sid` is passed as-is: absent on every hook stop, present only on a CLI one.
+    const match = matchOpenStart(open, trimmedString(mark.event.task), trimmedString(mark.event.sid));
     if (match === null) {
       // An orphan stop: a completion with no start anywhere in front of it. Dropped rather than
       // turned into a span, because the only thing it could produce is a bar whose start is a guess

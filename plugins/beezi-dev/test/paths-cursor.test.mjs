@@ -20,6 +20,8 @@ import {
   sessionStateFile,
   stateDir,
   syncStateFile,
+  timelineOutboxDir,
+  timelineOutboxFile,
 } from '../lib/paths-cursor.mjs';
 
 // Swap an env var for one test and put it back, whether or not it was set.
@@ -42,6 +44,7 @@ const everyStore = () => [
   credentialsFile(),
   billingConfigFile(),
   hookLauncherDir(),
+  timelineOutboxDir(),
 ];
 
 test("the data root is this agent's own, not the shared ~/.beezi", (t) => {
@@ -216,5 +219,19 @@ test('sync-state.json sits at the home ROOT, outside every directory pruneStale 
   assert.equal(syncStateFile(), path.join(home, 'sync-state.json'));
   for (const swept of [stateDir(), queueDir(), eventsDir(), pendingDir()]) {
     assert.notEqual(path.dirname(syncStateFile()), swept, `sync progress must not live under ${swept}`);
+  }
+});
+
+// ─── the timeline outbox (Task 8, fix D) ─────────────────────────────────────────────────────────
+
+test('timelineOutboxFile — <home>/timelines/<name>.json, in its own swept directory', (t) => {
+  const home = path.join(os.tmpdir(), 'beezi-timeline-outbox-shape');
+  withEnv(t, 'BEEZI_CURSOR_HOME', home);
+  assert.equal(timelineOutboxDir(), path.join(home, 'timelines'));
+  assert.equal(timelineOutboxFile('conv-1'), path.join(home, 'timelines', 'conv-1.json'));
+  // Not under queue/: deliverQueue POSTs every `.json` there to the REPORT route, and a timeline
+  // body on that route is a 400 that deletes it. Not under state/ either: that is committed truth.
+  for (const other of [queueDir(), stateDir(), pendingDir(), eventsDir()]) {
+    assert.notEqual(timelineOutboxDir(), other);
   }
 });

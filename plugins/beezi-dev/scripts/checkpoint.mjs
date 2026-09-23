@@ -14,9 +14,9 @@ dumpHookPayload(stdin == null ? undefined : stdin.raw);
 // Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // What used to be here stood a launcher down whenever a bundled run had been recorded in the last
-// fortnight, which under `cursor-agent` meant always and wrongly: the CLI runs no plugin-bundled
-// hook at all (Cursor staff, forum 163890), so the branch-boundary checkpoint below simply stopped
-// happening there.
+// fortnight, which under `cursor-agent` meant always and wrongly: older CLI builds ran no
+// plugin-bundled hook at all (Cursor staff, forum 163890, Jun–Aug 2026), so the branch-boundary
+// checkpoint below simply stopped happening there.
 if (!claimHookRun()) process.exit(0);
 
 // Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.

@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { getAccessToken as _getAccessToken } from './token.mjs';
+import { authEpoch as _authEpoch, getAccessToken as _getAccessToken } from './token.mjs';
 import { flushQueue as _flushQueue, HOOK_BUDGET_MS } from './checkpoint.mjs';
 import { git as _git, resolveOriginRemote } from './git.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
@@ -15,7 +15,7 @@ import { stateDir } from './paths-cursor.mjs';
 import { readJson, setWriteFailureReporter as _setWriteFailureReporter, writeJsonSecure } from './fs-store.mjs';
 import { pruneStale } from './prune.mjs';
 import { sweepHeldQueue as _sweepHeldQueue } from './queue-maintenance.mjs';
-import { safeName } from './sidecar.mjs';
+import { appendEvent as _appendEvent, safeName, withCwd } from './sidecar.mjs';
 import { ensureInstalled as _ensureInstalled } from './plugin-install.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson, readJsonBounded, POST_TIMEOUT_MS } from './http.mjs';
@@ -42,6 +42,7 @@ import {
 } from './stop-account-change.mjs';
 import {
   TrackingMode,
+  currentAccountKey,
   isLiveTrackingAllowed as _isLiveTrackingAllowed,
   readTrackingState as _readTrackingState,
   recordWhoami as _recordWhoami,
@@ -313,11 +314,41 @@ export async function runSessionStart(input, deps = {}) {
   // The hook clock. Seamed so the budget arithmetic below is assertable without a test having to
   // spend seven real seconds proving that a nearly-spent budget skips the plan read.
   const now = deps.now == null ? Date.now : deps.now;
+  // The sidecar append, seamed so a test can prove a throwing one cannot take a session start down.
+  const appendEvent = deps.appendEvent == null ? _appendEvent : deps.appendEvent;
 
   // Anchored at entry, not at the flush. The budget is the HOOK's, not one call's: everything below
   // happens inside Cursor's hard 10s kill, and a deadline computed after the local work had already
   // run silently granted the flush a fresh 7.5s on top of whatever git and the prune had spent.
   const startedAt = now();
+
+  // The timeline's first anchor. Without it a session's activity timeline starts at its first tool
+  // call, and the time before that — 14–270 s on real CLI sessions — is simply missing.
+  //
+  // FIRST, ahead of the token check, for the reason every other hook appends unconditionally: the
+  // sidecar is local, reporting is gated elsewhere, and the login-time backfill attributes a
+  // conversation recorded on an unlinked machine from exactly these lines. Written here it also
+  // survives the forbidden/revoked early returns below.
+  //
+  // `ts` is the HOOK's start as the caller measured it, not the moment of this write: this function
+  // spends seconds on the token, the prune and the network, and a late stamp would sort into the
+  // middle of the turn and relabel real work as waiting. It is set only when it is a finite number —
+  // `{ ts: undefined }` spread over appendEvent's own stamp would erase it, and JSON.stringify would
+  // then drop the key, leaving a line with no time at all.
+  //
+  // `cwd` is the caller's STAMPABLE cwd, never `input.cwd`: both hook registries fire sessionStart,
+  // and the reader collapses their two copies only when every field but `ts` matches and the stamps
+  // sit inside its one-second window (dedupeEvents, lib/delta-cursor.mjs).
+  //
+  // Timing only, so nothing about it may fail a start.
+  const startLine = deps.sessionStartLine;
+  if (startLine != null) {
+    try {
+      const event = { ev: 'session_start' };
+      if (typeof startLine.ts === 'number' && Number.isFinite(startLine.ts)) event.ts = startLine.ts;
+      appendEvent(input.session_id, withCwd(event, startLine.cwd));
+    } catch { /* timing only — a missing anchor costs the timeline its head, never the session */ }
+  }
 
   // ONCE, early, and before anything writes. lib/fs-store.mjs is on the startup path of every hook
   // and cannot import the telemetry stack itself (child_process + http on every tool call), so the
@@ -329,8 +360,21 @@ export async function runSessionStart(input, deps = {}) {
     setWriteFailureReporter((error) => recordIssue('state_write_failed', { error }));
   } catch { /* diagnostics must never break a session start */ }
 
+  // The login epoch is read BEFORE the token, and handed to the flush with it, for the same reason
+  // runCheckpoint does (lib/checkpoint.mjs, the authSnapshot note): the flush runs seconds later,
+  // and a snapshot it took for itself would pair a login switch's new epoch and account with this
+  // old token — the timeline outbox would then send the new account's entries as `Bearer <old>`.
+  let loginEpoch = null;
+  let epochRead = false;
+  try {
+    loginEpoch = await (deps.authEpoch == null ? _authEpoch({}) : deps.authEpoch());
+    epochRead = true;
+  } catch { epochRead = false; }
   let token = null;
   try { token = await getAccessToken(); } catch { token = null; }
+  let loginAccount = null;
+  try { loginAccount = currentAccountKey(); } catch { loginAccount = null; }
+  const flushSnapshot = epochRead && token ? { authSnapshot: { epoch: loginEpoch, token, account: loginAccount } } : {};
   if (!token)
     return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Run the beezi-login skill.';
 
@@ -356,9 +400,12 @@ export async function runSessionStart(input, deps = {}) {
   // ensureInstalled used to run exclusively from scripts/mcp.mjs's startup. The MCP server is a
   // separate subsystem the user can disable on its own, and it is spawned by the IDE — so a machine
   // that leans on `cursor-agent` could go indefinitely without ever writing `~/.cursor/hooks.json`,
-  // which is the ONLY registry the CLI reads (Cursor staff, forum 163890: a plugin's bundled hooks
-  // never fire under cursor-agent). Running it here means an ordinary IDE session — the thing that
-  // does happen on such a machine — installs and keeps repairing the registry the CLI depends on.
+  // which was the ONLY registry the CLI read (Cursor staff, forum 163890: a plugin's bundled hooks
+  // did not fire under the cursor-agent builds of Jun–Aug 2026). Running it here means an ordinary
+  // IDE session — the thing that does happen on such a machine — installs and keeps repairing the
+  // registry the CLI depends on.
+  // CLI 2026.09.18 runs bundled hooks too, which lets its own session start do the same repair; the
+  // registry still matters there, for older CLI builds and for a machine with no `node` on PATH.
   //
   // Cheap by construction, which is why it can sit on a per-session path: the shim is rewritten only
   // when its content differs, and hooksStatus short-circuits the install once the state is
@@ -417,7 +464,7 @@ export async function runSessionStart(input, deps = {}) {
   // 10s hook kill too, and an unbounded flush of a backlog against a stalled API costs N × the
   // per-request timeout. Deferring is free: the files stay on disk for the next hook.
   const [, systemMessage] = await Promise.all([
-    flushQueue(token, { fetchImpl, deadline: startedAt + HOOK_BUDGET_MS }),
+    flushQueue(token, { fetchImpl, deadline: startedAt + HOOK_BUDGET_MS, ...flushSnapshot }),
     announceRepo(input.cwd, token, fetchImpl, gitImpl, { liveAllowed }),
   ]);
 

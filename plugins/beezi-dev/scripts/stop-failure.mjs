@@ -14,9 +14,10 @@ dumpHookPayload(stdin == null ? undefined : stdin.raw);
 // Records this run's registry for the status surfaces; always true. See lib/hook-source.mjs.
 //
 // The stand-down that used to live here exited a launcher run whenever a bundled run had been
-// recorded in the last fortnight. The Cursor CLI runs no plugin-bundled hook at all (Cursor staff,
-// forum 163890), so on a machine that used both hosts, every tool failure under `cursor-agent` went
-// unreported — the one hook whose entire job is telling the user something broke.
+// recorded in the last fortnight. Older CLI builds ran no plugin-bundled hook at all (Cursor staff,
+// forum 163890, Jun–Aug 2026), so on a machine that used both hosts, every tool failure under
+// `cursor-agent` went unreported — the one hook whose entire job is telling the user something
+// broke.
 if (!claimHookRun()) process.exit(0);
 
 // Attribute the user's repository, not the plugin clone Cursor starts in. See lib/hook-cwd.mjs.

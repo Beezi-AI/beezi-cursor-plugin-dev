@@ -57,9 +57,13 @@ export const RELOAD_STEP = 'restart Cursor — hooks are read when the app start
 // kind it is.
 //
 // Adding an event is also the one edit here that can cost the OTHER nine. An event Cursor does not
-// fire is harmless — the entry simply never runs, which is the expected state of the last three
-// under `cursor-agent`, where staff have confirmed only sessionStart, sessionEnd, stop, postToolUse,
-// beforeShellExecution, afterShellExecution and afterFileEdit. An event name Cursor does not
+// fire is harmless — the entry simply never runs, which is the expected state of several of these
+// under `cursor-agent`. Staff once listed only sessionStart, sessionEnd, stop, postToolUse,
+// beforeShellExecution, afterShellExecution and afterFileEdit for the CLI, and that list is not the
+// whole picture any more: on CLI 2026.09.18 the plugin's BUNDLED hooks fire too, beside these
+// launchers (each hook runs twice, once as `--via plugin-hooks`), while subagentStart and
+// subagentStop still never fire — CLI subagents are read from its chat store instead. Headless
+// `agent -p` fires only sessionStart, postToolUse and sessionEnd. An event name Cursor does not
 // RECOGNISE is a different matter: if its loader answers an unknown key by discarding the registry
 // rather than the entry, every hook in this list goes silent together. So the first thing to check
 // after changing this array is that Cursor's own hook listing still shows all of them.
@@ -100,8 +104,9 @@ const REGISTRY_VERSION = 1;
 //
 // This comment used to say Cursor's registry had no per-hook `timeout` field (unlike Codex's), and
 // that belief cost something real: `buildHookEntries` emitted no timeout at all, so every hook
-// installed into the USER scope — which is the only registry `cursor-agent` reads (Cursor staff,
-// forum 163890) — ran against Cursor's undocumented default instead of the 10s the budget assumes.
+// installed into the USER scope — which was then the only registry `cursor-agent` read (Cursor
+// staff, forum 163890; CLI 2026.09.18 runs the bundled registry as well) — ran against Cursor's
+// undocumented default instead of the 10s the budget assumes.
 // The bundled hooks/hooks.json had carried `timeout: 10` on every entry the whole time, so the two
 // registries silently disagreed about the deadline the same script was written to.
 //
@@ -239,13 +244,73 @@ function commandTarget(command) {
 // install failure) still gets through.
 export const NODE_FLAGS = Object.freeze(['--no-warnings']);
 
-export function launcherBody(scriptPath, { nodePath, platform = process.platform }) {
+// The Cursor CLI ships its own Node inside a VERSIONED folder —
+// `%LOCALAPPDATA%\cursor-agent\versions\<version>\node.exe` on Windows, the same shape elsewhere —
+// and replaces that folder on every CLI update. An installer that ran on it (the MCP server under
+// `cursor-agent` does) would bake a path into every launcher that the next update deletes, and every
+// hook would then fail at spawn with the registry still looking perfect. One pattern, shared by
+// stableNodePath and hooksStatus, so "needs a fallback" and "is missing its fallback" cannot drift.
+const VERSIONED_CLI_NODE = /[\\/]cursor-agent[\\/]versions[\\/]/i;
+
+function isVersionedCliNode(nodePath) {
+  return typeof nodePath === 'string' && VERSIONED_CLI_NODE.test(nodePath);
+}
+
+// The interpreter a launcher should record, plus what it should try when that one is gone.
+//
+// Only the CLI's versioned Node gets a fallback. The IDE's `helpers\node.exe` and a system Node do
+// not move under us on an update, and an empty list keeps their launchers byte-identical to what
+// every existing install already has on disk — so an upgrade of the plugin rewrites nothing there.
+// The fallback is PATH `node`, the same thing the bundled plugin hooks already run. `env` is part of
+// the interface for a future lookup (e.g. an explicit override) and is not read today.
+export function stableNodePath(execPath, env) {
+  return { nodePath: execPath, fallbacks: isVersionedCliNode(execPath) ? ['node'] : [] };
+}
+
+// A fallback is either a bare command name (`node`, resolved on PATH by the shell) or a path. Only
+// a path needs quotes, and leaving the bare name bare keeps it a PATH lookup on both shells.
+function fallbackCommand(fallback) {
+  return /[\\/\s]/.test(fallback) ? `"${fallback}"` : fallback;
+}
+
+// `fallbacks` are tried in order after `nodePath`. Every candidate but the last is guarded by an
+// existence test, so every one of them except the last must be a path: `if exist node` tests the
+// cwd, not PATH. The last runs unconditionally, and when it is missing too the shell reports that
+// itself — which is the most useful thing left to say in a hook's execution log.
+export function launcherBody(scriptPath, { nodePath, platform = process.platform, fallbacks = [] }) {
   const flags = NODE_FLAGS.join(' ');
+  const list = Array.isArray(fallbacks) ? fallbacks.filter((f) => typeof f === 'string' && f) : [];
   if (platform === 'win32') {
     // CRLF: cmd.exe mis-parses a batch file with bare LF line endings on some shells.
-    return ['@echo off', `"${nodePath}" ${flags} "${scriptPath}" %*`, ''].join('\r\n');
+    if (!list.length) return ['@echo off', `"${nodePath}" ${flags} "${scriptPath}" %*`, ''].join('\r\n');
+    // Line-level `goto`, not `if exist "x" ( "x" … & exit /b %errorlevel% )`. cmd expands `%…%`
+    // when it PARSES a parenthesised block, which is before node runs, so that one-liner would exit
+    // with whatever errorlevel was set before the hook started. On a line of its own the expansion
+    // happens after node returns, and the hook's real exit code reaches Cursor.
+    const lines = ['@echo off'];
+    const guarded = [`"${nodePath}"`].concat(list.slice(0, -1).map(fallbackCommand));
+    guarded.forEach((command, i) => {
+      if (i > 0) lines.push(`:beezi_fallback_${i}`);
+      lines.push(`if not exist ${command} goto beezi_fallback_${i + 1}`);
+      lines.push(`${command} ${flags} "${scriptPath}" %*`);
+      lines.push('exit /b %errorlevel%');
+    });
+    lines.push(`:beezi_fallback_${guarded.length}`);
+    lines.push(`${fallbackCommand(list[list.length - 1])} ${flags} "${scriptPath}" %*`);
+    lines.push('');
+    return lines.join('\r\n');
   }
-  return ['#!/bin/sh', `exec "${nodePath}" ${flags} "${scriptPath}" "$@"`, ''].join('\n');
+  if (!list.length) return ['#!/bin/sh', `exec "${nodePath}" ${flags} "${scriptPath}" "$@"`, ''].join('\n');
+  // `exec` replaces the shell, so the first candidate that exists is the only one that runs and its
+  // exit status is the launcher's.
+  const lines = ['#!/bin/sh'];
+  const guarded = [`"${nodePath}"`].concat(list.slice(0, -1).map(fallbackCommand));
+  for (const command of guarded) {
+    lines.push(`if [ -x ${command} ]; then exec ${command} ${flags} "${scriptPath}" "$@"; fi`);
+  }
+  lines.push(`exec ${fallbackCommand(list[list.length - 1])} ${flags} "${scriptPath}" "$@"`);
+  lines.push('');
+  return lines.join('\n');
 }
 
 // The `{ hooks: { <event>: [ { command, statusMessage, timeout } ] } }` fragment for Beezi's events.
@@ -455,10 +520,18 @@ export function installHooks({
 
   fs.mkdirSync(launcherDir, { recursive: true });
 
+  // Every install goes through stableNodePath, including one handed an explicit `nodePath`. That is
+  // what keeps hooksStatus's "a CLI-node launcher without a fallback is stale" check from looping: a
+  // launcher this function writes on the CLI's Node always carries the fallback that check wants.
+  const node = stableNodePath(nodePath, process.env);
+
   const launchers = [];
   for (const { script } of BEEZI_HOOKS) {
     const launcher = launcherPath(script, launcherDir, platform, variantMarker);
-    fs.writeFileSync(launcher, launcherBody(path.join(resolvedScriptsDir, script), { nodePath, platform }), 'utf-8');
+    const body = launcherBody(path.join(resolvedScriptsDir, script), {
+      nodePath: node.nodePath, platform, fallbacks: node.fallbacks,
+    });
+    fs.writeFileSync(launcher, body, 'utf-8');
     if (platform !== 'win32') {
       try { fs.chmodSync(launcher, 0o755); } catch { /* best effort */ }
     }
@@ -514,11 +587,34 @@ export function uninstallHooks({
   return { scope, hooksFile: resolvedHooksFile, removed };
 }
 
-// The interpreter path baked into a launcher, if it still resolves.
-function nodePathIn(body) {
+// The interpreter path baked into a launcher: the first quoted string in it. That holds for both
+// shapes launcherBody writes — the one-line launcher, and the fallback chain, whose first quoted
+// string is the recorded Node inside `if not exist "…"` / `if [ -x "…" ]`. Nothing quoted may ever
+// be added above that point, or this reads the wrong path.
+function recordedNodePath(body) {
   const match = /"([^"]+)"/.exec(body);
-  if (!match) return false;
-  try { return fs.existsSync(match[1]); } catch { return false; }
+  return match ? match[1] : null;
+}
+
+// Does the interpreter a launcher recorded still resolve?
+//
+// For a fallback launcher this is deliberately still the RECORDED Node, not "would anything run".
+// After a CLI update the PATH `node` fallback may well carry the hooks, but only if the machine has
+// one; reading as stale is what makes ensureInstalled rewrite the launcher onto the new CLI's Node,
+// and that rewrite converges because the new path exists at the moment it is written.
+function nodePathIn(body) {
+  const nodePath = recordedNodePath(body);
+  if (nodePath == null) return false;
+  try { return fs.existsSync(nodePath); } catch { return false; }
+}
+
+// A launcher written on the CLI's versioned Node before fallbacks existed. It works until the next
+// CLI update and then fails every hook, so it reads as stale now — one rewrite, while the Node it
+// names is still there. It cannot loop: installHooks routes every install through stableNodePath,
+// so what it writes on that Node always carries the guard this looks for.
+function lacksCliFallback(body) {
+  if (!isVersionedCliNode(recordedNodePath(body))) return false;
+  return body.indexOf('if not exist "') === -1 && body.indexOf('if [ -x "') === -1;
 }
 
 // Is the current install complete and pointing at scripts that still exist? A plugin upgrade moves
@@ -567,7 +663,10 @@ export function hooksStatus({
     // Both halves of the launcher have to still exist. A Node upgrade removes the interpreter
     // directory the launcher was written with, and every hook then fails at spawn while the
     // registry still looks perfect — reporting "installed" would send the user chasing Cursor.
-    if (!body.includes(path.join(resolvedScriptsDir, script)) || !nodePathIn(body)) staleLaunchers.push(launcher);
+    // A launcher on the CLI's versioned Node with no fallback is the same failure, one update early.
+    if (!body.includes(path.join(resolvedScriptsDir, script)) || !nodePathIn(body) || lacksCliFallback(body)) {
+      staleLaunchers.push(launcher);
+    }
   }
 
   const complete =
