@@ -113,7 +113,7 @@ test('check-in state is scoped by environment and Beezi account ONLY', (t) => {
   ];
   assert.equal(new Set(files).size, 3, 'environment and Beezi account each separate the state');
   // And the Cursor account does NOT separate it. With the Cursor account in the key, a machine
-  // that goes sub1 -> sub2 -> sub1 inside seven days lands back on sub1's own file, finds the
+  // that goes sub1 -> sub2 -> sub1 inside one heartbeat window lands back on sub1's own file, finds the
   // matching hash and SKIPS - the re-map to sub1 never happens. One file per (env, Beezi account)
   // makes the state mean "the last identity this machine sent".
   assert.equal(accountSyncStateFile(SCOPE_WITH_CURSOR), accountSyncStateFile(SCOPE));
@@ -123,12 +123,24 @@ test('check-in state is scoped by environment and Beezi account ONLY', (t) => {
 test('a changed payload is due immediately; an unchanged one waits out the heartbeat', (t) => {
   tempHome(t);
   const hash = hashCheckInPayload(PAYLOAD);
-  const state = { lastHash: hash, lastSuccessAt: NOW - DAY };
+  const HOUR = 60 * 60 * 1000;
+  const state = { lastHash: hash, lastSuccessAt: NOW - HOUR };
   assert.equal(isCheckInDue(state, hash, NOW), false);
   assert.equal(isCheckInDue(state, hashCheckInPayload({ ...PAYLOAD, subscriptionType: 'ultra' }), NOW), true);
-  assert.equal(isCheckInDue(state, hash, NOW - DAY + CHECKIN_HEARTBEAT_MS), true);
+  assert.equal(isCheckInDue(state, hash, NOW - HOUR + CHECKIN_HEARTBEAT_MS), true);
   assert.equal(isCheckInDue({ lastHash: null, lastSuccessAt: null }, hash, NOW), true);
-  assert.equal(CHECKIN_HEARTBEAT_MS, 7 * DAY);
+});
+
+// DAILY, not weekly. A server that lost this machine's `cli_agent_accounts` row cannot say so to a
+// client that never asks, and session reports only LINK an existing row — so every day of heartbeat
+// is a day of sessions mapped to no subscription. An old server with no `cliAgentAccountKnown` flag
+// heals within a day; a new one heals on the next session start (see lib/session-start.mjs).
+test('a matching hash older than 24 hours is due again', () => {
+  const hash = hashCheckInPayload(PAYLOAD);
+  assert.equal(CHECKIN_HEARTBEAT_MS, DAY);
+  assert.equal(isCheckInDue({ lastHash: hash, lastSuccessAt: NOW - DAY - 1 }, hash, NOW), true);
+  assert.equal(isCheckInDue({ lastHash: hash, lastSuccessAt: NOW - 2 * DAY }, hash, NOW), true);
+  assert.equal(isCheckInDue({ lastHash: hash, lastSuccessAt: NOW - DAY + 60 * 1000 }, hash, NOW), false);
 });
 
 test('state round-trips and a foreign scope reads as never checked in', (t) => {

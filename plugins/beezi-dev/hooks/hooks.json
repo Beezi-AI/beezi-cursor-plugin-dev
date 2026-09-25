@@ -60,6 +60,12 @@
         "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/subagent-stop.mjs\" --via plugin-hooks",
         "timeout": 10
       }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node --no-warnings \"${CURSOR_PLUGIN_ROOT}/scripts/prompt-submit.mjs\" --via plugin-hooks",
+        "timeout": 3
+      }
     ]
   }
 }

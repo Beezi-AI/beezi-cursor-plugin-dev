@@ -1364,3 +1364,83 @@ test('with no budget no deadline is invented for the CLI readers', { skip: !node
   assert.equal('deadline' in seen.name, false);
   assert.equal('deadline' in seen.delta, false);
 });
+
+// The MAIN segment bills only what earlier checkpoints of this conversation have not. Codex review,
+// MAJOR: a late duplicate line crossing a checkpoint boundary carries its original timestamp and
+// stretched the next main segment back over wall clock already reported. Pinned here with injected
+// deltas, so the arithmetic is seen on its own: the real-delta repro and the conservation half live in
+// test/data-conservation.test.mjs.
+function seedCovered(covered) {
+  fs.mkdirSync(stateDir(), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(), 'conv-1.json'), JSON.stringify({ cursor: 0, coveredIntervals: covered }));
+}
+
+test('the main segment bills its window minus covered wall clock; the envelope is untouched', async (t) => {
+  tmpHome(t);
+  const T = Date.parse('2026-07-31T10:00:00.000Z');
+  seedCovered([[T, T + 60_000]]);
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({
+    computeDelta: () => delta({ duration_ms: 92_000, activeIntervals: [[T, T + 92_000]] }),
+  }));
+  const [payload] = queued();
+  assert.equal(payload.duration_sec, 32, 'the 60 s an earlier checkpoint billed are not billed again');
+  assert.equal(payload.started_at, '2026-07-31T10:00:00.000Z');
+  assert.equal(payload.ended_at, '2026-07-31T10:01:32.000Z');
+  // Coverage still ends up holding everything this window worked.
+  assert.deepEqual(stateOf('conv-1').coveredIntervals, [[T, T + 92_000]]);
+});
+
+test('with no overlap the main segment bills delta.duration_ms exactly, whatever its intervals say', async (t) => {
+  // The overlap is taken OFF duration_ms rather than recomputed from intervals, so a delta whose
+  // scalar and intervals disagree (an injected double) bills its scalar as before.
+  tmpHome(t);
+  const T = Date.parse('2026-07-31T10:00:00.000Z');
+  seedCovered([[T - 600_000, T - 300_000]]);
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({
+    computeDelta: () => delta({ duration_ms: 92_000, activeIntervals: [[T, T + 5_000]] }),
+  }));
+  assert.equal(queued()[0].duration_sec, 92);
+});
+
+// ── the consumed-line carry (Codex review, MAJOR: a late duplicate across a checkpoint boundary) ──
+//
+// The identities of the identified lines a window consumed are handed to the next window, which drops
+// a line with the same identity as a proven copy (lib/delta-cursor.mjs, consumedEventKeys). The
+// carry names lines the CURSOR has moved past, so it is committed with the cursor and only with it:
+// a window that is re-read because its segment could not be queued must not find its own lines
+// already "consumed", or the re-read would drop every one of them as a duplicate.
+
+test('the consumed-line carry is committed with the cursor, handed back, and withheld from a replay', async (t) => {
+  tmpHome(t);
+  const seen = [];
+  const recording = (id, cursor, resolvers) => {
+    seen.push(resolvers.consumedEventKeys);
+    return delta({ consumedEventKeys: ['k1', 'k2'] });
+  };
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: recording }));
+  assert.equal(seen[0], null, 'a first window has nothing to carry');
+  assert.deepEqual(stateOf('conv-1').consumedEventKeys, ['k1', 'k2']);
+  assert.equal('consumedEventKeys' in queued()[0], false, 'a state key on the wire 400s the report');
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: recording }));
+  assert.deepEqual(seen[1], ['k1', 'k2'], 'the carry is read back');
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: recording }), {
+    mode: CheckpointMode.AUDIT,
+    sink: () => {},
+  });
+  assert.equal(seen[2], null, 'a fresh-state replay reads no live carry');
+});
+
+test('a window whose main segment could not be queued leaves the carry where the cursor is', async (t) => {
+  tmpHome(t);
+  seedCovered([]);
+  // An empty segmentId cannot be made into a queue filename, so the main segment is not staged and
+  // the cursor stays put for the window to be re-read.
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({
+    computeDelta: () => delta({ segmentId: '', consumedEventKeys: ['k1'] }),
+  }));
+  const state = stateOf('conv-1');
+  assert.equal(state.cursor, 0, 'the control: the window was not reported');
+  assert.equal('consumedEventKeys' in state, false, 'a carry for lines the cursor never passed');
+});

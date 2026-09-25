@@ -20,7 +20,7 @@
 // and every module that can fail during evaluation — the reporting engine, the sidecar, the token
 // store, the transport — arrives through the `load` callback, after the handlers exist.
 
-// Cursor's per-handler `timeout`, in MILLISECONDS, for the two kinds of hook this plugin registers.
+// Cursor's per-handler `timeout`, in MILLISECONDS, for the three kinds of hook this plugin registers.
 // Both registries (the bundled hooks/hooks.json and the user-scope one lib/hooks-install.mjs writes)
 // derive their declared seconds from this table, so the two cannot drift apart.
 //
@@ -31,7 +31,28 @@
 // when they are slow, so they keep the 10s the checkpoint budget is derived from. Five seconds is
 // still far more than the permission path's actual work (one sidecar append) can take; it is a
 // ceiling for a wedged filesystem, not a target.
-export const HOOK_TIMEOUTS = Object.freeze({ analytics: 10000, permission: 5000 });
+//
+// Why the GATE kind is smaller still. `beforeSubmitPrompt` is synchronous and sits between the
+// user's Send and the model: Cursor waits for its answer before the prompt goes anywhere, on EVERY
+// turn. The analytics ten seconds there would be a Send button that can freeze for ten seconds, and
+// even the permission five is a long time to stare at a prompt that has not left. Its work is one
+// sidecar append, and its script answers `{"continue":true}` before doing any of it (see
+// scripts/prompt-submit.mjs), so three seconds is again only a ceiling for a wedged filesystem.
+// It is NOT a permission hook: that kind's stdout is empty by contract and tested to be, while this
+// one's must carry exactly one token.
+export const HOOK_TIMEOUTS = Object.freeze({ analytics: 10000, permission: 5000, gate: 3000 });
+
+// The `kind` spelling of a gate hook, for hookBudgetMs. A hook entry says `gate: true` the way a
+// permission one says `permission: true`; this constant is what that boolean maps to.
+export const HOOK_KIND_GATE = 'gate';
+
+// Which of the three kinds an entry's options describe. `gate` wins over `permission` only because
+// no entry is both; the two are separate flags so an entry cannot become one by naming the other.
+function hookKindOf(opts) {
+  if (opts != null && opts.gate === true) return HOOK_KIND_GATE;
+  if (opts != null && opts.permission === true) return 'permission';
+  return 'analytics';
+}
 
 // What a hook leaves between finishing its work and the host's kill. It covers node's own startup,
 // which is paid before any code here runs, plus the process teardown after it.
@@ -96,8 +117,14 @@ export function hookOccurredAt(input, nowMs) {
 }
 
 // How long a hook of this kind may spend before it has to be finished.
-export function hookBudgetMs(permission) {
-  const ceiling = permission === true ? HOOK_TIMEOUTS.permission : HOOK_TIMEOUTS.analytics;
+//
+// `true` is the permission kind and `false` the analytics one, as they always were; the gate kind is
+// asked for by name (HOOK_KIND_GATE). A gate budget is 500 ms — node's startup is inside the margin,
+// and the one append this kind does takes a millisecond on a healthy disk.
+export function hookBudgetMs(kind) {
+  let ceiling = HOOK_TIMEOUTS.analytics;
+  if (kind === true || kind === 'permission') ceiling = HOOK_TIMEOUTS.permission;
+  else if (kind === HOOK_KIND_GATE) ceiling = HOOK_TIMEOUTS.gate;
   return ceiling - HOOK_GUARD_MARGIN_MS;
 }
 
@@ -156,7 +183,9 @@ function safeRecord(deps, code, name) {
 // code is logged as a failed hook; for an analytics hook, non-zero is the failed-hook entry this
 // module exists to remove. Zero with nothing on stdout is "I ran, I have no opinion".
 function createBail(opts, deps) {
-  const permission = opts.permission === true;
+  // A gate entry is never treated as a permission one here, even if both flags were set: its script
+  // has already written the one token Cursor may see, and a failOutput behind it is two tokens.
+  const permission = opts.permission === true && opts.gate !== true;
   const exit = deps.exit == null ? ((c) => process.exit(c)) : deps.exit;
   let bailed = false;
   return function bail(code) {
@@ -167,7 +196,7 @@ function createBail(opts, deps) {
     safeRecord(deps, code, opts.name);
     // Only the permission kind has a protocol to be safe in: Cursor reads its stdout. An analytics
     // hook's return value is validated and dropped (Cursor forum #155689), so its failure path
-    // writes nothing at all.
+    // writes nothing at all. Neither does a gate hook's: its script answered before this could run.
     if (permission && !wroteStdout) {
       const out = opts.failOutput == null ? PERMISSION_FAILURE_OUTPUT : opts.failOutput;
       if (out !== '') {
@@ -206,9 +235,12 @@ export function installHookGuards(options) {
 // path does NOT: it opens no socket, so there is nothing to drain, and loading the shutdown module
 // there would put one more evaluable file in front of a user's tool call for no benefit. That is the
 // same reason the permission path does no network and flushes no telemetry.
-async function finish(permission, deps) {
+//
+// `immediate` is true for the permission AND the gate kind. The gate hook opens no socket either,
+// and it stands between the user's Send and the model, so a drain there is dead time on every turn.
+async function finish(immediate, deps) {
   const exit = deps.exit == null ? ((c) => process.exit(c)) : deps.exit;
-  if (permission) { exit(0); return; }
+  if (immediate) { exit(0); return; }
   try {
     const shutdown = deps.shutdown == null ? await import('./shutdown.mjs') : deps.shutdown;
     await shutdown.exitClean(0);
@@ -226,9 +258,13 @@ async function finish(permission, deps) {
 export async function runHook(options) {
   const opts = options == null ? {} : options;
   const deps = opts.deps == null ? {} : opts.deps;
-  const permission = opts.permission === true;
+  const kind = hookKindOf(opts);
+  const permission = kind === 'permission';
+  // Permission and gate both leave by the immediate exit: neither holds a socket, and both sit in
+  // front of something the user is waiting for.
+  const immediate = kind !== 'analytics';
   const now = deps.now == null ? Date.now : deps.now;
-  const deadlineAt = now() + hookBudgetMs(permission);
+  const deadlineAt = now() + hookBudgetMs(kind);
   // A hook process runs exactly one hook, so this is a no-op in production. It matters in tests,
   // where many runs share one process: a leftover `true` from an earlier run would suppress the next
   // run's fail-open token, and the suite would pass for the wrong reason in one order and fail in
@@ -246,8 +282,11 @@ export async function runHook(options) {
   // produce exactly the log entry this module exists to remove.
   const fail = async (code) => {
     safeRecord(deps, code, opts.name);
-    if (permission) {
-      if (!wroteStdout) {
+    if (immediate) {
+      // The failure token is the PERMISSION kind's alone. A gate script has already written
+      // `{"continue":true}` itself, straight to fd 1 and not through `writeOut` —
+      // so `wroteStdout` does not know about it, and a failOutput here would be a second token.
+      if (permission && !wroteStdout) {
         const out = opts.failOutput == null ? PERMISSION_FAILURE_OUTPUT : opts.failOutput;
         if (out !== '') {
           try { writeOut(deps, out); } catch { /* a closed pipe is still fail-open */ }
@@ -289,7 +328,7 @@ export async function runHook(options) {
   // event on this path (see the BOM note in lib/hook-input-cursor.mjs), so it costs one short-lived
   // process and no diagnostics record.
   if (input == null) {
-    await finish(permission, deps);
+    await finish(immediate, deps);
     return;
   }
 
@@ -325,5 +364,5 @@ export async function runHook(options) {
     return;
   }
 
-  await finish(permission, deps);
+  await finish(immediate, deps);
 }

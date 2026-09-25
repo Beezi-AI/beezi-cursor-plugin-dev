@@ -42,9 +42,16 @@ export const ACCOUNT_CHECKIN_ENDPOINT = ENDPOINTS.accountSync;
 
 export const CHECKIN_STATE_VERSION = 1;
 
-// Re-check in at least weekly even when nothing changed, so a server that lost the row recovers
+// Re-check in at least DAILY even when nothing changed, so a server that lost the row recovers
 // without waiting for the user's plan to move.
-export const CHECKIN_HEARTBEAT_MS = 7 * 24 * 60 * 60 * 1000;
+//
+// It was weekly, and a week is what losing the row actually cost: the server's session upsert only
+// LINKS an existing `cli_agent_accounts` row and never creates one, so from the moment the row went
+// missing every session report mapped to no subscription until the heartbeat came round again, and
+// nothing told the client in between. A newer server now says so in whoami
+// (`cliAgentAccountKnown: false`) and session start forces a check-in on it; this bound is the belt
+// for an older server that cannot say. One small POST per machine per day is the price.
+export const CHECKIN_HEARTBEAT_MS = 24 * 60 * 60 * 1000;
 
 export const CheckInOutcome = Object.freeze({
   DISABLED: 'disabled',
@@ -170,7 +177,7 @@ export function accountSyncStateDir() {
 // Scoped by environment + Beezi account, and DELIBERATELY NOT by the Cursor account (plan §2 C8).
 //
 // This is the flip-back guarantee and it is load-bearing. With the Cursor account in the key,
-// sub1 → sub2 → sub1 inside the seven-day heartbeat lands back on sub1's OWN state file, finds
+// sub1 → sub2 → sub1 inside one heartbeat window lands back on sub1's OWN state file, finds
 // `lastHash === hash`, and returns SKIPPED — the re-map to sub1 silently never happens. One file
 // per (environment, Beezi account) makes the state mean "the last identity this machine sent", so
 // any return to a previous tuple is itself a change and re-sends.
@@ -426,8 +433,8 @@ function result(outcome, extra) {
 //                existingBillingRecord, anchor, force=false }`.
 //
 // `force` skips the due gate ONLY (plan §2 C7). It is for the moments where the caller already
-// knows something moved — a fresh link, an observed account switch — and waiting out a seven-day
-// heartbeat would leave the server holding the wrong subscription. It does not skip the schema
+// knows something moved — a fresh link, an observed account switch, a server that says it has no
+// row for us — and waiting out the heartbeat would leave the server holding the wrong subscription. It does not skip the schema
 // check, the scope check or the auth fence, because none of those is a rate limit.
 //
 // It returns `writeback` for the caller to apply; it never writes billing.json itself, so the one

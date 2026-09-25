@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeDelta, BILLING_POOL } from '../lib/delta-cursor.mjs';
+import { computeDelta, BILLING_POOL, MAX_CARRIED_EVENT_KEYS } from '../lib/delta-cursor.mjs';
 
 const CONV = 'conv-abc';
 const at = (min) => Date.parse(`2026-01-01T00:${String(min).padStart(2, '0')}:00.000Z`);
@@ -363,4 +363,119 @@ test('a reader that throws yields an empty segment rather than breaking the hook
   assert.equal(delta.segmentId, `${CONV}:0-0`);
   assert.deepEqual(delta.entries, []);
   assert.deepEqual(delta.rateLimitEvents, []);
+});
+
+// ---------------------------------------------------------------------------
+// consumedEventKeys — a proven duplicate across a checkpoint boundary is dropped by identity
+// ---------------------------------------------------------------------------
+//
+// Codex review, MAJOR, twice over. dedupeEvents collapses the two registries' copies of an event only
+// WITHIN a window, so a late copy that crosses a checkpoint boundary kept its ORIGINAL timestamp and
+// anchored the new window back over already-billed time (10 s, then 20,995 ms instead of 1,000 ms).
+// The first fix dropped every anchor inside covered wall clock — and coverage can legitimately reach
+// past the sidecar snapshot (a CLI subagent's store-dated end), so a genuinely new prompt was dropped
+// too. The rule now is identity, never time: the window hands the next one the identities of the
+// identified lines it consumed, and only a line with the SAME identity is dropped.
+
+const S = (sec) => Date.parse('2026-01-01T00:00:00.000Z') + sec * 1000;
+const FIRST_WINDOW = [
+  { ts: S(0), ev: 'prompt', eid: 'p1' },
+  { ts: S(5), ev: 'tool', tool: 'read_file', bytes: 10, eid: 't1' },
+  { ts: S(10), ev: 'tool', tool: 'grep', bytes: 10, eid: 't2' },
+  { ts: S(10), ev: 'stop' },
+];
+const SECOND_WINDOW = [
+  { ts: S(0), ev: 'prompt', eid: 'p1' }, // the other registry's copy, late, with the gate's ts
+  { ts: S(20), ev: 'prompt', eid: 'p2' },
+  { ts: S(20.5), ev: 'tool', tool: 'read_file', bytes: 10, eid: 't3' },
+  { ts: S(21), ev: 'tool', tool: 'grep', bytes: 10, eid: 't4' },
+];
+const ALL = FIRST_WINDOW.concat(SECOND_WINDOW);
+
+test('a late copy of a line the previous window consumed is dropped before anything reads the window', () => {
+  const first = computeDelta(CONV, 0, resolvers(ALL.slice(0, FIRST_WINDOW.length), {}));
+  assert.equal(first.consumedEventKeys.length, 3, 'p1, t1 and t2; the stop carries no id');
+  const second = computeDelta(CONV, FIRST_WINDOW.length, resolvers(ALL, {}, { consumedEventKeys: first.consumedEventKeys }));
+  assert.equal(second.duration_ms, 1000);
+  assert.deepEqual(second.activeIntervals, [[S(20), S(21)]]);
+  // Dropped from the window itself, so the envelope no longer reaches back to the copy either.
+  assert.equal(second.started_at, new Date(S(20)).toISOString());
+  assert.equal(second.diagnostics.carriedDuplicateEvents, 1);
+  // The segment's line range is still the raw lines it read.
+  assert.equal(second.from, FIRST_WINDOW.length);
+  assert.equal(second.to, ALL.length);
+  // The control: without the carry the copy stretches the window to 21 s, as before either fix.
+  const unfixed = computeDelta(CONV, FIRST_WINDOW.length, resolvers(ALL, {}));
+  assert.equal(unfixed.duration_ms, 21000);
+  assert.equal(unfixed.diagnostics.carriedDuplicateEvents, 0);
+});
+
+test('only the SAME line is a duplicate: a shared eid on different content, and an unidentified line, survive', () => {
+  // The id is not unique per line. One edit call stamps every file it touched with the same eid; the
+  // `mcp_server` side channel and the `tool` line of one MCP call share the tool-call id. A carry on
+  // the bare eid would delete the second half of any such pair that straddles a boundary.
+  const before = [
+    { ts: S(0), ev: 'edit', path: 'src/a.ts', added: 1, removed: 0, eid: 'call-1' },
+    { ts: S(1), ev: 'mcp_server', tool: 'mcp_docs_search', server: 'docs', eid: 'call-2' },
+    { ts: S(2), ev: 'shell', cmd: 'npm test' },
+  ];
+  const after = [
+    { ts: S(3), ev: 'edit', path: 'src/b.ts', added: 2, removed: 0, eid: 'call-1' },
+    { ts: S(4), ev: 'tool', tool: 'mcp_docs_search', bytes: 5, eid: 'call-2' },
+    // Identical to the shell line above but with no id to prove it a copy: a real second run.
+    { ts: S(5), ev: 'shell', cmd: 'npm test' },
+  ];
+  const events = before.concat(after);
+  const first = computeDelta(CONV, 0, resolvers(events.slice(0, before.length), {}));
+  const second = computeDelta(CONV, before.length, resolvers(events, {}, { consumedEventKeys: first.consumedEventKeys }));
+  assert.equal(second.diagnostics.carriedDuplicateEvents, 0);
+  assert.equal(second.diagnostics.windowEvents, 3);
+  assert.equal(second.code_changes.files_changed, 1, 'the second file of the edit call was kept');
+  assert.deepEqual(second.activeIntervals, [[S(3), S(5)]]);
+});
+
+test('gen lines are never carried and never dropped: their eid names a generation, not a line', () => {
+  // One generation writes a `gen` line on every postToolUse envelope and one on the stop, all under
+  // the same eid (= gen_id), and those lines legitimately continue into the next window. Dropping
+  // them would take the timing anchors and the turn-end token counts with them; the request count
+  // across windows is countedGenerations' job, which already carries the generation.
+  const genLine = (sec) => ({ ts: S(sec), ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1', eid: 'g1' });
+  const events = [
+    genLine(0),
+    { ts: S(1), ev: 'tool', tool: 'read_file', bytes: 10, eid: 't1' },
+    genLine(30),
+    { ts: S(31), ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1', eid: 'g1', token_input: 100, token_output: 7 },
+  ];
+  const first = computeDelta(CONV, 0, resolvers(events.slice(0, 2), {}));
+  assert.equal(first.consumedEventKeys.length, 1, 'only the tool line');
+  const second = computeDelta(CONV, 2, resolvers(events, {}, {
+    consumedEventKeys: first.consumedEventKeys,
+    countedGenerations: first.countedGenerations,
+  }));
+  assert.equal(second.diagnostics.carriedDuplicateEvents, 0);
+  assert.equal(second.timingAnchors.count, 2);
+  assert.deepEqual(second.activeIntervals, [[S(30), S(31)]]);
+  assert.equal(second.tokens.token_input, 100);
+  assert.equal(second.consumedEventKeys.length, 1, 'still only the tool line');
+});
+
+test('the carry is bounded: the newest keys are kept and the oldest fall off the front', () => {
+  const prior = [];
+  for (let i = 0; i < MAX_CARRIED_EVENT_KEYS + 44; i++) prior.push(`stale-${i}`);
+  const fresh = computeDelta(CONV, 0, resolvers(SECOND_WINDOW, {}));
+  const carried = computeDelta(CONV, 0, resolvers(SECOND_WINDOW, {}, { consumedEventKeys: prior }));
+  assert.equal(MAX_CARRIED_EVENT_KEYS, 256);
+  assert.equal(carried.consumedEventKeys.length, MAX_CARRIED_EVENT_KEYS);
+  assert.deepEqual(carried.consumedEventKeys.slice(-fresh.consumedEventKeys.length), fresh.consumedEventKeys);
+  assert.equal(carried.consumedEventKeys.includes('stale-0'), false);
+  assert.equal(carried.consumedEventKeys[0], `stale-${prior.length + fresh.consumedEventKeys.length - MAX_CARRIED_EVENT_KEYS}`);
+});
+
+test('no carry, or a malformed one, drops nothing', () => {
+  const plain = computeDelta(CONV, FIRST_WINDOW.length, resolvers(ALL, {}));
+  for (const extra of [{}, { consumedEventKeys: null }, { consumedEventKeys: 'p1' }, { consumedEventKeys: [7, null, {}] }]) {
+    const delta = computeDelta(CONV, FIRST_WINDOW.length, resolvers(ALL, {}, extra));
+    assert.equal(delta.duration_ms, plain.duration_ms, JSON.stringify(extra));
+    assert.equal(delta.diagnostics.carriedDuplicateEvents, 0, JSON.stringify(extra));
+  }
 });

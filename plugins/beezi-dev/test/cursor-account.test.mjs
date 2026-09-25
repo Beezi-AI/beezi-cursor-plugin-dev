@@ -273,7 +273,9 @@ test('an unrecognized status token is dropped while the plan still resolves', ()
   }
 });
 
-test('the CLI config and the self-report carry no identity at all', () => {
+// The legacy top-level spelling carries only an email, never an id; only `authInfo.authId` (below)
+// can put an account id on a cli-config candidate. A bare self-report carries nothing.
+test('a legacy top-level CLI email and a bare self-report carry no account id', () => {
   const cli = readCursorAccount({
     ...NO_VSCDB,
     cliConfigFile: '/fake/cli-config.json',
@@ -292,4 +294,146 @@ test('the CLI config and the self-report carry no identity at all', () => {
 test('a bare (non-JSON) id value is accepted and kept verbatim', () => {
   const account = readCursorAccount(vscdb({ [MEMBERSHIP_KEY]: 'pro', [SIGNED_IN_KEY]: AUTH0_ID }));
   assert.equal(account.accountId, AUTH0_ID);
+});
+
+// ── the CLI's nested identity (`~/.cursor/cli-config.json` → `authInfo`) ─────────────────────────
+//
+// VERIFIED 2026-09-24 on a real CLI machine: the identity lives at `authInfo.email` and
+// `authInfo.authId` (both equal to the state.vscdb anchor on that machine), there is NO plan key
+// anywhere in the file, and `authInfo` sits beside credential material. The fixture copies that
+// layout, secrets included, so the no-leak assertions below are tested against the real hazard.
+const CLI_AUTH_ID = 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T';
+const CLI_SECRET = 'sk-cli-secret-0123456789';
+const CLI_REFRESH = 'rt-cli-refresh-9876543210';
+function realCliConfig(extra) {
+  return JSON.stringify({
+    version: 1,
+    editor: { vimMode: false },
+    permissions: { allow: [], deny: [] },
+    authInfo: {
+      email: 'Seat@Example.com',
+      authId: CLI_AUTH_ID,
+      accessToken: CLI_SECRET,
+      refreshToken: CLI_REFRESH,
+      apiKey: CLI_SECRET,
+      displayName: 'Seat Holder',
+    },
+    ...(extra == null ? {} : extra),
+  });
+}
+const CLI_ONLY = (extra) => ({
+  ...NO_VSCDB,
+  cliConfigFile: '/fake/cli-config.json',
+  readFile: () => realCliConfig(extra),
+});
+
+test('a CLI-only machine with no plan key still yields its identity', () => {
+  const account = readCursorAccount(CLI_ONLY());
+  assert.notEqual(account, null, 'an identity with no plan is still an answer — it is the anchor');
+  assert.equal(account.accountId, CLI_AUTH_ID, 'kept verbatim, provider prefix and all');
+  assert.equal(account.email, 'Seat@Example.com');
+  assert.equal(account.source, 'cli_config');
+  // No plan was read, so none is claimed: `unknown`, never a fabricated tier, and no raw string for
+  // the server's alias-discovery loop to mistake for a tier name.
+  assert.equal(account.plan, 'unknown');
+  assert.equal(account.rawPlan, null);
+  assert.equal(account.subscriptionId, null);
+  assert.equal(account.status, null);
+});
+
+test('nothing but email and authId ever leaves cli-config.json — no token, no other field', () => {
+  const account = readCursorAccount(CLI_ONLY());
+  // The exact key set: a reader that spread `authInfo` would add accessToken/refreshToken here.
+  assert.deepEqual(Object.keys(account).sort(), ['accountId', 'email', 'plan', 'rawPlan', 'source', 'status', 'subscriptionId']);
+  const serialized = JSON.stringify(account);
+  for (const secret of [CLI_SECRET, CLI_REFRESH, 'Seat Holder', 'accessToken', 'refreshToken', 'apiKey']) {
+    assert.equal(serialized.includes(secret), false, `${secret} must never be read into the account`);
+  }
+});
+
+test('the nested identity outranks the legacy top-level email, which stays a fallback', () => {
+  const nested = readCursorAccount(CLI_ONLY({ email: 'legacy@example.com' }));
+  assert.equal(nested.email, 'Seat@Example.com');
+
+  const legacy = readCursorAccount({
+    ...NO_VSCDB,
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => JSON.stringify({ email: 'legacy@example.com' }),
+  });
+  assert.equal(legacy.email, 'legacy@example.com');
+  assert.equal(legacy.accountId, null, 'there is no top-level id spelling to fall back to');
+});
+
+test('a cli-config with neither plan nor identity is still no answer', () => {
+  const account = readCursorAccount({
+    ...NO_VSCDB,
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => JSON.stringify({ version: 1, authInfo: { accessToken: CLI_SECRET } }),
+  });
+  assert.equal(account, null);
+});
+
+test('a non-string authId or email is ignored, not coerced', () => {
+  const account = readCursorAccount({
+    ...NO_VSCDB,
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => JSON.stringify({ authInfo: { authId: 12345, email: { nested: true } } }),
+  });
+  assert.equal(account, null);
+});
+
+test('a self-reported plan takes its identity from cli-config', () => {
+  const account = readCursorAccount({ ...CLI_ONLY(), selfReportedPlan: 'pro' });
+  assert.equal(account.plan, 'pro', 'the plan comes from the self-report');
+  // The winner's source is KEPT: `selfReported` and the staleness exemption key off it, and the
+  // identity donor must not be able to relabel a typed plan as a host read.
+  assert.equal(account.source, 'self_report');
+  assert.equal(account.accountId, CLI_AUTH_ID, 'the identity comes from cli-config');
+  assert.equal(account.email, 'Seat@Example.com');
+  assert.equal(JSON.stringify(account).includes(CLI_SECRET), false);
+});
+
+test('an unmapped self-report still surfaces its raw string, with the cli-config identity', () => {
+  const account = readCursorAccount({ ...CLI_ONLY(), selfReportedPlan: 'mystery-tier' });
+  assert.equal(account.plan, 'unknown');
+  assert.equal(account.rawPlan, 'mystery-tier', 'an identity-only candidate has no raw plan to win with');
+  assert.equal(account.source, 'self_report');
+  assert.equal(account.accountId, CLI_AUTH_ID);
+});
+
+test('a state.vscdb identity is never overwritten by the CLI one', () => {
+  // The IDE and the CLI can be signed into different accounts. Mixing them would attribute one
+  // account's plan to the other's id, so the donor only fills a winner that identifies nobody.
+  const account = readCursorAccount({
+    ...vscdb({ [MEMBERSHIP_KEY]: '"pro"', [EMAIL_KEY]: '"ide@example.com"', [SIGNED_IN_KEY]: 'auth0|ide_seat' }),
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => realCliConfig(),
+  });
+  assert.equal(account.source, 'state_vscdb');
+  assert.equal(account.email, 'ide@example.com');
+  assert.equal(account.accountId, 'auth0|ide_seat');
+});
+
+test('a state.vscdb email with no id is not topped up with the CLI id', () => {
+  const account = readCursorAccount({
+    ...vscdb({ [MEMBERSHIP_KEY]: '"pro"', [EMAIL_KEY]: '"ide@example.com"' }),
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => realCliConfig(),
+  });
+  assert.equal(account.email, 'ide@example.com');
+  assert.equal(account.accountId, null, 'half an identity from each source is no identity at all');
+});
+
+test('an unmapped state.vscdb tier still wins over an identity-only cli-config', () => {
+  const account = readCursorAccount({
+    ...vscdb({ [MEMBERSHIP_KEY]: '"start"', [EMAIL_KEY]: '"ide@example.com"' }),
+    cliConfigFile: '/fake/cli-config.json',
+    readFile: () => realCliConfig(),
+  });
+  assert.equal(account.rawPlan, 'start');
+  assert.equal(account.source, 'state_vscdb');
+  assert.equal(account.email, 'ide@example.com');
+  // This is the case that actually REACHES the donor (the loop did not break on a mapped plan), so
+  // it is the one that proves half an identity from each source is never stitched into one anchor.
+  assert.equal(account.accountId, null);
 });

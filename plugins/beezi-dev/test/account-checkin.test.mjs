@@ -14,6 +14,8 @@ import {
   CheckInVia,
 } from '../lib/account-checkin.mjs';
 import { CheckInOutcome } from '../lib/account-sync.mjs';
+import { readCursorAccount } from '../lib/cursor-account.mjs';
+import { observationFromAccount, observationFromArgs, reconcilePlan, ReconcileOutcome } from '../lib/billing-capture.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 
 // The wiring between `lib/account-sync.mjs` (the protocol) and the three call sites (plan §4 B3).
@@ -311,4 +313,98 @@ test('the refresh report of a plan-less machine sends nothing', async (t) => {
   const res = await reportRefreshedAccount(null, d);
   assert.equal(d.checkInAccount.calls.length, 0);
   assert.equal(res.skipped, CheckInSkip.NO_RECORD);
+});
+
+// ── a CLI-only machine, end to end: cli-config.json → billing.json → the check-in body ─────────
+//
+// The failure this pins: `~/.cursor/cli-config.json` keeps the identity at `authInfo.email` /
+// `authInfo.authId` and has no plan key, the reader returned null for want of a plan, reconcile had
+// nothing to anchor, and the check-in answered NOTHING_TO_REPORT — so no session report from that
+// machine ever carried an `account_uuid`. Chained through the REAL reader, observation, reconcile
+// and payload builder, so a drop anywhere along the way fails here.
+const CLI_AUTH_ID = 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T';
+const CLI_SECRET = 'sk-cli-secret-0123456789';
+const CLI_ONLY = {
+  stateVscdbFile: '/fake/state.vscdb',
+  readKeys: () => null,
+  cliConfigFile: '/fake/cli-config.json',
+  readFile: () => JSON.stringify({
+    version: 1,
+    authInfo: { email: 'Seat@Example.com', authId: CLI_AUTH_ID, accessToken: CLI_SECRET, refreshToken: CLI_SECRET },
+  }),
+};
+const E2E_NOW = Date.parse('2026-09-24T00:00:00.000Z');
+
+function cliOnlyRecord(prior) {
+  const obs = observationFromAccount(readCursorAccount(CLI_ONLY), 'session-start');
+  return reconcilePlan(obs, prior == null ? null : prior, { now: E2E_NOW, attempted: true });
+}
+
+test('a CLI-only machine with no plan anchors billing.json and checks in with its accountUuid', async (t) => {
+  tmpHome(t);
+  const r = cliOnlyRecord();
+  // Still NEEDS_USER — no plan was read and none is claimed — but the identity is not thrown away.
+  assert.equal(r.outcome, ReconcileOutcome.NEEDS_USER);
+  assert.equal(r.persist, true);
+  assert.equal(r.record.plan, null);
+  assert.deepEqual(r.record.accountAnchor, { email: 'seat@example.com', accountId: CLI_AUTH_ID, subscriptionId: null, source: 'cli_config' });
+  assert.equal(JSON.stringify(r.record).includes(CLI_SECRET), false, 'no cli-config credential reaches billing.json');
+
+  const payload = checkInPayloadFromRecord(r.record);
+  assert.deepEqual(payload, { accountUuid: CLI_AUTH_ID, email: 'seat@example.com' }, 'no plan, so no subscriptionType is invented');
+  assert.equal(identifiesAnAccount(payload), true);
+
+  const d = deps({ record: r.record });
+  const res = await syncAccountIfNeeded('tok', { force: false, via: CheckInVia.SESSION_START }, d);
+  assert.equal(res.skipped, undefined, 'not NOTHING_TO_REPORT any more');
+  assert.equal(d.checkInAccount.calls[0].payload.accountUuid, CLI_AUTH_ID);
+  assert.equal(JSON.stringify(d.checkInAccount.calls[0].payload).includes(CLI_SECRET), false);
+});
+
+test('a plan-less record written before the fix learns the CLI identity on the next read', () => {
+  // What every CLI-only billing.json on disk looks like today: an attempt stamp and nothing else.
+  const stale = reconcilePlan(null, null, { now: E2E_NOW - 8 * 24 * 60 * 60 * 1000, attempted: true }).record;
+  assert.equal(stale.accountAnchor, null);
+  const r = cliOnlyRecord(stale);
+  assert.equal(r.persist, true, 'an anchor learned is worth writing');
+  assert.equal(r.record.accountAnchor.accountId, CLI_AUTH_ID);
+});
+
+test('a CLI-only record with no plan keeps its anchor when nothing new is learned', () => {
+  const first = cliOnlyRecord().record;
+  // A read that observes nothing identifying must not blank what the previous read learned.
+  const blind = reconcilePlan(
+    observationFromAccount({ plan: 'unknown', rawPlan: null, source: 'cli_config', email: null, accountId: null }, 'session-start'),
+    first,
+    { now: E2E_NOW + 60 * 1000, attempted: true },
+  );
+  assert.equal(blind.record.accountAnchor.accountId, CLI_AUTH_ID);
+});
+
+test('a self-reported plan on a CLI-only machine checks in with the plan AND the cli-config identity', () => {
+  // The reader-level merge (`deps.selfReportedPlan`): the plan from the user, the identity from cli-config.
+  const obs = observationFromAccount(readCursorAccount({ ...CLI_ONLY, selfReportedPlan: 'pro' }), 'refresh');
+  const r = reconcilePlan(obs, null, { now: E2E_NOW });
+  assert.equal(r.record.plan, 'pro');
+  assert.equal(r.record.selfReported, true);
+  assert.deepEqual(checkInPayloadFromRecord(r.record), { accountUuid: CLI_AUTH_ID, email: 'seat@example.com', subscriptionType: 'pro' });
+});
+
+test('`/beezi:refresh --plan pro` on a CLI-only machine keeps the identity it already learned', () => {
+  // The PRODUCTION self-report path is `observationFromArgs`, which carries no identity by
+  // construction. Over a CLI-learned anchor, writing its empty anchor through would drop the
+  // accountUuid — and, because the attempt stamp moves too, keep it dropped for a full recheck window.
+  const anchored = cliOnlyRecord().record;
+  const r = reconcilePlan(observationFromArgs({ plan: 'pro' }), anchored, { now: E2E_NOW + 60 * 1000 });
+  assert.equal(r.record.plan, 'pro');
+  assert.equal(r.record.selfReported, true);
+  assert.equal(r.record.accountAnchor.accountId, CLI_AUTH_ID);
+  assert.deepEqual(checkInPayloadFromRecord(r.record), { accountUuid: CLI_AUTH_ID, email: 'seat@example.com', subscriptionType: 'pro' });
+});
+
+test('a self-report that NAMES a different email is still a switch, never glued to the old id', () => {
+  const anchored = cliOnlyRecord().record;
+  const r = reconcilePlan(observationFromArgs({ plan: 'pro', email: 'other@example.com' }), anchored, { now: E2E_NOW + 60 * 1000 });
+  assert.equal(r.record.accountAnchor.email, 'other@example.com');
+  assert.equal(r.record.accountAnchor.accountId, null, 'the old seat id must not ride along');
 });

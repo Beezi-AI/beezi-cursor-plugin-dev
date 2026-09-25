@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { BEEZI_HOOKS, PERMISSION_EVENTS } from '../lib/hooks-install.mjs';
+import { BEEZI_HOOKS, GATE_EVENTS, PERMISSION_EVENTS } from '../lib/hooks-install.mjs';
 
 // Every registered hook, run the way Cursor runs it, with its business layer broken on purpose.
 //
@@ -26,13 +26,14 @@ const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SCRIPTS = path.join(PLUGIN_ROOT, 'scripts');
 const LIB = path.join(PLUGIN_ROOT, 'lib');
 
-// Cursor's own ceiling is 10s (5s for a permission hook). A run that has not finished in twice that
-// is not "slow", it is the unbounded hang this bootstrap exists to make impossible.
+// Cursor's own ceiling is 10s (5s for a permission hook, 3s for the prompt gate). A run that has
+// not finished in twice that is not "slow", it is the unbounded hang this bootstrap exists to make
+// impossible.
 const KILL_MS = 20000;
 
 // One business module per script, and the export its handler actually calls.
 //
-// `lib/sidecar.mjs` is the common one by construction: all ten append at least one line, and it is
+// `lib/sidecar.mjs` is the common one by construction: all eleven append at least one line, and it is
 // reached only through `load`, never through the four bootstrap imports at the top of a hook entry.
 // `session-start.mjs` is the exception anyway: its one `session_start` line is appended inside its
 // own try/catch, so a throwing appendEvent never reaches the runner, and its own engine module
@@ -48,11 +49,28 @@ const BROKEN = Object.freeze({
   'mcp-before.mjs': { module: 'sidecar.mjs', symbol: 'appendEvent' },
   'subagent-start.mjs': { module: 'sidecar.mjs', symbol: 'appendEvent' },
   'subagent-stop.mjs': { module: 'sidecar.mjs', symbol: 'appendEvent' },
+  // The gate never loads the sidecar: it decodes the payload and hands the line to a detached
+  // recorder process, which a `--import` loader does not follow (it is execArgv, not environment).
+  // So its broken module is the decoder — the one business module the gate process itself loads —
+  // and every mode below also leaves no recorder behind to write into a home already deleted.
+  'prompt-submit.mjs': { module: 'hook-input-cursor.mjs', symbol: 'normalizeHookInput' },
 });
 
 const permissionScripts = new Set(
   BEEZI_HOOKS.filter((h) => PERMISSION_EVENTS.includes(h.event)).map((h) => h.script),
 );
+
+// The one carve-out from "nothing on stdout". A GATE hook (`beforeSubmitPrompt`) holds the user's
+// Send until it answers `{"continue": true|false, …}`, and scripts/prompt-submit.mjs answers
+// `{"continue":true}` synchronously before it touches stdin or loads anything. So on EVERY path —
+// the broken-module ones below included — its stdout is exactly that token: not empty (which would
+// merely fail open, and say nothing about whether the answer is really written first), and never
+// two tokens (which is what a runner failOutput behind it would produce).
+const gateScripts = new Set(
+  BEEZI_HOOKS.filter((h) => GATE_EVENTS.includes(h.event)).map((h) => h.script),
+);
+const GATE_ANSWER = '{"continue":true}';
+const expectedStdout = (script) => (gateScripts.has(script) ? GATE_ANSWER : '');
 
 // A payload that is valid and attributable, and that names no working directory.
 //
@@ -174,7 +192,7 @@ for (const { script } of BEEZI_HOOKS) {
       const entry = writeLoader(dir, broken.module, broken.symbol, 'import-failure');
       const res = runScript(script, { loaderEntry: entry });
       assert.equal(res.code, 0, `${script} exited ${res.code} on an import failure`);
-      assert.equal(res.stdout, '', `${script} wrote to stdout on an import failure`);
+      assert.equal(res.stdout, expectedStdout(script), `${script} wrote the wrong stdout on an import failure`);
       assert.ok(res.ms < KILL_MS, `${script} did not terminate inside the host deadline`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -187,7 +205,7 @@ for (const { script } of BEEZI_HOOKS) {
       const entry = writeLoader(dir, broken.module, broken.symbol, 'throws');
       const res = runScript(script, { loaderEntry: entry });
       assert.equal(res.code, 0, `${script} exited ${res.code} on a business throw`);
-      assert.equal(res.stdout, '', `${script} wrote to stdout on a business throw`);
+      assert.equal(res.stdout, expectedStdout(script), `${script} wrote the wrong stdout on a business throw`);
       assert.ok(res.ms < KILL_MS, `${script} did not terminate inside the host deadline`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -212,12 +230,22 @@ for (const { script } of BEEZI_HOOKS) {
       const entry = writeLoader(dir, broken.module, broken.symbol, 'rejects');
       const res = runScript(script, { loaderEntry: entry });
       assert.equal(res.code, 0, `${script} exited ${res.code} on an uncaught rejection`);
-      assert.equal(res.stdout, '', `${script} wrote to stdout on an uncaught rejection`);
+      assert.equal(res.stdout, expectedStdout(script), `${script} wrote the wrong stdout on an uncaught rejection`);
       assert.ok(res.ms < KILL_MS, `${script} did not terminate inside the host deadline`);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  if (gateScripts.has(script)) {
+    test(`${script} still answers exactly once on a payload it cannot attribute`, () => {
+      for (const input of ['', 'not json', '{"no":"session"}']) {
+        const res = runScript(script, { input });
+        assert.equal(res.stdout, GATE_ANSWER, `${script} answered wrongly on ${JSON.stringify(input)}`);
+        assert.equal(res.code, 0);
+      }
+    });
+  }
 
   if (permission) {
     test(`${script} stays silent on a payload it cannot attribute`, () => {
@@ -237,14 +265,15 @@ for (const { script } of BEEZI_HOOKS) {
 
 // A hook entry shaped exactly like the ten, but with its failure injected directly, so the injection
 // does not depend on which module a given script happens to import.
-function writeFixture(dir, { permission, mode }) {
+function writeFixture(dir, { permission, mode, gate = false }) {
   const runner = pathToFileURL(path.join(LIB, 'hook-runner.mjs')).href;
   const body = `import { installHookGuards, runHook } from ${JSON.stringify(runner)};\n`
-    + `installHookGuards({ name: 'fixture', permission: ${permission} });\n`
+    + `installHookGuards({ name: 'fixture', permission: ${permission}, gate: ${gate} });\n`
     + `const deps = ${mode === 'telemetry-throws' ? '{ recordIssue() { throw new Error("beezi-test: telemetry"); } }' : '{}'};\n`
     + 'runHook({\n'
     + "  name: 'fixture',\n"
     + `  permission: ${permission},\n`
+    + `  gate: ${gate},\n`
     + '  deps,\n'
     + (mode === 'load-throws'
       ? '  load: () => Promise.reject(new Error("beezi-test: load")),\n  handle: () => {},\n'
@@ -259,12 +288,16 @@ function writeFixture(dir, { permission, mode }) {
   return file;
 }
 
-for (const permission of [false, true]) {
+// The gate kind is here too, with the script's own answer deliberately left out of the fixture:
+// what is under test is that the RUNNER adds nothing on the gate path, whatever fails.
+for (const kind of ['analytics', 'permission', 'gate']) {
+  const permission = kind === 'permission';
+  const gate = kind === 'gate';
   for (const mode of ['load-throws', 'handle-throws', 'handle-rejects', 'floating-rejection', 'telemetry-throws']) {
-    test(`a ${permission ? 'permission' : 'analytics'} entry survives ${mode}`, () => {
+    test(`a ${kind} entry survives ${mode}`, () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-fixture-'));
       try {
-        const file = writeFixture(dir, { permission, mode });
+        const file = writeFixture(dir, { permission, mode, gate });
         const started = Date.now();
         let stdout = '';
         let code = 0;

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   HOOK_GUARD_MARGIN_MS,
+  HOOK_KIND_GATE,
   HOOK_TIMEOUTS,
   PERMISSION_ALLOW_OUTPUT,
   PERMISSION_FAILURE_OUTPUT,
@@ -52,12 +53,16 @@ function recorder() {
 }
 
 test('the timeout table is the one both registries and the budget derive from', () => {
-  assert.deepEqual(HOOK_TIMEOUTS, { analytics: 10000, permission: 5000 });
+  // `gate` is the third kind (beforeSubmitPrompt): it delays the user's Send, so it is the smallest.
+  assert.deepEqual(HOOK_TIMEOUTS, { analytics: 10000, permission: 5000, gate: 3000 });
   // A permission hook is smaller than the analytics path by construction, not by convention.
   assert.ok(HOOK_TIMEOUTS.permission < HOOK_TIMEOUTS.analytics);
   assert.equal(hookBudgetMs(false), 10000 - HOOK_GUARD_MARGIN_MS);
   assert.equal(hookBudgetMs(true), 5000 - HOOK_GUARD_MARGIN_MS);
   assert.ok(hookBudgetMs(true) > 0, 'a permission hook still needs room to do its one append');
+  assert.ok(HOOK_TIMEOUTS.gate < HOOK_TIMEOUTS.permission);
+  assert.equal(hookBudgetMs(HOOK_KIND_GATE), 3000 - HOOK_GUARD_MARGIN_MS);
+  assert.ok(hookBudgetMs(HOOK_KIND_GATE) > 0, 'a gate hook still needs room to do its one append');
 });
 
 test('a business module that throws while being evaluated is contained', async () => {
@@ -274,6 +279,79 @@ test('a failure after the handler has written cannot corrupt that write', async 
   });
   assert.equal(out.stdout, '{"systemMessage":"hi"}');
   assert.deepEqual(out.exits, [0]);
+});
+
+// ── the gate path (beforeSubmitPrompt) ──────────────────────────────────────────────────────────
+//
+// The script has ALREADY answered Cursor with `{"continue":true}` before the runner is reached (see
+// scripts/prompt-submit.mjs), so the runner's job on this path is to add nothing: no second token,
+// whatever `failOutput` says, and no dispatcher drain between the user's Send and the model.
+
+test('a gate hook never drains a dispatcher on the way out', async () => {
+  const { out, deps } = recorder();
+  let drained = false;
+  deps.shutdown = { exitClean: () => { drained = true; } };
+  await runHook({ name: 'prompt-submit', gate: true, deps, load: () => Promise.resolve({}), handle: () => {} });
+  assert.equal(drained, false, 'the gate path holds no socket and must not wait on one');
+  assert.deepEqual(out.exits, [0]);
+  assert.equal(out.stdout, '');
+});
+
+test('a failing gate hook writes nothing, even when a failOutput is supplied', async () => {
+  for (const handle of [() => { throw new Error('boom'); }, () => Promise.reject(new Error('boom'))]) {
+    const { out, deps } = recorder();
+    let drained = false;
+    deps.shutdown = { exitClean: () => { drained = true; } };
+    await runHook({ name: 'prompt-submit', gate: true, failOutput: '{"continue":true}', deps, load: () => Promise.resolve({}), handle });
+    assert.equal(out.stdout, '', 'a second token behind the script’s own answer is malformed output');
+    assert.equal(drained, false);
+    assert.deepEqual(out.exits, [0]);
+  }
+});
+
+test('a gate hook with an unattributable payload or a broken load exits at once, silently', async () => {
+  const unattributable = recorder();
+  let drained = false;
+  unattributable.deps.shutdown = { exitClean: () => { drained = true; } };
+  unattributable.deps.decoder = decoderOf(null);
+  await runHook({ name: 'prompt-submit', gate: true, deps: unattributable.deps, load: () => Promise.resolve({}), handle: () => {} });
+  assert.equal(drained, false);
+  assert.deepEqual(unattributable.out.exits, [0]);
+
+  const broken = recorder();
+  await runHook({ name: 'prompt-submit', gate: true, failOutput: 'x', deps: broken.deps, load: () => Promise.reject(new Error('eval')), handle: () => {} });
+  assert.equal(broken.out.stdout, '');
+  assert.deepEqual(broken.out.exits, [0]);
+});
+
+test('the gate guards write nothing on an uncaught failure, whatever failOutput says', () => {
+  const handlers = {};
+  const exits = [];
+  let written = '';
+  installHookGuards({
+    name: 'prompt-submit',
+    gate: true,
+    failOutput: '{"continue":true}',
+    deps: { on: (ev, fn) => { handlers[ev] = fn; }, exit: (code) => exits.push(code), write: (t) => { written += t; }, recordIssue: () => {} },
+  });
+  handlers.uncaughtException(new Error('boom'));
+  assert.equal(written, '');
+  assert.deepEqual(exits, [0]);
+});
+
+test('a gate hook hands its handler the gate budget', async () => {
+  const { deps } = recorder();
+  let clock = 1000;
+  deps.now = () => clock;
+  let remaining = null;
+  await runHook({
+    name: 'prompt-submit',
+    gate: true,
+    deps,
+    load: () => Promise.resolve({}),
+    handle: (loaded, ctx) => { remaining = ctx.remainingMs(); },
+  });
+  assert.equal(remaining, hookBudgetMs(HOOK_KIND_GATE));
 });
 
 // ── the guards ───────────────────────────────────────────────────────────────────────────────────

@@ -93,8 +93,8 @@ const SELF_REPORTED_PLANS = Object.freeze([
   'free', 'pro', 'pro_plus', 'ultra', 'team', 'team_premium', 'enterprise',
 ]);
 
-// `identity` is `{ accountId, subscriptionId, status }` and is optional: only the deterministic
-// state.vscdb read can supply one. Its ids go through `normalizeAccountIdentifier`, NOT through
+// `identity` is `{ accountId, subscriptionId, status }` and is optional: only a deterministic host
+// read can supply one — state.vscdb all three, cli-config.json an `accountId` alone. Its ids go through `normalizeAccountIdentifier`, NOT through
 // `safeField` above — `safeField` caps at 64 characters, and an SSO `samlp|<connection>|<nameId>`
 // id is routinely longer than that. Truncating it, or dropping it, is how a Team/SSO seat becomes
 // permanently email-only.
@@ -158,8 +158,9 @@ export const IdentityMatch = Object.freeze({
 
 // ID FIRST, then email. The account id is Cursor's own opaque identity for this seat and does not
 // move when a user renames their address, so where both sides have one it is the only thing worth
-// asking. Email is the fallback for the population that has no id: every pre-v3 record, every
-// CLI-config machine, and any seat whose per-seat key was absent.
+// asking. Email is the fallback for the population that has no id: every pre-v3 record, a
+// CLI-config machine whose `authInfo` carries no `authId` (or one written before that was read),
+// and any seat whose per-seat key was absent.
 //
 // A missing identity on EITHER side is `unknown` — not a match, and not a switch. Treating it as a
 // match would let an old user's protected tier survive a hand-over; treating it as a switch would
@@ -406,9 +407,24 @@ export function reconcilePlan(observationInput, existing, options) {
   // Gated on MATCH, and that gate is the whole safety of it: backfilling from the previous anchor
   // is only sound when the previous anchor describes the SAME account. On a switch the old seat's
   // id must never ride along onto the new one.
-  const anchor = identity === IdentityMatch.MATCH
-    ? filledFrom(observedAnchor, prior.accountAnchor)
-    : observedAnchor;
+  //
+  // ONE exception to "rebuilt from the observation", and it is narrow on purpose: a SELF-REPORT
+  // that names nobody. `--plan pro` is the user typing a tier for this machine; it carries no
+  // identity by construction (see observationFromArgs), so it is not a competing source whose
+  // blank should win — it is a plan with nobody attached. Writing its empty anchor through would
+  // drop the id a CLI-only machine learned from cli-config, send the next check-in with no
+  // `accountUuid`, and — since the attempt stamp moves with it — keep it dropped for a whole
+  // recheck window. A host read that sees no identity is NOT excepted: pairing one source's plan
+  // with another source's identity is exactly what this function refuses everywhere else. A
+  // self-report that DOES name an email is compared like any observation, and can still switch.
+  const selfReportNamesNobody = identity === IdentityMatch.UNKNOWN
+    && obs.source === AccountSource.SELF_REPORT
+    && !anchorIdentifies(observedAnchor)
+    && prior != null
+    && anchorIdentifies(prior.accountAnchor);
+  let anchor = observedAnchor;
+  if (identity === IdentityMatch.MATCH) anchor = filledFrom(observedAnchor, prior.accountAnchor);
+  else if (selfReportNamesNobody) anchor = prior.accountAnchor;
   const priorKnown = prior != null && known(prior.plan);
   const due = force || prior == null || isDue(prior, now, RECHECK_MS);
 
@@ -501,13 +517,33 @@ export function reconcilePlan(observationInput, existing, options) {
 
   // Nothing stored, nothing observed that names a plan: only the user can close this. The attempt
   // is still recorded, for the same reason as the no-source branch above.
+  //
+  // The IDENTITY is recorded too, whenever the observation carried one. This is the first-run path
+  // of every CLI-only machine: cli-config.json holds `authInfo.authId`/`email` and no plan key, so
+  // the plan is unknown here by construction — and throwing the anchor away with it left billing.json
+  // identifying nobody, the check-in with NOTHING_TO_REPORT, and every session report without an
+  // `account_uuid`. The same rule as the preserved-plan branch above: an observation that
+  // identifies someone replaces the stored anchor, and one that identifies nobody keeps it. (A
+  // switch never reaches here — it returned above — so this cannot carry an old seat's id across.)
   changes.push(change(ChangeKind.UNAVAILABLE, 'plan', prior == null ? null : prior.plan, null));
   const base = prior == null ? blankRecord() : prior;
+  const learnedAnchor = anchorIdentifies(anchor) ? anchor : base.accountAnchor;
+  const anchorLearned = !anchorsEqual(learnedAnchor, prior == null ? null : prior.accountAnchor);
+  let record = prior;
+  if (attempted || anchorLearned) {
+    record = {
+      ...base,
+      accountAnchor: learnedAnchor,
+      lastPlanReadAttemptAt: attempted ? nowIso : base.lastPlanReadAttemptAt,
+    };
+  }
   return {
     outcome: ReconcileOutcome.NEEDS_USER,
-    record: attempted ? { ...base, lastPlanReadAttemptAt: nowIso } : prior,
+    record,
     changes,
-    persist: attempted || migration.migrated,
+    // An anchor learned is worth a write on its own: without it the not-attempted path would compute
+    // the identity and then discard it unwritten.
+    persist: attempted || anchorLearned || migration.migrated,
   };
 }
 

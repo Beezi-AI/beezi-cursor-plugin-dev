@@ -32,6 +32,8 @@ import { readCursorAccount as _readCursorAccount } from './cursor-account.mjs';
 import {
   syncAccountIfNeeded as _syncAccountIfNeeded,
   buildCheckInScope as _buildCheckInScope,
+  checkInPayloadFromRecord,
+  identifiesAnAccount,
   CheckInOutcome,
   CheckInVia,
 } from './account-checkin.mjs';
@@ -200,9 +202,11 @@ const PLAN_RECHECK_RESERVE_MS = 2000;
 // timeout, which is what makes the await below PROVABLY bounded — the hook cannot start a request
 // it does not have the budget to finish, and the request cannot outlive its own abort.
 //
-// NOT forced. The fingerprint gate plus the seven-day heartbeat is the intended steady state on a
-// hot path: an unchanged account reads one small state file and sends nothing. Forcing here would
-// POST on every single session start, which is the one thing a per-session path must not do.
+// NOT forced by default. The fingerprint gate plus the daily heartbeat is the intended steady state
+// on a hot path: an unchanged account reads one small state file and sends nothing. Forcing here
+// unconditionally would POST on every single session start, which is the one thing a per-session
+// path must not do. It is forced only on evidence: a due pendingCheckIn marker, or a whoami that
+// says the server holds no account row for us (see the check-in block in runSessionStart).
 export const CHECKIN_TIMEOUT_MS = 1500;
 const CHECKIN_RESERVE_MS = 2500;
 
@@ -529,20 +533,39 @@ export async function runSessionStart(input, deps = {}) {
         }
       } catch { pending = false; marker = null; }
 
+      // Has the server LOST this machine's account row? The session upsert only links an existing
+      // `cli_agent_accounts` row and never creates one, so a lost row silently maps every session to
+      // no subscription — and the hash gate cannot notice, because nothing local changed. A newer
+      // server says so in the whoami this hook ALREADY made (`who` is the revocation probe above),
+      // so reading it costs no request. Strictly `=== false`: absent is an older server that cannot
+      // say and `true` is the normal case, and both keep today's unforced behaviour.
+      //
+      // Only with something to heal WITH. The anchor test is the very predicate account-checkin
+      // uses for NOTHING_TO_REPORT, so the two can never disagree: forcing a body that identifies
+      // nobody would change nothing server-side, since no row can be created without one.
+      let serverLostAccount = false;
       try {
-        // FORCED only when a marker is due. A marker means an earlier run owed a send that never
-        // left the machine, so the hash gate is not what stands between the server and the truth —
-        // and on an ordinary start that gate plus the seven-day heartbeat is exactly the steady
-        // state this hot path wants. One call either way: draining is a reason to force the
+        serverLostAccount = who != null
+          && who.cliAgentAccountKnown === false
+          && identifiesAnAccount(checkInPayloadFromRecord(config));
+      } catch { serverLostAccount = false; }
+
+      try {
+        // FORCED only on evidence: a due marker, or the server saying it has no row. A marker means
+        // an earlier run owed a send that never left the machine; a lost row means the send that
+        // DID land has been undone. Either way the hash gate is not what stands between the server
+        // and the truth — and on an ordinary start that gate plus the daily heartbeat is exactly the
+        // steady state this hot path wants. One call either way: each is a reason to force the
         // check-in that was going to happen anyway, never a second request.
         const result = await syncAccount(
           token,
-          { force: pending, via: CheckInVia.SESSION_START },
+          { force: pending || serverLostAccount, via: CheckInVia.SESSION_START },
           { record: config, who, tracking: null, fetchImpl, timeoutMs: CHECKIN_TIMEOUT_MS },
         );
         // Cleared on SENT and on nothing else. Every other answer — offline, a 400, a fence that
         // moved — is a send still owed, and the marker is what remembers that; the stop hook's own
-        // backoff keeps an offline machine from retrying on every turn.
+        // backoff keeps an offline machine from retrying on every turn. Keyed on the MARKER alone:
+        // a self-heal force with no marker has nothing to clear.
         if (marker != null && result != null && result.outcome === CheckInOutcome.SENT) {
           clearPendingCheckIn(marker.file, marker.scope, {});
         }

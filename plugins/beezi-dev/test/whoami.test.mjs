@@ -240,3 +240,27 @@ test('whoami — 403 keeps its legacy shape and is additionally flagged forbidde
   assert.equal(unauthorized.valid, false);
   assert.equal(unauthorized.forbidden, undefined);
 });
+
+// ── `cliAgentAccountKnown`: does the server hold this vendor's account row for the caller? ──────
+//
+// Optional and tri-state. `false` is the one actionable answer — the server has lost (or never had)
+// the `cli_agent_accounts` row, so session start forces a check-in to recreate it. ABSENT means an
+// older server that cannot say, and must read exactly like today's shape, so the key is only
+// present when the server sent a real boolean.
+test('whoami — cliAgentAccountKnown is carried when the server sends a boolean', async () => {
+  for (const known of [true, false]) {
+    const res = await whoami('tok', deps(async () => ({
+      ok: true,
+      json: async () => ({ email: 'dev@acme.com', cliAgentAccountKnown: known }),
+    })));
+    assert.equal(res.valid, true);
+    assert.equal(res.cliAgentAccountKnown, known);
+  }
+});
+
+test('whoami — an absent or non-boolean cliAgentAccountKnown is unknown, not false', async () => {
+  for (const body of [{}, { cliAgentAccountKnown: null }, { cliAgentAccountKnown: 'false' }, { cliAgentAccountKnown: 0 }]) {
+    const res = await whoami('tok', deps(async () => ({ ok: true, json: async () => body })));
+    assert.equal('cliAgentAccountKnown' in res, false, `${JSON.stringify(body)} must not become a verdict`);
+  }
+});

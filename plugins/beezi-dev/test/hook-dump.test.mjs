@@ -10,6 +10,8 @@ import {
   captureFile,
   captureHookStdin,
   dumpHookPayload,
+  REDACTED,
+  redactPayloadBytes,
 } from '../lib/hook-dump.mjs';
 import { readHookInput } from '../lib/hook-input-cursor.mjs';
 
@@ -239,4 +241,108 @@ test('captureHookStdin reports an unreadable stdin rather than throwing', (t) =>
   assert.deepEqual(stdin, { raw: null, replay: null });
   // And the caller's `?? 0` still resolves, so the hook falls back to reading fd 0.
   assert.doesNotThrow(() => dumpHookPayload(stdin?.raw, []));
+});
+
+// ── redaction: the one payload capture must not record verbatim ──────────────────────────────────
+//
+// `beforeSubmitPrompt` hands its hook the user's prompt text and attachments. Capture's whole point
+// is raw bytes, but those bytes are what the person typed to the model — and the capture file and
+// its replay spill both outlive the run. So scripts/prompt-submit.mjs asks for those two fields to
+// be replaced before anything is written. The SHAPE survives (the keys, the attachment count, every
+// other field) because the shape is what a capture session is for.
+
+const PROMPT_FIELDS = ['prompt', 'attachments'];
+const SECRET = 'my secret prompt about project zebra';
+const PROMPT_PAYLOAD = {
+  session_id: 'c9',
+  generation_id: 'gen-9',
+  hook_event_name: 'beforeSubmitPrompt',
+  prompt: SECRET,
+  attachments: [{ type: 'file', file_path: '/home/me/zebra-notes.md' }, { type: 'rule', file_path: '/r' }],
+  workspace_roots: ['/repo'],
+};
+
+test('redaction replaces the named fields, keeps their keys, and keeps everything else', () => {
+  const out = redactPayloadBytes(Buffer.from(JSON.stringify(PROMPT_PAYLOAD)), PROMPT_FIELDS);
+  const text = out.toString('utf-8');
+  assert.equal(text.includes('zebra'), false, 'prompt or attachment text survived redaction');
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.prompt, REDACTED);
+  // Same length, so "how many attachments does a real payload carry" is still answerable.
+  assert.deepEqual(parsed.attachments, [REDACTED, REDACTED]);
+  assert.equal(parsed.session_id, 'c9');
+  assert.equal(parsed.generation_id, 'gen-9');
+  assert.deepEqual(parsed.workspace_roots, ['/repo']);
+  // A field that is absent stays absent: redaction never invents a key.
+  const bare = JSON.parse(redactPayloadBytes(Buffer.from('{"session_id":"c1"}'), PROMPT_FIELDS).toString('utf-8'));
+  assert.deepEqual(bare, { session_id: 'c1' });
+});
+
+test('redaction keeps a UTF-8 BOM, so the capture still answers the BOM question', () => {
+  const bom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify(PROMPT_PAYLOAD))]);
+  const out = redactPayloadBytes(bom, PROMPT_FIELDS);
+  assert.equal(out.subarray(0, 3).toString('hex'), 'efbbbf');
+  assert.equal(out.toString('utf-8').includes('zebra'), false);
+});
+
+test('redaction reads every encoding the hook decoder reads, and writes the same encoding back', (t) => {
+  // A payload the decoder accepts but the redactor refused would lose its prompt line whenever
+  // capture is on — so both UTF-16 forms Windows PowerShell has been seen producing are covered.
+  const home = tmpHome(t);
+  const json = JSON.stringify(PROMPT_PAYLOAD);
+  const le = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, 'utf16le')]);
+  const be = Buffer.from(le).swap16();
+  for (const [name, buf] of [['utf16le', le], ['utf16be', be]]) {
+    const out = redactPayloadBytes(buf, PROMPT_FIELDS);
+    assert.ok(Buffer.isBuffer(out), `${name} was refused`);
+    assert.equal(out.subarray(0, 2).toString('hex'), buf.subarray(0, 2).toString('hex'), `${name} lost its mark`);
+    const file = path.join(home, `${name}.bin`);
+    fs.writeFileSync(file, out);
+    const parsed = readHookInput(file);
+    assert.equal(parsed.generation_id, 'gen-9', `${name} no longer decodes`);
+    assert.equal(parsed.prompt, REDACTED);
+    assert.equal(JSON.stringify(parsed).includes('zebra'), false);
+  }
+});
+
+test('a payload redaction cannot read is refused rather than recorded', () => {
+  // Not parseable means not redactable, and an unredacted prompt is the one thing this must not
+  // write. The hook's own decoder rejects the same bytes, so nothing the hook could use is lost.
+  for (const raw of ['not json', '{"prompt":', '["a prompt in an array"]', '"a bare string"']) {
+    assert.equal(redactPayloadBytes(Buffer.from(raw), PROMPT_FIELDS), null, raw);
+  }
+});
+
+test('captureHookStdin redacts both the dumped bytes and the replay spill', (t) => {
+  const home = tmpHome(t);
+  const source = path.join(home, 'prompt-fixture.json');
+  fs.writeFileSync(source, JSON.stringify(PROMPT_PAYLOAD));
+
+  const stdin = captureHookStdin(source, { redact: PROMPT_FIELDS });
+  assert.equal(stdin.raw.toString('utf-8').includes('zebra'), false);
+  // The replay is a plain-text file in the user's home that a killed hook leaves behind, so it must
+  // not hold the prompt either — and it must still be the payload the hook parses.
+  assert.equal(fs.readFileSync(stdin.replay, 'utf-8').includes('zebra'), false);
+  const parsed = readHookInput(stdin.replay);
+  assert.equal(parsed.session_id, 'c9');
+  assert.equal(parsed.generation_id, 'gen-9');
+
+  dumpHookPayload(stdin.raw, ['--via', 'plugin-hooks']);
+  const line = fs.readFileSync(captureFile(), 'utf-8');
+  assert.equal(line.includes('zebra'), false);
+  assert.equal(JSON.parse(records()[0].raw).prompt, REDACTED);
+});
+
+test('captureHookStdin with redaction on an unreadable payload records no bytes and spills nothing', (t) => {
+  const home = tmpHome(t);
+  const source = path.join(home, 'garbage.bin');
+  fs.writeFileSync(source, `prompt: ${SECRET}`);
+  const stdin = captureHookStdin(source, { redact: PROMPT_FIELDS });
+  assert.deepEqual(stdin, { raw: null, replay: null });
+  assert.equal(fs.existsSync(path.join(captureDir(home), 'stdin')), false);
+});
+
+test('captureHookStdin with redaction still reads nothing when capture is off', (t) => {
+  tmpHome(t, { capturing: false });
+  assert.equal(captureHookStdin(0, { redact: PROMPT_FIELDS }), null);
 });

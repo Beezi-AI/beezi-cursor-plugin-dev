@@ -9,7 +9,7 @@ import { lazyRecordIssue } from './diagnostics-sink.mjs';
 
 // Plan §4 B3 — the one production entry point for the account check-in.
 //
-// `lib/account-sync.mjs` owns the protocol: the payload allowlist, the fingerprint, the seven-day
+// `lib/account-sync.mjs` owns the protocol: the payload allowlist, the fingerprint, the daily
 // heartbeat, the auth fence and the plan writeback. It deliberately owns NO wiring — it builds no
 // URL, reads no file and resolves no token — which is why, until this module existed, it had zero
 // callers and the whole subsystem was inert. Everything a call site needs in order to reach it
@@ -174,7 +174,7 @@ export function identifiesAnAccount(payload) {
 //   token    — a bearer token the caller already holds, or null to resolve one. A caller inside a
 //              hook has one; `scripts/billing-capture.mjs` does not and passes null.
 //   options  — `{ force, via }`. `force` skips the protocol's due gate ONLY (plan §2 C7); it is for
-//              a caller that already knows something moved and for which waiting out a seven-day
+//              a caller that already knows something moved and for which waiting out the daily
 //              heartbeat would leave the server holding the wrong subscription. `via` is local.
 //   deps     — injection seams; every one defaults to the real thing.
 //

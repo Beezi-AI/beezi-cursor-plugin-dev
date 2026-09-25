@@ -40,8 +40,10 @@ Report the output verbatim, then act on what it says.
   builds read no other registry, and it is the one that works without `node` on PATH, so anything
   other than `✓ … are installed` here can mean CLI sessions report nothing. It needs the install
   command — including when the bundled line above says the IDE is covered.
-- On Windows, `agent` launched from **Git Bash** runs no hooks at all; launch it from PowerShell or
-  cmd. Neither registry can fix that.
+- On Windows, `agent` launched from **Git Bash** runs no hooks at all, and the CLI is expected to
+  refuse every prompt with "Hook blocked" (the plugin's `beforeSubmitPrompt` turn-start hook fails
+  before it starts). If the user reports "Hook blocked" in the CLI, tell them to launch `agent` from
+  a PowerShell or cmd window opened directly. Neither registry can fix that.
 
 So `⚠ Beezi: analytics hooks are NOT installed` printed underneath a firing bundled registry is a
 real problem to fix, not a contradiction. Run the install. Both registries are meant to stay

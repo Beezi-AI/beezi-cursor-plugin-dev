@@ -201,11 +201,27 @@ function readVscdbCandidate(deps) {
   return { rawPlan: raw, source: AccountSource.STATE_VSCDB, email, accountId, subscriptionId, status };
 }
 
-// TODO(P0): unverified — see lib/hook-dump.mjs
-// The CLI's own config; key spelling is a guess, so several are accepted.
+// TODO(P0): the PLAN key spellings are still unverified — see lib/hook-dump.mjs. The IDENTITY is
+// not: VERIFIED 2026-09-24 on a real CLI machine, `~/.cursor/cli-config.json` nests it as
+// `authInfo.email` and `authInfo.authId`, both equal to that machine's state.vscdb anchor, and the
+// file carries NO plan key at all. So a CLI-only machine's config is an identity source first and
+// a plan source only if a future CLI starts writing one.
 const CLI_CONFIG_FILE = 'cli-config.json';
 const CLI_PLAN_FIELDS = ['stripeMembershipType', 'membershipType', 'plan', 'subscription', 'tier'];
+// The pre-2026-09-24 guesses, kept as a FALLBACK for the email only. None of them was ever observed,
+// and there is deliberately no top-level id spelling beside them: an id nobody has seen in the wild
+// is an id we would be guessing the meaning of.
 const CLI_EMAIL_FIELDS = ['email', 'cachedEmail', 'userEmail'];
+// `authInfo` sits beside the CLI's credentials. These two names are the ENTIRE read surface of that
+// object — picked one by one, never spread, never iterated — so a token stored next to them has no
+// path into the candidate, billing.json or the wire.
+const CLI_AUTH_INFO = 'authInfo';
+const CLI_AUTH_EMAIL = 'email';
+const CLI_AUTH_ID = 'authId';
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+}
 
 function readCliCandidate(deps) {
   let file = deps.cliConfigFile;
@@ -225,25 +241,33 @@ function readCliCandidate(deps) {
 
   let raw = null;
   for (const field of CLI_PLAN_FIELDS) {
-    const value = parsed[field];
-    if (typeof value === 'string' && value.trim() !== '') {
-      raw = value.trim();
-      break;
-    }
+    raw = nonEmptyString(parsed[field]);
+    if (raw !== null) break;
   }
-  if (raw === null) return null;
 
-  let email = null;
-  for (const field of CLI_EMAIL_FIELDS) {
-    if (typeof parsed[field] === 'string' && parsed[field].trim() !== '') {
-      email = parsed[field].trim();
-      break;
+  const authInfo = parsed[CLI_AUTH_INFO] !== null && typeof parsed[CLI_AUTH_INFO] === 'object'
+    ? parsed[CLI_AUTH_INFO]
+    : {};
+  // The same verbatim rule as the vscdb ids (see identifierOrNull): trimmed, never split, never
+  // capped. This is the per-seat signed-in id, not a membership/owner id, which is why it may be an
+  // account id at all.
+  const accountId = nonEmptyString(authInfo[CLI_AUTH_ID]);
+  let email = nonEmptyString(authInfo[CLI_AUTH_EMAIL]);
+  if (email === null) {
+    for (const field of CLI_EMAIL_FIELDS) {
+      email = nonEmptyString(parsed[field]);
+      if (email !== null) break;
     }
   }
-  // The CLI config has never been observed to carry an identity of any kind, and the three
-  // identity fields are explicitly null rather than absent so a caller reading them never has to
-  // distinguish "this source cannot answer" from "this source was not consulted".
-  return { rawPlan: raw, source: AccountSource.CLI_CONFIG, email, accountId: null, subscriptionId: null, status: null };
+
+  // No plan AND no identity is no answer. An identity with no plan IS one: on a CLI-only machine it
+  // is the only account anchor there is, and returning null here was why such a machine checked in
+  // nothing and every session report went out with no `account_uuid`. `rawPlan: null` is how the
+  // caller tells an identity-only candidate from a plan-bearing one.
+  if (raw === null && email === null && accountId === null) return null;
+  // The CLI keeps no Stripe subscription id or status; both stay explicitly null so a caller never
+  // has to distinguish "this source cannot answer" from "this source was not consulted".
+  return { rawPlan: raw, source: AccountSource.CLI_CONFIG, email, accountId, subscriptionId: null, status: null };
 }
 
 function selfReportCandidate(deps) {
@@ -253,13 +277,44 @@ function selfReportCandidate(deps) {
   return { rawPlan: raw.trim(), source: AccountSource.SELF_REPORT, email: null, accountId: null, subscriptionId: null, status: null };
 }
 
+// Does this candidate say who the account is? A source label alone does not.
+function identifies(candidate) {
+  return candidate != null && (candidate.email != null || candidate.accountId != null);
+}
+
+// The winner with the cli-config identity filled in — ONLY when the winner identifies nobody.
+//
+// A winner that knows even half an identity keeps exactly what it has. state.vscdb and the CLI can
+// be signed into DIFFERENT accounts on one machine, and topping a vscdb email up with the CLI's id
+// would stitch two accounts into one anchor: the reconciler would then compare, and the server
+// would upsert, a seat that exists nowhere. A self-report is the case this exists for — the user
+// typed a tier, which says nothing about who they are, and on a CLI-only machine cli-config is the
+// only thing that does.
+//
+// Only `email` and `accountId` move. The winner's `source` is kept, because `selfReported` and the
+// staleness exemption key off it: an identity donor must not be able to relabel a typed plan as a
+// host read. `subscriptionId` and `status` stay the winner's — the CLI has neither.
+function withDonorIdentity(winner, donor) {
+  if (winner == null || donor == null || identifies(winner) || winner === donor) return winner;
+  return { ...winner, email: donor.email, accountId: donor.accountId };
+}
+
 // { plan, rawPlan, source, email, accountId, subscriptionId, status } for the highest-authority
 // source that produced a value, or null when no source did. `plan` is always one of CURSOR_PLANS;
 // `rawPlan` keeps the original string even when it did not map, so an unrecognized tier is
-// discoverable server-side instead of vanishing. The three identity fields are always present and
-// are null for every source but state.vscdb, which is the only one that holds an identity at all.
+// discoverable server-side instead of vanishing. The identity fields are always present: state.vscdb
+// supplies all three, cli-config supplies `email` and `accountId` (from `authInfo`), and a
+// self-report supplies none of its own.
+//
+// A cli-config that carries an identity but no plan is an IDENTITY-ONLY candidate (`rawPlan:
+// null`). It never wins the plan — an unmapped raw string from any source still outranks it, since
+// that string is what the server's discovery loop needs — but it donates its identity to a winner
+// that has none, and when nothing else answered at all it is returned as `plan: 'unknown'` so a
+// CLI-only machine still has an account anchor.
 export function readCursorAccount(deps = {}) {
   const candidates = [];
+  let donor = null;
+  let winner = null;
   for (const read of [readVscdbCandidate, readCliCandidate, selfReportCandidate]) {
     let candidate = null;
     try {
@@ -270,10 +325,14 @@ export function readCursorAccount(deps = {}) {
     if (!candidate) continue;
     const plan = normalizeCursorPlan(candidate.rawPlan);
     const resolved = { ...candidate, plan };
-    if (plan !== 'unknown') return resolved;
+    if (resolved.source === AccountSource.CLI_CONFIG && identifies(resolved)) donor = resolved;
+    if (candidate.rawPlan == null) continue; // identity-only: a donor, never a plan answer
+    if (plan !== 'unknown') { winner = resolved; break; }
     candidates.push(resolved);
   }
   // Nothing mapped: surface the highest-authority raw string we did see, so the unmapped value is
-  // still reported rather than silently replaced by a lower-authority guess.
-  return candidates.length > 0 ? candidates[0] : null;
+  // still reported rather than silently replaced by a lower-authority guess. With no raw string at
+  // all, the identity-only candidate is still worth returning — it is the whole anchor.
+  if (winner == null) winner = candidates.length > 0 ? candidates[0] : donor;
+  return withDonorIdentity(winner, donor);
 }

@@ -108,7 +108,17 @@ const SESSION_LIFECYCLE_EVENTS = new Set(['start', 'session_start', 'end', 'sess
 //
 // It is still not ACTIVITY: a window containing nothing but turn ends describes no work of its own,
 // which is why the two sets below are separate rather than one.
-const TURN_END_EVENTS = new Set(['stop']);
+//
+// TURN STARTS sit in the same set, for the same two reasons in the other direction. The `prompt`
+// line scripts/prompt-submit.mjs writes on `beforeSubmitPrompt` is the instant the human pressed
+// Send; the seconds from there to the first tool call or the turn's `stop` are the agent's, and a
+// CLI turn that calls no tool has NOTHING else in the sidecar before its `gen` + `stop` pair — so
+// without the prompt anchoring the clock that whole turn bills as a point. But a prompt is not work
+// either: a window holding only prompt lines is a turn the user aborted before the agent did
+// anything, and letting it justify a segment would bill a keypress. The three aliases are the
+// spellings the reader has always recognised (KNOWN_EVENTS, lib/session-name-cursor.mjs), kept
+// together so one of them cannot drift back into ACTIVITY on its own.
+const TURN_END_EVENTS = new Set(['stop', 'prompt', 'user', 'user_message', 'user_prompt']);
 
 // The timing-anchor allowlist: every kind this reader understands EXCEPT the session lifecycle.
 //
@@ -125,7 +135,8 @@ export const TIMING_ANCHOR_EVENTS = new Set(
 );
 
 // What counts as WORK when deciding whether a segment is worth emitting: the anchors minus the turn
-// ends. A `stop` + `session_end` window anchors a span and still reports nothing billable.
+// boundaries (ends AND starts). A `stop` + `session_end` window anchors a span and still reports
+// nothing billable, and so does a window of bare `prompt` lines.
 export const ACTIVITY_EVENTS = new Set(
   [...TIMING_ANCHOR_EVENTS].filter((ev) => !TURN_END_EVENTS.has(ev)),
 );
@@ -142,6 +153,12 @@ const UNKNOWN_MODEL = 'unknown';
 // straddled, so a short tail is enough and an unbounded list would grow for the life of a
 // conversation. Oldest entries fall off the front.
 export const MAX_CARRIED_GENERATIONS = 200;
+
+// How many consumed-line identities a window hands to the next one (see consumedKeysOf). A late
+// copy from the other hook registry lands milliseconds after its original, so only the lines nearest
+// the boundary can still have a copy outstanding; a short tail is enough, and like the generation
+// carry above it is persisted per session, so it is bounded and the oldest entries fall off the front.
+export const MAX_CARRIED_EVENT_KEYS = 256;
 
 // Every `usageData` key that prices one model, matched case-insensitively — a case difference
 // between the hook payload's spelling and Cursor's own would otherwise move an entire model's spend
@@ -463,6 +480,83 @@ export function dedupeEvents(events, { windowMs = DEDUPE_WINDOW_MS } = {}) {
     kept.push(event);
   }
   return { events: kept, dropped };
+}
+
+// ---------------------------------------------------------------------------
+// Duplicates across a checkpoint boundary
+// ---------------------------------------------------------------------------
+//
+// dedupeEvents collapses the registries' copies only WITHIN one window. When a checkpoint falls
+// between the two copies of one event, the late copy lands in the next window still carrying the
+// ORIGINAL timestamp — for a `prompt` line, the gate's start — and as a timing anchor it stretched the
+// new window's first active stretch back to that instant. Codex review, MAJOR: 10,000 ms billed, then
+// 20,995 ms where 1,000 ms was right.
+//
+// The copy is recognised by IDENTITY, and only by identity. The previous fix dropped every anchor
+// whose timestamp fell inside wall clock earlier checkpoints had covered, and Codex review, MAJOR,
+// again: coverage legitimately reaches PAST what the sidecar held at a checkpoint — the CLI subagent
+// enrichment dates a worker's end from its chat store's last write, and the checkpoint claims the
+// worker's residual — so a genuinely new prompt landing in that stretch was thrown away as a copy,
+// and the gap it anchored with it (1 s billed where 15 s of uncovered work had happened). Time says
+// nothing about whether a line is a copy; its identity does.
+//
+// So each window hands the next one the identities of the identified lines it consumed, and the next
+// window drops a line whose identity is among them, before anything reads the window.
+//
+// WHAT the identity is: `contentKey` — the whole line bar its timestamp — and only for a line with a
+// non-empty `eid`. That is exactly dedupeEvents' own rule for an identified line ("a duplicate
+// wherever in the window it turns up"), extended across the boundary, so a line is dropped here only
+// when it would have been dropped had the checkpoint not split the two copies. The bare `eid` is NOT
+// enough, because it is not unique per line: one edit call stamps every file it touched with the same
+// id, the `mcp_server` side channel shares the tool-call id with the `tool` line of the same call, and
+// an edit and the tool line of one call can share `tool_use_id`. A set of bare ids would delete the
+// second half of any such pair that straddles a boundary. A line with no `eid` (`shell`, `stop`,
+// `session_end`) is never dropped this way: two identical ones a window apart can be two real events,
+// and nothing proves otherwise.
+//
+// `gen` lines are neither carried nor dropped. Their `eid` is the generation id (lib/sidecar-events.mjs
+// sets it to `gen_id`), which names a generation rather than a line: one generation writes a `gen`
+// line on every postToolUse envelope and one on its stop, and those lines legitimately continue into
+// the next window, where their timestamps anchor real time and the turn-end line's token counts are
+// merged. A request is already counted once across windows by the generation carry
+// (`countedGenerations`). The residual this leaves is named: a late COPY of a `gen` line can still
+// anchor backwards, and the host's coverage subtraction (lib/checkpoint.mjs, mainSegmentBilling)
+// keeps that from re-billing any covered second — it can only bridge an uncovered gap, which is time
+// the unsplit session bills too.
+//
+// A carried key from an older release that digests differently simply never matches, which is the
+// safe direction: nothing is dropped that is not proven a copy.
+const isCarriedLine = (event) => event != null && typeof event === 'object'
+  && typeof event.eid === 'string' && event.eid !== ''
+  && !(typeof event.ev === 'string' && GEN_EVENTS.has(event.ev));
+
+// The window with every proven cross-boundary copy removed. `carried` is the host's persisted list;
+// absent, or not an array (a state file written before the carry existed), drops nothing.
+function dropCarriedDuplicates(window, carried) {
+  if (!Array.isArray(carried) || carried.length === 0) return { events: window, dropped: 0 };
+  const known = new Set(carried.filter((key) => typeof key === 'string'));
+  if (known.size === 0) return { events: window, dropped: 0 };
+  const kept = window.filter((event) => !(isCarriedLine(event) && known.has(contentKey(event))));
+  return { events: kept, dropped: window.length - kept.length };
+}
+
+// The carry for the next window: the prior one, then this window's identified non-gen lines in
+// stream order, de-duplicated and bounded to the newest MAX_CARRIED_EVENT_KEYS — the same shape as
+// the generation carry. The host commits it WITH the cursor (lib/checkpoint.mjs), because it names
+// lines the cursor has moved past.
+function consumedKeysOf(window, carried) {
+  const out = [];
+  const seen = new Set();
+  const push = (key) => {
+    if (typeof key !== 'string' || seen.has(key)) return;
+    seen.add(key);
+    out.push(key);
+  };
+  if (Array.isArray(carried)) carried.forEach(push);
+  for (const event of window) {
+    if (isCarriedLine(event)) push(contentKey(event));
+  }
+  return out.length > MAX_CARRIED_EVENT_KEYS ? out.slice(-MAX_CARRIED_EVENT_KEYS) : out;
 }
 
 // The priced increment for every model in the window, taken ONCE against the reported baseline.
@@ -1022,7 +1116,11 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
       }
     }
   }
-  const { events: window, dropped: duplicateEvents } = dedupeEvents(rawWindow);
+  const { events: deduped, dropped: duplicateEvents } = dedupeEvents(rawWindow);
+  // Then the copies whose originals an EARLIER window consumed (see dropCarriedDuplicates). Before
+  // anything reads the window — the clock, operations, code changes and the run split alike — so a
+  // copy counts nowhere. `from`/`to` and `absIndexOf` still name the raw lines this call read.
+  const { events: window, dropped: carriedDuplicateEvents } = dropCarriedDuplicates(deduped, resolvers.consumedEventKeys);
 
   const requestsByModel = new Map();
   // model id -> every variant spelling seen for it in this window, so the cost split can find the
@@ -1361,6 +1459,10 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
     // MUST be persisted by the host and handed back as `resolvers.countedGenerations` next window,
     // or a generation whose lines straddle the boundary is billed as two requests.
     countedGenerations,
+    // MUST be persisted by the host WITH the cursor and handed back as `resolvers.consumedEventKeys`
+    // next window, or a late registry copy that crosses the boundary anchors that window back over
+    // time already billed (see dropCarriedDuplicates). Bounded at MAX_CARRIED_EVENT_KEYS.
+    consumedEventKeys: consumedKeysOf(window, resolvers.consumedEventKeys),
     hasReportableWork: reportableWork(entries, operations, code_changes, activeIntervals, activityCount),
     // Derived from timing anchors only; `count` is how many of them anchored the clock,
     // and the two bounds are the same instants `started_at`/`ended_at` carry. Session markers are
@@ -1407,6 +1509,9 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
       // roughly one duplicate per event.
       windowEvents: window.length,
       duplicateEvents,
+      // Late copies dropped because an EARLIER window consumed their originals (dropCarriedDuplicates).
+      // Counted apart from `duplicateEvents`, which is the within-window collapse.
+      carriedDuplicateEvents,
       recognizedEvents: recognized,
       unrecognizedEvents: [...unrecognized],
       // A window full of events none of which we understand is a writer/reader schema mismatch. It

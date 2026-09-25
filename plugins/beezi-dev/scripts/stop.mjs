@@ -81,8 +81,10 @@ runHook({
     } catch { /* the user's checkpoint is not forfeit to an account read */ }
 
     // Turn-end: emit the whole-session activity timeline alongside the segment checkpoint. The
-    // timeline rides on `stop` rather than on `afterAgentResponse` / `afterAgentThought`, which are
-    // staff-acknowledged not to fire in the `cursor-agent` CLI at all.
+    // timeline rides on `stop` rather than on `afterAgentResponse` / `afterAgentThought`: staff said
+    // those never fire in the `cursor-agent` CLI, and although receptron/mulmoterminal#2064 saw them
+    // fire in the interactive CLI on 2026.09.10, headless `agent -p` still does not. `stop` fires
+    // in both.
     //
     // The REMAINING budget, because this is the hook that flushes the queue: a backlog against a
     // stalled API costs one per-request timeout per report, and the appends above have already spent

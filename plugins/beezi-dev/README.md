@@ -55,7 +55,7 @@ loads three components from the manifest at `.cursor-plugin/plugin.json`:
 | Component | Path | What Cursor does with it |
 | --- | --- | --- |
 | skills | `skills/*/SKILL.md` | every user-invoked entry point (sign-in, status, tracking, history, diagnostics) |
-| hooks | `hooks/hooks.json` | the ten analytics hooks, addressed by `${CURSOR_PLUGIN_ROOT}` |
+| hooks | `hooks/hooks.json` | the eleven analytics hooks, addressed by `${CURSOR_PLUGIN_ROOT}` |
 | MCP | `mcp.json` | the stdio bridge to the Beezi MCP server |
 
 Cursor substitutes `${CURSOR_PLUGIN_ROOT}` in an MCP server's `command`, `args`, `env` and `cwd`,
@@ -302,9 +302,9 @@ this avoids.
 
 ## Hooks
 
-Ten events, in `BEEZI_HOOKS` (`lib/hooks-install.mjs`) and in the bundled `hooks/hooks.json` — one
-list, asserted equal by `test/plugin-manifest.test.mjs`, because a registry that covers nine of the
-ten fails silently on whichever one it dropped.
+Eleven events, in `BEEZI_HOOKS` (`lib/hooks-install.mjs`) and in the bundled `hooks/hooks.json` — one
+list, asserted equal by `test/plugin-manifest.test.mjs`, because a registry that covers ten of the
+eleven fails silently on whichever one it dropped.
 
 | Cursor event | script | job | fires under `cursor-agent`? |
 | --- | --- | --- | --- |
@@ -318,6 +318,7 @@ ten fails silently on whichever one it dropped.
 | `beforeMCPExecution` | `mcp-before.mjs` | **permission hook.** one non-countable `mcp_server` identity line | unconfirmed |
 | `subagentStart` | `subagent-start.mjs` | **permission hook.** opens a subagent span | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
 | `subagentStop` | `subagent-stop.mjs` | closes one — carries no `subagent_id`, so the pairing is a read-time heuristic | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
+| `beforeSubmitPrompt` | `prompt-submit.mjs` | **gate hook.** answers `{"continue":true}` first, then one text-free `prompt` line: the turn's START for the timeline | interactive CLI yes (receptron/mulmoterminal#2064, 2026.09.10); `-p` no |
 
 The last column is about the EVENT, not about this plugin's registry: under older `cursor-agent`
 builds (Jun–Aug 2026) a plugin's bundled hooks never run, so every row there is carried by the
@@ -345,14 +346,25 @@ a handler on the completion side would count every MCP call twice — once in `o
 `est_tokens`. `beforeMCPExecution` is registered instead because it is the only event that sees the
 server's `url`/`command`, and its line is a side channel that carries identity and nothing countable.
 
-**Two of the ten are permission hooks.** Cursor reads the stdout of `beforeMCPExecution` and
+**Two of the eleven are permission hooks.** Cursor reads the stdout of `beforeMCPExecution` and
 `subagentStart` as a decision and obeys it, and exit code 2 blocks the user's action outright. Those
 two scripts write nothing to stdout on any path — not on a valid payload, not on a malformed one, not
 on an internal throw — and exit 0 always. `test/plugin-manifest.test.mjs` greps both for
 `process.stdout`, `console.log` and any non-zero `process.exit`, because the branch that would ship a
 stray byte is the one no test exercises.
 
-**Adding an eleventh event is the one edit here that can cost the other ten.** An event Cursor does
+**One is a gate hook.** `beforeSubmitPrompt` is synchronous: Cursor holds the user's Send until it
+answers `{"continue": true|false, "user_message"?}`, and exit 2 blocks the prompt. `prompt-submit.mjs`
+writes exactly `{"continue":true}` with a synchronous write before it reads stdin or loads anything,
+never writes again, never sets `user_message`, and exits 0 on every path; its deadline is 3s rather
+than 5s or 10s because it sits in front of every Send. What it records is one `{"ev":"prompt"}` line
+with the generation id and nothing else — no prompt text, no attachments. It exists because it is the
+only event that says when a turn STARTED: a CLI turn that calls no tool otherwise leaves only
+`gen` + `stop` in the sidecar, and the timeline drew such a session as almost nothing but "User
+input". With capture on, the prompt and attachments are replaced before the payload is dumped or
+spilled (`redactPayloadBytes` in `lib/hook-dump.mjs`).
+
+**Adding a twelfth event is the one edit here that can cost the other eleven.** An event Cursor does
 not FIRE is harmless — the entry sits there and never runs, which is the expected state of the last
 four under `cursor-agent`. An event name Cursor does not RECOGNISE is a different matter: if its
 loader answers an unknown key by discarding the registry rather than the entry, every hook in the
@@ -465,13 +477,14 @@ The event sidecar is the source of truth:
 
 | `ev` | derived from | in practice written by | counted? |
 | --- | --- | --- | --- |
-| `gen` | `model_id`/`model` + `generation_id` on the common envelope | every hook that does not filter its lines — so all but `file-edit.mjs` and the two subagent scripts | one billable request per distinct `gen_id` |
+| `gen` | `model_id`/`model` + `generation_id` on the common envelope | every hook that does not filter its lines — so all but `file-edit.mjs`, `prompt-submit.mjs` and the two subagent scripts | one billable request per distinct `gen_id` |
 | `tool` | `tool_name` | `postToolUse`, `postToolUseFailure` | yes — `operations` and `est_tokens` |
 | `edit` | `edits[]` / `file_path` | `afterFileEdit` **only** | `code_changes`, when `ai-code-tracking.db` is absent |
 | `shell` | `command` | `afterShellExecution` | yes, as a shell operation |
 | `mcp_server` | `url` / `command`, via `lib/mcp-identity.mjs` | `beforeMCPExecution` | **no** — identity side channel |
 | `subagent_start` / `subagent_stop` | `hook_event_name`, then `subagent_id` / `subagent_type` | `subagentStart` / `subagentStop` | **no** — timeline spans only |
-| `stop` / `session_end` | nothing — written as bare markers | `stop.mjs` / `report.mjs` | turn and session boundaries for the timeline |
+| `stop` / `session_end` | nothing — written as bare markers | `stop.mjs` / `report.mjs` | `stop` ends a turn for the timeline and anchors billing; `session_end` is neither |
+| `prompt` | `generation_id` only, as `eid` — never the prompt text | `beforeSubmitPrompt` | **no** — a timing anchor, like `stop`; the turn's start for the timeline |
 
 `eventsFromHookPayload` is **field-driven, not event-driven**: it reads whatever keys a payload
 carries, so a renamed key degrades to "fewer events" rather than "no events". That is why the middle
@@ -851,7 +864,8 @@ are accepted and everything below is worth doing.
 Once through in the **IDE**, once through under **`cursor-agent`**, because they are different hosts
 with different registries, and which of them fires under the CLI depends on its build: the Jun–Aug
 2026 builds run only the launchers, 2026.09.18 runs both. On Windows, launch `agent` from PowerShell or cmd, not
-Git Bash, which runs no hooks at all. In one session each:
+Git Bash: under Git Bash no hook runs, and the `beforeSubmitPrompt` turn-start hook is expected to
+turn into "Hook blocked" on every prompt ([details](../../docs/host-boundaries.md#cursor-cli-on-windows-under-git-bash-runs-no-hooks)). In one session each:
 
 1. a plain question, no tools — a turn-end with no tool call at all;
 2. a read and a grep — `postToolUse` on two different built-in tools;
@@ -953,10 +967,11 @@ list at once.
    table below.) *If it never fires anywhere:* nothing is needed from the user and nothing changes. The user-scope registry is written at the first
    session and left in place regardless, so it carries every host either way; the recorded hook
    source is diagnostics only.
-2. **Whether Cursor's loader accepts all ten event names.** Six are known to be parsed. The four
-   added since — `afterFileEdit`, `beforeMCPExecution`, `subagentStart`, `subagentStop` — come from
-   documentation. An event Cursor does not FIRE costs nothing; an event name it does not RECOGNISE
-   costs the other nine if the loader discards the registry rather than the entry. **This is the
+2. **Whether Cursor's loader accepts all eleven event names.** Six are known to be parsed. The five
+   added since — `afterFileEdit`, `beforeMCPExecution`, `subagentStart`, `subagentStop`,
+   `beforeSubmitPrompt` — come from documentation (the last also from a third-party CLI
+   observation). An event Cursor does not FIRE costs nothing; an event name it does not RECOGNISE
+   costs the other ten if the loader discards the registry rather than the entry. **This is the
    first thing a capture session checks, and it is checked by counting the entries in Cursor's own
    hook listing, not by driving the plugin** — the failure mode is silence.
 3. **The per-event fields beyond the common envelope.** The envelope is settled — `session_id`,
@@ -1081,8 +1096,11 @@ each call site.
 
 - **Surfaces are IDE agent/chat and `cursor-agent` CLI only.** Cursor Tab and cloud/background
   agents are out of scope.
-- **`afterAgentResponse` / `afterAgentThought` do not fire in the CLI** (staff-acknowledged). The
-  session timeline rides on `stop` instead, so this costs nothing.
+- **`afterAgentResponse` / `afterAgentThought` / `beforeSubmitPrompt` in the CLI.** Staff once said
+  they do not fire there; receptron/mulmoterminal#2064 observed them firing in the interactive CLI on
+  2026.09.10, and not in headless `agent -p`. The session timeline ends turns on `stop` and starts
+  them on the `prompt` line `beforeSubmitPrompt` writes when there is one; a turn without one falls
+  back to the `stop` rule, so a build that does not fire it costs only the turn-start edge.
 - **The ingest routes are frozen** — `/sessions/report|errors|timeline`, `/repos/status` — because
   they are a contract with already-installed Claude Code and Codex plugins. Agent discrimination is
   the `X-Beezi-Agent` header. Only `/me/cursor/*` is per-agent.

@@ -502,6 +502,34 @@ const CAPABILITIES = Object.freeze({
 // the host reported no version, which is a different statement from "this path never looked".
 const versionField = (v) => (v === undefined ? {} : { cursor_version: v });
 
+// What the MAIN segment bills and claims: this window's active wall clock MINUS what earlier
+// checkpoints of this conversation already billed (`covered`, the persisted `coveredIntervals`).
+//
+// Codex review, MAJOR. On a dual-registry install one copy of an event can land before a checkpoint
+// and its late duplicate — carrying the ORIGINAL timestamp — after it. dedupeEvents collapses copies
+// only within one window, so the late one anchored the next window's first stretch back over time
+// the previous segment had already reported: 10,000 ms, then 20,995 ms where 1,000 ms was right.
+// Subagent segments have always billed "residual after covered"; this puts the main segment under
+// the same rule. The copy itself is removed by the delta, by identity (`consumedEventKeys`, carried
+// below); this subtraction is the second line of defence, for what identity cannot prove — a late
+// `gen` copy, a state file written before the carry existed — and it never removes an ANCHOR, only
+// already-billed seconds. (An earlier version dropped every anchor inside covered wall clock, and
+// Codex review, MAJOR, again: coverage can legitimately extend past the sidecar snapshot — a CLI
+// subagent's store-dated end — so a genuinely new prompt there was dropped with the gap it anchored.)
+//
+// Returned as the OVERLAP taken off `delta.duration_ms`, not as a total recomputed from intervals:
+// with no overlap — every normal window, the first window, the audit/backfill's fresh parse with no
+// coverage, and an injected delta that reports no intervals at all — the result is `duration_ms`
+// itself, to the millisecond, whatever that delta's intervals look like. Only the duration and the
+// claim move; `started_at` / `ended_at` stay the delta's envelope over every anchor.
+function mainSegmentBilling(delta, covered) {
+  const durationMs = delta.duration_ms == null ? 0 : delta.duration_ms;
+  const active = Array.isArray(delta.activeIntervals) ? delta.activeIntervals : [];
+  const intervals = subtractIntervals(active, covered);
+  const overlapMs = totalMs(mergeIntervals(active)) - totalMs(intervals);
+  return { durationMs: Math.max(0, durationMs - Math.max(0, overlapMs)), intervals };
+}
+
 // The named execution modes `options.mode` accepts. One value today; a constant rather than a bare
 // string so the caller and the behaviours it selects cannot drift apart on a typo — a misspelled
 // mode would silently run the LIVE path over a historical session, which advances the real cursor
@@ -935,6 +963,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         // checkpoints; without the carry the same generation is counted twice and the seat-covered
         // request bucket inflates. Bounded at 200 by delta-cursor; anonymous keys never carried.
         countedGenerations: Array.isArray(state.countedGenerations) ? state.countedGenerations : null,
+        // The identities of the identified lines EARLIER windows consumed, so a late registry copy
+        // that crossed the checkpoint boundary is dropped as the duplicate it provably is
+        // (dropCarriedDuplicates in lib/delta-cursor.mjs; Codex review, MAJOR). Bounded at 256 by
+        // delta-cursor. Absent under `freshState`, whose state object has no carry, so the
+        // audit/backfill's whole-history parse — which collapses both copies in its one window — is
+        // unaffected; and absent on a state file from before the carry, which drops nothing.
+        consumedEventKeys: Array.isArray(state.consumedEventKeys) ? state.consumedEventKeys : null,
         // The per-run attribution split. A seam rather than a pre-computed input because the planner
         // needs `{ index, event }` pairs over ABSOLUTE line numbers, and those exist only inside
         // computeDelta — the frequent (non-turn-end) path materialises no event array at all.
@@ -1160,6 +1195,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       // the persisted map → the workspace folder's local: id → UNATTRIBUTED_REMOTE, so it is
       // unconditionally truthy. A guard on it read as a real skip path and was dead code.
       const { branch, remote } = attributionOf();
+      const mainBilling = mainSegmentBilling(delta, covered);
       // A single write failure must not abort the checkpoint (which would leave the cursor
       // unadvanced and re-process everything forever) — skip and continue.
       try {
@@ -1174,7 +1210,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           to_line: delta.to,
           models: modelsFrom(delta.entries),
           ...tokenFields(delta.tokens),
-          duration_sec: Math.max(0, Math.round((delta.duration_ms == null ? 0 : delta.duration_ms) / 1000)),
+          duration_sec: Math.max(0, Math.round(mainBilling.durationMs / 1000)),
           billing_source: billingSource,
           ...subscriptionFields,
           ...accountFields,
@@ -1206,14 +1242,20 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         // workers happened to be correlated this window) and it puts the time on the thread that was
         // blocked for the whole fan-out, which is the thread the user was waiting on.
         //
+        // "Full" is this window's span, NOT time an EARLIER checkpoint already billed: the duration
+        // above and the claim below are both mainSegmentBilling's, which leaves out covered wall
+        // clock (Codex review, MAJOR — a late duplicate line across a checkpoint boundary). With no
+        // overlap, which is every normal window, it is exactly `delta.activeIntervals` and
+        // `delta.duration_ms`.
+        //
         // What it claims is the ACTIVE intervals, never the [started_at, ended_at] envelope. A
         // subagent that ran ten minutes writes two lines, so those ten minutes look to the parent
         // like one idle gap it bills nothing for; claiming the envelope would mark the gap covered
         // and the subagent would bill nothing either, and ten real minutes would leave the session
         // altogether. A computeDelta that reports no intervals (an injected double) claims nothing,
         // which is exactly the pre-subagent behaviour.
-        if (Array.isArray(delta.activeIntervals) && delta.activeIntervals.length > 0) {
-          covered = claimIntervals(covered, delta.activeIntervals);
+        if (mainBilling.intervals.length > 0) {
+          covered = claimIntervals(covered, mainBilling.intervals);
           coveredDirty = true;
         }
         lastPayload = payload;
@@ -1452,6 +1494,14 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       // "where the event at index `cursor` begins", so a half-updated pair would resume mid-history.
       const byte = sharedEvents ? sharedEvents.nextByte : delta.nextByte;
       if (Number.isFinite(byte) && byte >= 0) next.cursorBytes = byte;
+      // The consumed-line carry, on the same step and for the same reason: it names lines the cursor
+      // has moved PAST. Committed on any other condition — beside `countedGenerations`, on the main
+      // segment being queued — it would be wrong in both directions: a window whose segment could
+      // not be queued is re-read next checkpoint, and a carry naming its lines would make that re-read
+      // drop every one of them as a "duplicate"; and a marker-only window that consumes identified
+      // lines without queueing anything would lose their identities. NEVER REACHES THE WIRE: it
+      // lives on `state`, which is not spread into any payload.
+      if (Array.isArray(delta.consumedEventKeys)) next.consumedEventKeys = delta.consumedEventKeys;
     }
     // Remember where this conversation lives. The cwd drifts (cd, worktree switches) while the
     // conversation id is fixed, so track.mjs reads this mapping instead of relying on process.cwd().

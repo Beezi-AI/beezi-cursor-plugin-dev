@@ -394,7 +394,7 @@ test('the new kinds are activity, so they still bound the segment', () => {
 // ---------------------------------------------------------------------------
 
 test('a subagent finishing is NOT read as the user being handed control', () => {
-  // TURN_END_EVENTS in lib/session-timeline-cursor.mjs is `{stop, end, session_end}` and matches on
+  // TURN_END_EVENTS in lib/session-timeline-cursor.mjs is `{stop, session_start}` and matches on
   // exact equality, so `subagent_stop` is already excluded and the gap after one is classified
   // `working` — correctly: the parent agent is still running while its worker finishes.
   //

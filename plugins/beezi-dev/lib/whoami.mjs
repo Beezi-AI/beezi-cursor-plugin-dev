@@ -60,22 +60,30 @@ export async function probeWhoami(token, deps = {}) {
   const parsed = await readJsonBounded(res, timeoutMs - (Date.now() - startedAt));
   const bodyMissing = parsed == null;
   const body = bodyMissing ? {} : parsed;
+  const tenant = {
+    email: body.email == null ? null : body.email,
+    name: body.name == null ? null : body.name,
+    tenantTier: body.tenantTier == null ? null : body.tenantTier,
+    backfillCompleted: body.backfillCompleted === true,
+  };
+  // Does the server hold a `cli_agent_accounts` row for this vendor, linked to the caller? A newer
+  // server answers; an older one says nothing. Only a REAL boolean is carried, and the key is
+  // otherwise absent rather than null: `false` makes session start force a check-in, so a
+  // stringly `"false"`, a `0` or a missing field must never be able to read as one — and an
+  // absent key keeps every existing consumer's view of this shape byte-for-byte unchanged.
+  if (typeof body.cliAgentAccountKnown === 'boolean') tenant.cliAgentAccountKnown = body.cliAgentAccountKnown;
   return {
     outcome: WhoamiOutcome.AUTHORIZED,
     status,
-    tenant: {
-      email: body.email == null ? null : body.email,
-      name: body.name == null ? null : body.name,
-      tenantTier: body.tenantTier == null ? null : body.tenantTier,
-      backfillCompleted: body.backfillCompleted === true,
-    },
+    tenant,
     policy: body.trackingMode == null ? null : { mode: body.trackingMode },
     bodyMissing,
   };
 }
 
 // The shipped shape, kept exactly: { valid: true, email, name, tenantTier, trackingMode,
-// backfillCompleted } | { valid: false } | null (offline/unknown). lib/link-status.mjs is a shared
+// backfillCompleted[, cliAgentAccountKnown] } | { valid: false } | null (offline/unknown). The
+// bracketed key is present only when the server sent a boolean (see probeWhoami); absent = unknown. lib/link-status.mjs is a shared
 // file and reads this, so the contract does not move — but a 403 additionally carries
 // `forbidden: true`, which is what lets the callers that must not delete on it tell the two
 // refusals apart without a second request.
@@ -84,7 +92,7 @@ export async function whoami(token, deps = {}) {
   if (probe.outcome === WhoamiOutcome.UNAUTHORIZED) return { valid: false };
   if (probe.outcome === WhoamiOutcome.FORBIDDEN) return { valid: false, forbidden: true };
   if (probe.outcome === WhoamiOutcome.INDETERMINATE) return null;
-  return {
+  const out = {
     valid: true,
     email: probe.tenant.email,
     name: probe.tenant.name,
@@ -92,4 +100,6 @@ export async function whoami(token, deps = {}) {
     trackingMode: probe.policy == null ? null : probe.policy.mode,
     backfillCompleted: probe.tenant.backfillCompleted,
   };
+  if (typeof probe.tenant.cliAgentAccountKnown === 'boolean') out.cliAgentAccountKnown = probe.tenant.cliAgentAccountKnown;
+  return out;
 }

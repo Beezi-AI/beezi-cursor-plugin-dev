@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { BEEZI_HOOKS, PLUGIN_ROOT, hookTimeoutSec } from '../lib/hooks-install.mjs';
 import { HookSource } from '../lib/hook-source.mjs';
+import { hookBudgetMs, HOOK_KIND_GATE } from '../lib/hook-runner.mjs';
 import { readJson } from '../lib/fs-store.mjs';
 
 // Cursor's plugin spec, checked against what is actually on disk. Every assertion here is a path
@@ -94,7 +95,8 @@ test('every bundled hook runs a script that exists, and says which registry it c
     // the user's action — the host holds the MCP call or the subagent launch until the hook answers
     // — so a stall there is dead time in an editor that has not moved, and it gets 5s. The analytics
     // hooks run behind the work and keep the 10s lib/checkpoint.mjs derives HOOK_BUDGET_MS from;
-    // shortening those would truncate the queue flush for no benefit to anyone.
+    // shortening those would truncate the queue flush for no benefit to anyone. The prompt gate
+    // (beforeSubmitPrompt) holds the user's Send on every turn, so it gets 3s.
     //
     // One lookup serves BOTH registries — this bundled one and the user-scope one the installer
     // writes — because the same script runs under both, and a deadline declared in only one of them
@@ -120,7 +122,13 @@ test('every hook script claims the run before doing any work', () => {
   // The assertion stays because that record has to come from every script. A new hook added without
   // the line is a hook whose registry is invisible to all three surfaces, and the only symptom is a
   // status report that is quietly wrong.
-  for (const { script } of BEEZI_HOOKS) {
+  //
+  // The ONE exemption is the prompt gate, and it is pinned the other way round in its own structure
+  // test below. Codex review, BLOCKING: Cursor holds the user's Send until the gate PROCESS ends, so
+  // a JSON read and an atomic write in front of every Send buys nothing — every other hook records
+  // the same registry on every event, `stop` included, which ends every turn the gate starts.
+  for (const { script, gate } of BEEZI_HOOKS) {
+    if (gate === true) continue;
     const body = fs.readFileSync(path.join(PLUGIN_ROOT, 'scripts', script), 'utf-8');
     assert.match(body, /if \(!claimHookRun\(\)\) process\.exit\(0\)/, `${script} does not claim its run`);
   }
@@ -129,8 +137,22 @@ test('every hook script claims the run before doing any work', () => {
 test('every hook script moves to the project directory before doing any work', () => {
   // Cursor starts most of them inside the plugin directory, which is itself a git clone. Without
   // this call every segment would be attributed to the Beezi plugin repository.
-  for (const { script } of BEEZI_HOOKS) {
+  //
+  // The ONE exemption is the prompt gate, pinned the other way round here and in its structure test
+  // below. Codex review, BLOCKING: `enterProjectDir()` is a synchronous `fs.existsSync` plus a
+  // `process.chdir`, and Cursor holds the user's Send until the gate PROCESS ends — a timer cannot
+  // interrupt either call, so a 900 ms existsSync stall on a wedged workspace kept Send held 916 ms.
+  // The gate shells out to nothing (attribution is the reason every other hook enters the
+  // workspace), and the cwd it stamps is derived from the payload and the environment by
+  // stampableCwd, without touching the disk. test/prompt-submit.test.mjs proves it at runtime with
+  // every synchronous fs call in the gate process stalled.
+  for (const { script, gate } of BEEZI_HOOKS) {
     const body = fs.readFileSync(path.join(PLUGIN_ROOT, 'scripts', script), 'utf-8');
+    if (gate === true) {
+      const code = body.replace(/\/\/.*$/gm, '');
+      assert.equal(/enterProjectDir\s*\(/.test(code), false, `${script} enters the project directory in front of Send`);
+      continue;
+    }
     assert.match(body, /^enterProjectDir\(\);$/m, `${script} does not enter the project directory`);
   }
 });
@@ -159,6 +181,76 @@ test('no permission hook script contains a way to write to stdout', () => {
     // Exit 2 is Cursor's "block this action". Nothing in an analytics plugin may reach for it.
     assert.equal(/process\.exit\((?!0\))/.test(body), false, `${script} can exit non-zero`);
   }
+});
+
+// The GATE hook: `beforeSubmitPrompt` holds the user's Send until it answers
+// `{"continue": true|false, "user_message"?}`, and exit 2 blocks the prompt. It is not a permission
+// hook (those must say nothing, and the grep above would rightly flag this one), so it gets its own
+// structural pin. The runtime half — every path prints exactly the token and exits 0 — is in
+// test/prompt-submit.test.mjs and test/hook-bootstrap.test.mjs.
+const gateScripts = () => BEEZI_HOOKS.filter((h) => h.gate === true).map((h) => h.script);
+
+test('the prompt gate answers exactly once, first, and has no other way to reach stdout', () => {
+  assert.deepEqual(gateScripts(), ['prompt-submit.mjs']);
+  assert.equal(permissionScripts().includes('prompt-submit.mjs'), false, 'the gate is not a permission hook');
+  const source = fs.readFileSync(path.join(PLUGIN_ROOT, 'scripts', 'prompt-submit.mjs'), 'utf-8');
+  // Code only: the comments explain the contract and name the very things the code may not do.
+  const body = source.replace(/\/\/.*$/gm, '');
+  const answer = "fs.writeSync(1, '{\"continue\":true}')";
+  assert.equal(body.split(answer).length - 1, 1, 'exactly one answer');
+  assert.equal((body.match(/writeSync\s*\(/g) || []).length, 1, 'no second synchronous write');
+  // ORDER: guards, then the wall-clock guard, then the answer, then everything that reads, loads,
+  // appends or can exit early. Each `later` must be PRESENT as well as late: a missing one reads as
+  // index -1, which is not after anything.
+  const at = (needle) => body.indexOf(needle);
+  const wall = 'setTimeout(leave, GATE_WALL_MS)';
+  assert.ok(at('installHookGuards(') !== -1 && at('installHookGuards(') < at(wall), 'the wall guard precedes the process guards');
+  assert.ok(at(wall) !== -1 && at(wall) < at(answer), 'the wall guard is armed after the answer, or not at all');
+  // `enterProjectDir()` is no longer on this list: the gate does not call it at all (see the
+  // project-directory test above). The recorder's append is `fs.appendFile(`, the asynchronous
+  // call that replaced `appendEvent(` so a stalled sidecar cannot outlive the recorder's deadline.
+  for (const later of ['process.stdin', 'import(', 'spawn(', 'fs.appendFile(']) {
+    assert.ok(at(later) > at(answer), `${later} runs before the answer is written`);
+  }
+  // NO SYNCHRONOUS I/O IN THE GATE, and the recorder that does the write instead. Codex review,
+  // BLOCKING, the second time round: a timer cannot interrupt a synchronous call, so a 900 ms
+  // synchronous append stub kept the process — and the user's Send — alive 914 ms after answering,
+  // wall guard or no wall guard. The gate now reads stdin through events and hands the line to a
+  // detached recorder; the script itself holds no synchronous read of stdin and no synchronous
+  // write but the answer (the recorder's append is lib/sidecar.mjs's, reached by import).
+  for (const sync of ['appendFileSync', 'writeFileSync', 'readFileSync(0', 'readSync(']) {
+    assert.equal(body.includes(sync), false, `${sync} is back in the gate script`);
+  }
+  // The recorder inherits NO stdio handle — Cursor may wait for the gate's pipes to close as well as
+  // for its exit — is detached from the gate's process group, opens no console window on Windows,
+  // and is not waited for.
+  assert.match(body, /detached: true/);
+  assert.match(body, /windowsHide: true/);
+  assert.match(body, /stdio: \['ignore', 'ignore', 'ignore'\]/);
+  assert.match(body, /\.unref\(\)/);
+  // The hand-off goes through the environment, never the command line a process listing shows.
+  assert.match(body, /\[\s*'--no-warnings',\s*SELF,\s*RECORD_FLAG\s*\]/);
+  // The guard ends the process inside the gate budget. Codex review, BLOCKING: Cursor waits for the
+  // hook PROCESS, not the answer, and the runner's 500 ms gate budget used to be enforced by nothing.
+  const wallMs = Number((/const GATE_WALL_MS = (\d+);/.exec(body) || [])[1]);
+  assert.ok(wallMs > 0 && wallMs < hookBudgetMs(HOOK_KIND_GATE), `GATE_WALL_MS ${wallMs} is not inside the gate budget`);
+  // Nothing on the gate's path but the read and the hand-off: no registry bookkeeping (the exemption
+  // in the claim test above), no runner and its unbounded tail, and no capture replay spill.
+  assert.equal(/claimHookRun/.test(body), false, 'registry bookkeeping is back in front of Send');
+  assert.equal(/\brunHook\b/.test(body), false, 'the runner is back on the gate path');
+  assert.equal(/captureHookStdin/.test(body), false, 'the gate spills stdin to a replay file again');
+  // Nothing else may reach the stream, and nothing may refuse or annotate the user's prompt.
+  assert.equal(/\bemit\b/.test(body), false, 'ctx.emit would be a second token');
+  assert.equal(/failOutput/.test(body), false, 'a failOutput would be a second token on the failure path');
+  assert.equal(/process\s*\.\s*stdout/.test(body), false);
+  assert.equal(/console\s*\./.test(body), false);
+  assert.equal(/user_message/.test(body), false);
+  assert.equal(/"continue"\s*:\s*false/.test(body), false);
+  assert.equal(/process\.exit\((?!0\))/.test(body), false, 'exit 2 blocks the prompt');
+  // A `gen` line derived from this payload would bill a generation Cursor has not started.
+  assert.equal(/eventsFromHookPayload\s*\(/.test(body), false);
+  // Declared a gate to the guards, or their crash path takes another kind's way out.
+  assert.match(body, /installHookGuards\(\{[^}]*gate: true/);
 });
 
 // Run a hook script the way Cursor does — stdin piped, `--via plugin-hooks` on the command line —

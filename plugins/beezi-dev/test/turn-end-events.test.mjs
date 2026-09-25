@@ -99,20 +99,28 @@ test('the boundary a stop hook writes makes the gap that follows waiting_user', 
   assert.equal(timeline.periods[1].ended_at, new Date(boundary.ts + 60_000).toISOString());
 });
 
-test('the closing boundary extends the session span past the last tool call', (t) => {
+test('the closing boundary is recorded, but the session span ends at the last turn, not at it', (t) => {
+  // This used to assert the opposite: that `session_end` stretched `ended_at` past the last tool
+  // call. It did, and on a real CLI session that was the bug — sessionEnd fires whenever the user
+  // gets round to closing the CLI, so the timeline ENDED on a "User input" band from the last stop
+  // to the shutdown, and the axis ran on past the last drawn period. The worry the old assertion
+  // answered (a final turn that touched no tool looking like it ended early) is answered by that
+  // turn's own `stop` line now, which IS an anchor.
   const home = tmpHome(t);
   const id = 'conv-span';
   const start = Date.now() - 60_000;
   appendEvent(id, { ts: start, ev: 'gen', model: 'claude-4.5-sonnet' });
   appendEvent(id, { ts: start + 10_000, ev: 'tool', tool: 'read_file', bytes: 100, ms: 5 });
+  appendEvent(id, { ts: start + 20_000, ev: 'stop' });
 
   runHook(SCRIPTS.sessionEnd, { conversation_id: id, cwd: home }, home);
 
   const boundary = readEvents(id).find((event) => event.ev === 'session_end');
   assert.ok(boundary, 'the sessionEnd hook wrote no closing boundary');
-  // Without the boundary the session looks like it ended at its last tool call, which under-reports
-  // every session whose final turn answered without touching a tool.
-  assert.equal(computeSessionTimeline(id).ended_at, new Date(boundary.ts).toISOString());
+  const timeline = computeSessionTimeline(id);
+  assert.equal(timeline.ended_at, new Date(start + 20_000).toISOString());
+  // …and no trailing wait is drawn from the last stop to the shutdown.
+  assert.deepEqual(timeline.periods.map((p) => p.state), ['working']);
 });
 
 // ── the stop hook's account check (plan §4 Phase C) ─────────────────────────────────────────────

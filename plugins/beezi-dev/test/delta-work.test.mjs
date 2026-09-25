@@ -244,3 +244,44 @@ test('the code-changes database window still spans every timestamped line, marke
   assert.equal(branchTs, at(9));
   assert.equal(delta.ended_at, '2026-01-01T00:00:00.000Z');
 });
+
+// ---------------------------------------------------------------------------
+// Turn STARTS — the `prompt` line scripts/prompt-submit.mjs writes on `beforeSubmitPrompt`
+// ---------------------------------------------------------------------------
+//
+// Before that hook existed a Cursor turn with no tool calls left only `gen` + `stop` in the sidecar,
+// and nothing said when the human pressed Send. The prompt line is that instant. It belongs with
+// `stop`: a real moment that anchors the clock (the seconds from Send to the first tool call are
+// the agent's), but not work on its own — a window holding nothing but a prompt is a turn the user
+// aborted before the agent did anything, and billing it would invent a segment out of a keypress.
+// Epoch milliseconds, per the fixture convention (timestampOf reads a number below 1e12 as seconds).
+const PT = 1790000000000;
+
+test('every prompt alias is a timing anchor and none of them is activity', () => {
+  for (const kind of ['prompt', 'user', 'user_message', 'user_prompt']) {
+    assert.equal(TIMING_ANCHOR_EVENTS.has(kind), true, `${kind} must anchor the clock`);
+    assert.equal(ACTIVITY_EVENTS.has(kind), false, `${kind} is not work on its own`);
+  }
+});
+
+test('a window holding only prompt lines (an aborted turn) reports no work', () => {
+  const events = [{ ts: PT, ev: 'prompt', eid: 'g1' }, { ts: PT + 4000, ev: 'prompt', eid: 'g2' }];
+  const delta = computeDelta(CONV, 0, resolvers(events));
+  assert.equal(delta.hasReportableWork, false);
+  assert.deepEqual(delta.entries, []);
+  // Still consumed, so the next checkpoint does not re-read the same two lines forever.
+  assert.deepEqual(delta.consumed, { from: 0, to: 2 });
+});
+
+test('a prompt → tool → stop window bills from the prompt to the stop', () => {
+  const events = [
+    { ts: PT, ev: 'prompt', eid: 'g1' },
+    { ts: PT + 20_000, ev: 'tool', tool: 'read_file', bytes: 10 },
+    { ts: PT + 45_000, ev: 'stop' },
+  ];
+  const delta = computeDelta(CONV, 0, resolvers(events));
+  assert.equal(delta.hasReportableWork, true);
+  assert.equal(delta.started_at, new Date(PT).toISOString());
+  assert.equal(delta.ended_at, new Date(PT + 45_000).toISOString());
+  assert.equal(delta.duration_ms, 45_000);
+});

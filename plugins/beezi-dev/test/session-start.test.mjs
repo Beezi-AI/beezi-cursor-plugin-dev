@@ -739,7 +739,7 @@ test('session start checks the account in UNFORCED, with the record the reconcil
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].token, 'tok', 'the token this hook already resolved — no second lookup');
-  // The fingerprint gate plus the seven-day heartbeat IS the intended steady state here. Forcing on
+  // The fingerprint gate plus the daily heartbeat IS the intended steady state here. Forcing on
   // a per-session path would POST on every single session start.
   assert.equal(calls[0].options.force, false);
   assert.equal(calls[0].options.via, 'session-start');
@@ -909,6 +909,99 @@ test('the marker is read from the file the check-in’s own scope names', async 
   assert.equal(seen[0].file, '/state/beezi-user.json');
   assert.deepEqual(seen[0].scope, { env: '', beeziAccount: 'beezi-user' });
   assert.equal(typeof seen[0].now, 'number', 'the due stamp is evaluated against the hook clock');
+});
+
+// ── self-heal: whoami says the server has no `cli_agent_accounts` row for this machine ────────
+//
+// The server's session upsert only LINKS an existing account row; it never creates one. Once the
+// row is gone, every session maps to no subscription until the next check-in — and the hash gate
+// plus the heartbeat keeps that check-in from happening, because nothing local changed. whoami is
+// already fetched on this path (it is the revocation probe), so its `cliAgentAccountKnown: false`
+// is a free signal: force the check-in that was going to run anyway. No new request is added.
+
+const ANCHORED = { plan: 'pro', subscriptionType: 'pro', accountAnchor: { email: 'seat@example.com', accountId: 'auth0|seat', source: 'cli_config' } };
+
+function selfHealRun(t, who, record) {
+  tmpHome(t);
+  const calls = [];
+  const whoCalls = [];
+  return runSessionStart(
+    { session_id: 'conv-1', cwd: null },
+    linkedDeps({
+      whoami: async (...args) => { whoCalls.push(args); return who; },
+      readBillingConfig: () => record,
+      flushQueue: async () => ({ flushed: 0 }),
+      buildCheckInScope: () => ({ ok: false, reason: 'no-beezi-account', scope: null }),
+      syncAccount: async (token, options) => { calls.push(options); return { outcome: 'sent' }; },
+    }),
+  ).then(() => ({ calls, whoCalls }));
+}
+
+test('a server that says it has no account row, plus a local anchor, forces the check-in', async (t) => {
+  const { calls, whoCalls } = await selfHealRun(t, { valid: true, email: 'dev@example.com', cliAgentAccountKnown: false }, ANCHORED);
+  assert.equal(whoCalls.length, 1, 'the SAME whoami the revocation check made — no second probe');
+  assert.equal(calls.length, 1, 'one check-in, forced — not an extra request');
+  assert.equal(calls[0].force, true);
+  assert.equal(calls[0].via, 'session-start');
+});
+
+test('an id-only or email-only anchor is still an anchor worth forcing for', async (t) => {
+  for (const accountAnchor of [
+    { email: null, accountId: 'auth0|seat', source: 'cli_config' },
+    { email: 'seat@example.com', accountId: null, source: 'self_report' },
+  ]) {
+    const { calls } = await selfHealRun(t, { valid: true, cliAgentAccountKnown: false }, { plan: null, accountAnchor });
+    assert.equal(calls[0].force, true, JSON.stringify(accountAnchor));
+  }
+});
+
+test('a server that knows the row, or cannot say, gets the ordinary unforced heartbeat', async (t) => {
+  for (const who of [
+    { valid: true, email: 'dev@example.com', cliAgentAccountKnown: true },
+    { valid: true, email: 'dev@example.com' },
+    // A probe that did not answer carries no verdict of any kind.
+    null,
+  ]) {
+    const { calls } = await selfHealRun(t, who, ANCHORED);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].force, false, `${JSON.stringify(who)} must not force`);
+  }
+});
+
+test('no local anchor means nothing to heal with — not forced', async (t) => {
+  // Forcing a body that identifies nobody would change nothing server-side: there is no row to
+  // create without an `accountUuid` or an email, and account-checkin skips it as NOTHING_TO_REPORT.
+  for (const record of [
+    {},
+    { plan: 'pro', subscriptionType: 'pro', accountAnchor: null },
+    { plan: 'pro', accountAnchor: { email: null, accountId: null, source: 'self_report' } },
+  ]) {
+    const { calls } = await selfHealRun(t, { valid: true, cliAgentAccountKnown: false }, record);
+    assert.equal(calls[0].force, false, JSON.stringify(record));
+  }
+});
+
+test('a pending marker still forces on its own, flag or no flag', async (t) => {
+  tmpHome(t);
+  const calls = [];
+  const m = markerDeps(true, {
+    whoami: async () => ({ valid: true, email: 'dev@example.com', cliAgentAccountKnown: true }),
+    syncAccount: async (token, options) => { calls.push(options); return { outcome: 'sent' }; },
+  });
+  await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+  assert.equal(calls[0].force, true);
+  assert.equal(m.cleared.length, 1);
+});
+
+test('the self-heal force never clears a marker that was not there', async (t) => {
+  tmpHome(t);
+  const m = markerDeps(false, {
+    whoami: async () => ({ valid: true, email: 'dev@example.com', cliAgentAccountKnown: false }),
+    readBillingConfig: () => ANCHORED,
+    syncAccount: async () => ({ outcome: 'sent' }),
+  });
+  await runSessionStart({ session_id: 'conv-1', cwd: null }, linkedDeps(m.deps));
+  assert.deepEqual(m.cleared, []);
 });
 
 // ── The session_start sidecar line: the timeline's first anchor ──

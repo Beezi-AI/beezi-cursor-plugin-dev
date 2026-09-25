@@ -6,6 +6,8 @@ import path from 'node:path';
 import {
   BEEZI_HOOKS,
   BEEZI_STATUS_MESSAGE,
+  GATE_EVENTS,
+  GATE_HOOK_TIMEOUT_SEC,
   HOOK_TIMEOUT_SEC,
   PERMISSION_EVENTS,
   PERMISSION_HOOK_TIMEOUT_SEC,
@@ -50,6 +52,7 @@ const EVENTS = [
   'afterFileEdit',
   'afterShellExecution',
   'beforeMCPExecution',
+  'beforeSubmitPrompt',
   'postToolUse',
   'postToolUseFailure',
   'sessionEnd',
@@ -59,13 +62,18 @@ const EVENTS = [
   'subagentStop',
 ];
 
-test('all ten Cursor lifecycle events are registered', () => {
+test('all eleven Cursor lifecycle events are registered', () => {
   // sessionEnd IS registered, unlike the Codex fork — Cursor implements it while Codex silently
   // drops the entry. postToolUseFailure revives the failure hook Codex had no event for.
   //
   // The last four are capture-only: their scripts dump the payload and exit, and nothing reads the
   // result yet. They are registered ahead of the features that need them because a capture session
   // proves the registry as a whole, and the machine that has Cursor installed is the expensive part.
+  //
+  // The eleventh is `beforeSubmitPrompt`: the only event that says when a turn STARTED. Without it a
+  // CLI turn that calls no tool leaves nothing but its end in the sidecar, and the session timeline
+  // drew almost every such session as "User input" from end to end.
+  assert.equal(BEEZI_HOOKS.length, 11);
   assert.deepEqual(BEEZI_HOOKS.map((h) => h.event).sort(), EVENTS);
 });
 
@@ -87,6 +95,7 @@ test('postToolUse routes to the tiny sidecar writer, not the reporting engine', 
   assert.equal(byEvent.beforeMCPExecution, 'mcp-before.mjs');
   assert.equal(byEvent.subagentStart, 'subagent-start.mjs');
   assert.equal(byEvent.subagentStop, 'subagent-stop.mjs');
+  assert.equal(byEvent.beforeSubmitPrompt, 'prompt-submit.mjs');
 });
 
 test('launcherName picks the right extension per platform', () => {
@@ -161,9 +170,23 @@ test('a permission hook gets half the deadline an analytics hook does', () => {
     assert.equal(entries[event][0].timeout, PERMISSION_HOOK_TIMEOUT_SEC, `${event} kept the analytics deadline`);
   }
   for (const { event } of BEEZI_HOOKS) {
-    if (PERMISSION_EVENTS.includes(event)) continue;
+    if (PERMISSION_EVENTS.includes(event) || GATE_EVENTS.includes(event)) continue;
     assert.equal(entries[event][0].timeout, HOOK_TIMEOUT_SEC, `${event} is not a permission hook`);
   }
+});
+
+test('the prompt gate gets the shortest deadline of all, and is not a permission hook', () => {
+  // `beforeSubmitPrompt` is synchronous and holds the user's Send until it answers, on every turn.
+  // The analytics ten seconds there could freeze Send for ten seconds; the permission kind does not
+  // fit either, because its stdout is empty by contract and this one must answer
+  // `{"continue":true}`. So it is a third kind with a three-second ceiling.
+  assert.equal(GATE_HOOK_TIMEOUT_SEC, 3);
+  assert.ok(GATE_HOOK_TIMEOUT_SEC < PERMISSION_HOOK_TIMEOUT_SEC);
+  assert.deepEqual([...GATE_EVENTS], ['beforeSubmitPrompt']);
+  assert.equal(PERMISSION_EVENTS.includes('beforeSubmitPrompt'), false);
+  assert.equal(hookTimeoutSec('beforeSubmitPrompt'), GATE_HOOK_TIMEOUT_SEC);
+  const entries = buildHookEntries({ launcherDir: '/h', platform: 'linux' });
+  assert.equal(entries.beforeSubmitPrompt[0].timeout, GATE_HOOK_TIMEOUT_SEC);
 });
 
 test('BOTH registries declare the same per-event deadline', () => {

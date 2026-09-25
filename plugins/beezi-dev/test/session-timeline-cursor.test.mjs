@@ -555,3 +555,211 @@ test('a long gap after session_start is waiting_user, never idle', () => {
   assert.deepEqual(tl.periods.map((p) => p.state), ['waiting_user']);
   assert.equal(tl.started_at, new Date(T).toISOString());
 });
+
+// ─── turn STARTS: the `prompt` line beforeSubmitPrompt writes ───────────────
+//
+// Verified on a real CLI session: a turn that calls no tool leaves only `gen` + `stop` in the
+// sidecar, so every gap after a stop was `waiting_user`, the first turn (before the first line) was
+// never drawn, and the trailing `session_end` added one more "User input" band at the end. The
+// portal showed almost nothing but "User input". scripts/prompt-submit.mjs now writes a `prompt`
+// line when the human presses Send, and the classifier reads it as the turn's start.
+//
+// Every prompt carries its own `eid` (the generation id the hook reads), the way real lines do, so
+// the default duplicate collapse keeps each one.
+const promptAt = (ms, eid) => ({ ts: T + ms, ev: 'prompt', eid });
+const stopAt = (ms) => ({ ts: T + ms, ev: 'stop' });
+const genAt = (ms, genId) => ({ ts: T + ms, ev: 'gen', model: 'claude-opus-5', gen_id: genId, eid: genId });
+const sessionEndAt = (ms) => ({ ts: T + ms, ev: 'session_end' });
+const iso = (ms) => new Date(T + ms).toISOString();
+const shape = (tl) => tl.periods.map((p) => [p.state, Date.parse(p.started_at) - T, Date.parse(p.ended_at) - T]);
+const promptStates = (events, options) =>
+  computeSessionTimeline('conv-1', { readEvents: () => events }, options).periods.map((p) => p.state);
+
+test('a CLI turn is User input then Agent working, and the timeline ends on the agent', () => {
+  const tl = computeSessionTimeline('cli', {
+    readEvents: () => [promptAt(0, 'g1'), stopAt(20000), promptAt(60000, 'g2'), stopAt(75000), sessionEndAt(300000)],
+  });
+  assert.deepEqual(shape(tl), [
+    ['working', 0, 20000],
+    ['waiting_user', 20000, 60000],
+    ['working', 60000, 75000],
+  ]);
+  // The axis starts at the first prompt and ends at the last turn's stop: no trailing "User input"
+  // band from session_end, and no blank tail after the last drawn period either.
+  assert.equal(tl.started_at, iso(0));
+  assert.equal(tl.ended_at, iso(75000));
+});
+
+test('the shape stop.mjs really writes (gen, then stop) draws the same way', () => {
+  // stop.mjs appends the turn's `gen` line a millisecond before its `stop`, so a no-tool CLI turn is
+  // prompt, gen, stop — not prompt, stop.
+  const tl = computeSessionTimeline('cli', {
+    readEvents: () => [
+      promptAt(0, 'g1'), genAt(20000, 'g1'), stopAt(20001),
+      promptAt(60000, 'g2'), genAt(75000, 'g2'), stopAt(75001),
+      sessionEndAt(300000),
+    ],
+  });
+  assert.deepEqual(shape(tl), [
+    ['working', 0, 20001],
+    ['waiting_user', 20001, 60000],
+    ['working', 60000, 75001],
+  ]);
+  assert.equal(tl.ended_at, iso(75001));
+});
+
+test('a stream with no prompt lines classifies exactly as before', () => {
+  // `-p`, builds that do not fire beforeSubmitPrompt, and every sidecar written before the hook
+  // existed. The only change is that session_end no longer draws a trailing wait.
+  const tl = computeSessionTimeline('legacy', {
+    readEvents: () => [genAt(0, 'a'), toolAt(10000), stopAt(20000), genAt(80000, 'b'), stopAt(90000)],
+  });
+  assert.deepEqual(shape(tl), [
+    ['working', 0, 20000],
+    ['waiting_user', 20000, 80000],
+    ['working', 80000, 90000],
+  ]);
+});
+
+test('turns with and without a prompt line mix in one stream', () => {
+  // A registry that started firing mid-session, or one lost prompt line: the prompted turn draws as
+  // working from its Send, the unprompted one falls back to the stop rule.
+  const tl = computeSessionTimeline('mixed', {
+    readEvents: () => [
+      promptAt(0, 'g1'), stopAt(20000),
+      genAt(50000, 'g2'), stopAt(55000),
+      promptAt(90000, 'g3'), toolAt(100000), stopAt(110000),
+    ],
+  });
+  assert.deepEqual(shape(tl), [
+    ['working', 0, 20000],
+    ['waiting_user', 20000, 50000],
+    ['working', 50000, 55000],
+    ['waiting_user', 55000, 90000],
+    ['working', 90000, 110000],
+  ]);
+});
+
+test('session_start followed by a prompt drops the lead-in: the timeline starts when the human speaks', () => {
+  // The Claude plugin's dropLeadIn: the minutes between opening the CLI and typing the first prompt
+  // are not a turn, and a "User input" band there is time nobody was asked to account for.
+  const tl = computeSessionTimeline('s', {
+    readEvents: () => [sessionStart(0), promptAt(40000, 'g1'), stopAt(60000)],
+  });
+  assert.deepEqual(shape(tl), [['working', 40000, 60000]]);
+  assert.equal(tl.started_at, iso(40000));
+  assert.equal(tl.ended_at, iso(60000));
+});
+
+test('session_start with no prompt keeps the lead-in as the user wait it always was', () => {
+  const tl = computeSessionTimeline('s', {
+    readEvents: () => [sessionStart(0), toolAt(17000), stopAt(20000)],
+  });
+  assert.deepEqual(shape(tl), [['waiting_user', 0, 17000], ['working', 17000, 20000]]);
+  assert.equal(tl.started_at, iso(0));
+});
+
+test('a prompt followed by five silent minutes is idle, never the user', () => {
+  // Documented, not accidental: after Send the turn is the agent's, so a long gap with no tool call
+  // is the agent waiting on something of its own (a long think, a slow model), at the same
+  // threshold billing uses. It is never `waiting_user`, and never a break however long it runs.
+  const tl = computeSessionTimeline('slow', {
+    readEvents: () => [promptAt(0, 'g1'), stopAt(IDLE_GAP_MS)],
+  });
+  assert.deepEqual(shape(tl), [['idle', 0, IDLE_GAP_MS]]);
+  assert.deepEqual(promptStates([promptAt(0, 'g1'), stopAt(IDLE_GAP_MS - 1)]), ['working']);
+  assert.deepEqual(promptStates([promptAt(0, 'g1'), stopAt(BREAK_MS * 2)]), ['idle']);
+});
+
+test('the gap before a prompt is the user, and a break past BREAK_MS', () => {
+  const events = [promptAt(0, 'g1'), stopAt(1000), promptAt(1000 + BREAK_MS, 'g2'), stopAt(2000 + BREAK_MS)];
+  assert.deepEqual(promptStates(events), ['working', 'break', 'working']);
+  // Opting out of break keeps the long wait the user's, as it always has.
+  assert.deepEqual(promptStates(events, { allowBreakState: false }), ['working', 'waiting_user', 'working']);
+  // A prompt that follows a tool call with no stop in between (an aborted turn) still ends a wait.
+  assert.deepEqual(
+    promptStates([promptAt(0, 'g1'), toolAt(5000), promptAt(30000, 'g2'), stopAt(40000)]),
+    ['working', 'waiting_user', 'working'],
+  );
+});
+
+test('a validated permission marker still labels the wait before a prompt', () => {
+  const tl = computeSessionTimeline(
+    'm',
+    { readEvents: () => [promptAt(0, 'g1'), stopAt(1000), promptAt(5000, 'g2'), stopAt(6000)] },
+    { permissionMarkers: [{ startMs: T + 1000, endMs: T + 5000 }] },
+  );
+  assert.equal(tl.periods[1].state, 'waiting_user');
+  assert.equal(tl.periods[1].waiting_subtype, 'command_approval');
+});
+
+test('subagents inside a prompted turn keep their lanes and the turn stays working', () => {
+  const tl = computeSessionTimeline('fan', {
+    readEvents: () => [
+      promptAt(0, 'g1'),
+      { ts: T + 1000, ev: 'subagent_start', sid: 'sa_01', stype: 'general-purpose', task: 'a' },
+      { ts: T + 30000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'a' },
+      stopAt(40000),
+      sessionEndAt(100000),
+    ],
+  });
+  assert.deepEqual(tl.subagents, [{
+    agent_id: 'sa_01',
+    agent_type: 'general-purpose',
+    started_at: iso(1000),
+    ended_at: iso(30000),
+  }]);
+  assert.deepEqual(shape(tl), [['working', 0, 40000]]);
+  assert.equal(tl.ended_at, iso(40000));
+});
+
+// The session span is widened by any subagent lane, because a lane is drawn on the same axis as the
+// periods. Codex review (MAJOR): the widening loop read `startedMs` / `endedMs`, but the spans
+// correlateSubagents returns spell them `started_ms` / `ended_ms` — so the loop never widened
+// anything, and a background subagent whose missing stop was synthetically closed at session_end
+// was drawn as a lane running 58 seconds past the end of its own timeline.
+test('a lane that outlives the last period widens the session span to cover it', () => {
+  const tl = computeSessionTimeline('bg', {
+    readEvents: () => [
+      promptAt(0, 'g1'),
+      // No subagent_stop at all: the background-subagent host bug. The correlator closes it at the
+      // last activity, which is the trailing session_end.
+      { ts: T + 1000, ev: 'subagent_start', sid: 'sa_bg', stype: 'general-purpose', task: 'bg' },
+      stopAt(2000),
+      sessionEndAt(60000),
+    ],
+  });
+  assert.equal(tl.subagents.length, 1);
+  assert.equal(tl.subagents[0].started_at, iso(1000));
+  assert.equal(tl.subagents[0].ended_at, iso(60000));
+  // The axis reaches the lane's end, so the lane is drawn inside it rather than past it.
+  assert.equal(tl.started_at, iso(0));
+  assert.equal(tl.ended_at, iso(60000));
+  // The periods themselves are untouched: widening moves the axis, never a period's state.
+  assert.deepEqual(shape(tl), [['working', 0, 2000]]);
+});
+
+test('a lane inside the turn widens nothing', () => {
+  const tl = computeSessionTimeline('inner', {
+    readEvents: () => [
+      promptAt(0, 'g1'),
+      { ts: T + 5000, ev: 'subagent_start', sid: 'sa_in', stype: 'general-purpose', task: 'in' },
+      { ts: T + 15000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'in' },
+      stopAt(20000),
+      sessionEndAt(90000),
+    ],
+  });
+  assert.equal(tl.subagents.length, 1);
+  assert.equal(tl.subagents[0].ended_at, iso(15000));
+  assert.equal(tl.started_at, iso(0));
+  assert.equal(tl.ended_at, iso(20000));
+});
+
+test('a stream of nothing but session_end still yields a timeline, with no periods', () => {
+  // Filtering session_end out of the anchors must not turn a real (if empty) session into null:
+  // null means "schema mismatch", and a sidecar holding one shutdown line is not that.
+  const tl = computeSessionTimeline('end-only', { readEvents: () => [sessionEndAt(0)] });
+  assert.deepEqual(tl.periods, []);
+  assert.equal(tl.started_at, iso(0));
+  assert.equal(tl.ended_at, iso(0));
+});

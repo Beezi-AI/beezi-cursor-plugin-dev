@@ -51,12 +51,22 @@ export const RELOAD_STEP = 'restart Cursor — hooks are read when the app start
 // `afterMCPExecution` is deliberately absent. `postToolUse` already fires for MCP tools, so a
 // handler on the completion side would count every MCP call twice.
 //
-// Two of the ten — `beforeMCPExecution` and `subagentStart` — are PERMISSION hooks: Cursor reads
+// Two of the eleven — `beforeMCPExecution` and `subagentStart` — are PERMISSION hooks: Cursor reads
 // their stdout and obeys it, and exit code 2 blocks the user's action outright. Their scripts write
 // nothing to stdout on any path and always exit 0. Do not add an entry here without checking which
 // kind it is.
 //
-// Adding an event is also the one edit here that can cost the OTHER nine. An event Cursor does not
+// One — `beforeSubmitPrompt` — is a GATE hook, the third kind. Cursor holds the user's Send until
+// it answers `{"continue": true|false, "user_message"?}`; exit 2 blocks the prompt and any other
+// failure fails open. Its script writes exactly `{"continue":true}`, synchronously, before it does
+// anything else, never writes a second byte and always exits 0. It exists because it is the only
+// event that says when a turn STARTED: a CLI turn that calls no tool otherwise leaves nothing but
+// its end (`gen` + `stop`) in the sidecar, and the session timeline drew such sessions as almost
+// nothing but "User input" (lib/session-timeline-cursor.mjs, buildPeriods). It fires in the
+// interactive CLI (receptron/mulmoterminal#2064, 2026.09.10) and not in `-p`, where the timeline
+// falls back to the turn-end rule.
+//
+// Adding an event is also the one edit here that can cost the OTHER ten. An event Cursor does not
 // fire is harmless — the entry simply never runs, which is the expected state of several of these
 // under `cursor-agent`. Staff once listed only sessionStart, sessionEnd, stop, postToolUse,
 // beforeShellExecution, afterShellExecution and afterFileEdit for the CLI, and that list is not the
@@ -79,6 +89,7 @@ export const BEEZI_HOOKS = Object.freeze([
   { event: 'beforeMCPExecution', script: 'mcp-before.mjs', permission: true },
   { event: 'subagentStart', script: 'subagent-start.mjs', permission: true },
   { event: 'subagentStop', script: 'subagent-stop.mjs' },
+  { event: 'beforeSubmitPrompt', script: 'prompt-submit.mjs', gate: true },
 ]);
 
 const BEEZI_EVENTS = BEEZI_HOOKS.map((h) => h.event);
@@ -92,6 +103,17 @@ export const PERMISSION_EVENTS = Object.freeze(
 
 export function isPermissionEvent(event) {
   return PERMISSION_EVENTS.indexOf(event) !== -1;
+}
+
+// The events that gate the user's Send, derived the same way and for the same reason: a gate event
+// listed in one place and not the other would get the analytics ten seconds in front of every
+// prompt.
+export const GATE_EVENTS = Object.freeze(
+  BEEZI_HOOKS.filter((h) => h.gate === true).map((h) => h.event),
+);
+
+export function isGateEvent(event) {
+  return GATE_EVENTS.indexOf(event) !== -1;
 }
 
 // Cursor's hooks.json carries a schema version at the top level.
@@ -124,10 +146,15 @@ export const HOOK_TIMEOUT_SEC = HOOK_TIMEOUTS.analytics / 1000;
 // HOOK_BUDGET_MS from — shortening those would truncate the queue flush for no benefit to anyone.
 export const PERMISSION_HOOK_TIMEOUT_SEC = HOOK_TIMEOUTS.permission / 1000;
 
+// A gate hook's deadline. `beforeSubmitPrompt` holds the user's Send, on every turn, so it is the
+// shortest of the three — see HOOK_TIMEOUTS in lib/hook-runner.mjs for the reasoning.
+export const GATE_HOOK_TIMEOUT_SEC = HOOK_TIMEOUTS.gate / 1000;
+
 // The deadline this event's handler is registered with, in seconds, for BOTH registries. One lookup
 // so the bundled hooks/hooks.json and the user-scope registry cannot declare different budgets for
 // the same script — see the parity test in test/hooks-install.test.mjs.
 export function hookTimeoutSec(event) {
+  if (isGateEvent(event)) return GATE_HOOK_TIMEOUT_SEC;
   return isPermissionEvent(event) ? PERMISSION_HOOK_TIMEOUT_SEC : HOOK_TIMEOUT_SEC;
 }
 
@@ -149,7 +176,7 @@ export function installCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
 // This is a property of the USER scope, and it is not a workaround for a missing variable. Cursor
 // does have a plugin-root substitution — `${CURSOR_PLUGIN_ROOT}`, staff-confirmed, expanded in a
 // hook's `command` and in an MCP server's `args`/`cwd` — and the bundled hooks/hooks.json relies on
-// it for all ten entries. What it is NOT expanded in is `~/.cursor/hooks.json`, which belongs to the
+// it for all eleven entries. What it is NOT expanded in is `~/.cursor/hooks.json`, which belongs to the
 // user rather than to any plugin and so has no plugin root to resolve against. The absolute path has
 // to be baked in there by the installer, and baking it into a one-token launcher is what keeps the
 // entry free of argument-splitting and PATH-resolution rules — and what lets a Node upgrade be
@@ -208,7 +235,7 @@ function ownsLauncherName(basename, variantMarker) {
 // true only while the launcher's own path holds no whitespace — and the launcher lives under the
 // user's home, which on Windows is routinely `C:\Users\First Last`. Unquoted, such an entry asks the
 // host to run `C:\Users\First` with `Last\.beezi-cursor\hooks\beezi-stop.cmd` as an argument, and
-// every hook on the machine fails at spawn while the registry still lists all ten and looks perfect.
+// every hook on the machine fails at spawn while the registry still lists all eleven and looks perfect.
 //
 // Quote only when there is whitespace to protect. A space-free path then stays byte-identical to what
 // every existing install already has on disk, so an upgrade rewrites nothing and no comparison
@@ -430,7 +457,7 @@ export function mergeHooks(existing, beeziHooks, launcherDir = hookLauncherDir()
 
 // A registry we cannot parse must never be treated as an empty one. The file is the user's — they
 // are invited to open and review it — so a stray trailing comma is a realistic state, and merging
-// onto `{}` would rewrite the file with Beezi's ten events and nothing else, deleting every hook
+// onto `{}` would rewrite the file with Beezi's eleven events and nothing else, deleting every hook
 // they had configured. Refuse instead, and say which file to fix.
 function readRegistry(hooksFile) {
   let raw;

@@ -278,8 +278,9 @@ export async function runStopAccountCheck(ctx, deps) {
   });
 
   // C1 — read the host. ENOENT on a `cursor-agent`-only machine with no IDE globalStorage, a throw
-  // from a half-written database, a plan that came from cli-config.json and therefore carries no
-  // identity at all: none of them may break the user's stop hook, so all of them answer null.
+  // from a half-written database, a cli-config.json with no `authInfo` (it now carries the CLI's
+  // email and auth id, but no plan): none of them may break the user's stop hook, so all of them
+  // answer null.
   let account = null;
   try {
     account = (d.readAccount == null ? _readCursorAccount : d.readAccount)();
@@ -407,8 +408,8 @@ export async function runStopAccountCheck(ctx, deps) {
 // One forced, inline, budget-bounded check-in, plus the marker bookkeeping around it.
 //
 // `force: true` throughout: the caller has already established that something moved (or that an
-// earlier run owed a send), and the seven-day heartbeat gate exists to suppress redundant traffic,
-// not to delay a subscription change by a week.
+// earlier run owed a send), and the heartbeat gate (24 h, lib/account-sync.mjs) exists to suppress
+// redundant traffic, not to delay a subscription change by a day.
 //
 // The marker rules, in one place so they cannot drift:
 //   * below the floor                 → no POST at all, marker written.

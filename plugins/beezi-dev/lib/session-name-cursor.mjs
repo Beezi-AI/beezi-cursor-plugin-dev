@@ -10,9 +10,11 @@ import { readCliChatMeta } from './cli-chats-cursor.mjs';
 // composerData. The IDE and the CLI keep separate stores, so for any one id at most one of the two
 // title sources exists; the IDE goes first only because it is the older, better-known source.
 //
-// The fallback matters more here than for Codex: Cursor's hook set has no prompt event, so the
-// sidecar only carries a prompt if the writer registered one. When it does not, the prompt is read
-// out of composerData — enrichment that degrades to null rather than failing.
+// The fallback matters more here than for Codex: the sidecar only carries prompt TEXT if a writer
+// put it there. The `prompt` line scripts/prompt-submit.mjs writes on `beforeSubmitPrompt` is
+// text-free by design (the sidecar outlives the session, and it is a turn-start marker, not a
+// transcript), so it is skipped below like any other text-free line. When no line has text, the
+// prompt is read out of composerData — enrichment that degrades to null rather than failing.
 
 const MAX = 200;
 // What the CLI calls every chat until `/rename` or its auto-titler names it; every headless `-p` chat

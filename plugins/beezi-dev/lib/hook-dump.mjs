@@ -133,6 +133,64 @@ function buildRecord(rawBuffer, argv) {
   return record;
 }
 
+// What a redacted field's value is replaced with. A fixed, obviously-not-Cursor string, so nobody
+// reading a capture mistakes it for what the host sent.
+export const REDACTED = '[redacted by beezi]';
+
+// Replace the named top-level fields of a JSON payload, keeping its keys and its encoding. Returns
+// the new bytes, or null when the payload cannot be read as a JSON object.
+//
+// WHY THIS EXISTS. Capture is "raw bytes, verbatim" (property 3 above), and for one hook that is
+// the wrong promise: `beforeSubmitPrompt` carries the user's prompt text and their attachments,
+// which are what a person typed to the model rather than anything about how Cursor's hooks behave.
+// The capture file and the replay spill both outlive the run — a killed hook leaves its spill for
+// good — so scripts/prompt-submit.mjs asks for those fields to be replaced before either is
+// written. The SHAPE is kept, because the shape is what capture is for: every key is still there,
+// an array keeps its length (how many attachments a real payload carries is a real question), and
+// every other field is untouched.
+//
+// NULL, NOT A GUESS, when the bytes are not a JSON object. An unparseable payload cannot be
+// redacted, and writing it unredacted is the one outcome this function exists to prevent. The
+// hook's own decoder (readHookInput in lib/hook-input-cursor.mjs) rejects the same bytes, so the
+// hook loses nothing it could have used. That is also why the decoding here matches that decoder's
+// — the same UTF-16 marks, the same stripped U+FEFF run, the same trim: a payload the decoder
+// accepted but this refused would silently lose the hook's own work whenever capture is on. It is
+// reimplemented rather than imported because this module is one of the four a hook entry imports
+// statically, and hook-input-cursor is deliberately reached only through the runner's `load`.
+export function redactPayloadBytes(rawBuffer, fields) {
+  if (!Buffer.isBuffer(rawBuffer) || !Array.isArray(fields)) return null;
+  let encoding = 'utf-8';
+  let swapped = false;
+  let bytes = rawBuffer;
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) encoding = 'utf16le';
+  else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // swap16 throws on an odd length, and so does the decoder's — the same bytes are refused by both.
+    if (bytes.length % 2 !== 0) return null;
+    bytes = Buffer.from(bytes).swap16();
+    encoding = 'utf16le';
+    swapped = true;
+  }
+  const text = bytes.toString(encoding);
+  const lead = /^\uFEFF*/.exec(text)[0];
+  let parsed;
+  try {
+    parsed = JSON.parse(text.slice(lead.length).trim());
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, field)) continue;
+    const value = parsed[field];
+    if (Array.isArray(value)) parsed[field] = value.map(() => REDACTED);
+    // null, numbers and booleans carry no text, and replacing them would hide a shape fact.
+    else if (value !== null && (typeof value === 'string' || typeof value === 'object')) parsed[field] = REDACTED;
+  }
+  // The leading marks go back exactly as they arrived, so `head_hex` still answers the BOM question.
+  const out = Buffer.from(lead + JSON.stringify(parsed), encoding);
+  return swapped ? out.swap16() : out;
+}
+
 // Append one capture line for this hook run. Returns nothing: no caller may branch on whether the
 // capture landed, because no caller may behave differently when capture is on.
 export function dumpHookPayload(rawBuffer, argv = process.argv.slice(2)) {
@@ -169,7 +227,12 @@ export function dumpHookPayload(rawBuffer, argv = process.argv.slice(2)) {
 //
 // Returns null when capture is off, which is the whole of the cost on a normal run: no read, no
 // write, and the call site's fd-0 fallback leaves `readHookInput()` reading fd 0 exactly as before.
-export function captureHookStdin(fd = 0, { home = beeziCursorHome(), env = process.env } = {}) {
+//
+// `redact` names payload fields to replace BEFORE either copy is written — the dumped bytes and the
+// replay spill both. See redactPayloadBytes. A payload that cannot be redacted is recorded as a run
+// with no bytes and spills nothing; the hook then reads a drained fd 0 and gets no payload, which is
+// exactly what its own decoder would have made of the same bytes.
+export function captureHookStdin(fd = 0, { home = beeziCursorHome(), env = process.env, redact = null } = {}) {
   if (!env[DUMP_ENV_VAR]) return null;
   let raw;
   try {
@@ -178,6 +241,12 @@ export function captureHookStdin(fd = 0, { home = beeziCursorHome(), env = proce
     // Nothing readable on stdin. Report it as a run with no bytes rather than as no run: the caller
     // still dumps (buildRecord records `bytes: null`) and still falls back to fd 0.
     return { raw: null, replay: null };
+  }
+  if (Array.isArray(redact)) {
+    let redacted = null;
+    try { redacted = redactPayloadBytes(raw, redact); } catch { redacted = null; }
+    if (redacted === null) return { raw: null, replay: null };
+    raw = redacted;
   }
 
   const replay = path.join(captureDir(home), 'stdin', `${process.pid}-${Date.now()}.bin`);

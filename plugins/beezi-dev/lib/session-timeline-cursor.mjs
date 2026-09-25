@@ -24,8 +24,13 @@ import * as hostHttp from './http.mjs';
 // CLI, which fires no subagent hooks at all: its lines are rebuilt from the CLI's own chat store
 // (lib/cli-subagents-cursor.mjs) before correlation.
 //
-// The turn boundary is `stop`. `afterAgentResponse` / `afterAgentThought` are a staff-acknowledged
-// bug in the CLI (they do not fire), so nothing here may depend on them.
+// The turn END is `stop`; the turn START is the `prompt` line scripts/prompt-submit.mjs writes on
+// `beforeSubmitPrompt` (see buildPeriods). Staff once said `afterAgentResponse` /
+// `afterAgentThought` / `beforeSubmitPrompt` do not fire in the CLI, and that is no longer the whole
+// picture: receptron/mulmoterminal#2064 observed them firing in the INTERACTIVE CLI on 2026.09.10,
+// and not in headless `agent -p`. So the prompt line is used when it is there and nothing here
+// depends on it: a turn without one (`-p`, an older build, a sidecar written before the hook
+// existed) falls back to the `stop` rule it has always had.
 
 // `dedupeEvents` is REQUIRED for the subagent list and merely tidy for the periods.
 //
@@ -128,8 +133,68 @@ export const WAITING_SUBTYPE = Object.freeze({ COMMAND_APPROVAL: 'command_approv
 // Left out, that gap was an agent-side gap, and one over five minutes drew as `idle` — which the
 // portal labels "Subagents working" — at the very start of a session that had delegated nothing.
 // Billing is unaffected: delta-cursor's SESSION_LIFECYCLE_EVENTS keeps `session_start` out of the
-// timing anchors, so this only decides how the gap is DRAWN, never whether it is billed.
-const TURN_END_EVENTS = new Set(['stop', 'end', 'session_end', 'session_start']);
+// timing anchors, so this only decides how the gap is DRAWN, never whether it is billed. When the
+// session's first real anchor is a prompt the lead-in is dropped altogether — see periodAnchors.
+//
+// `end` / `session_end` USED to be members. They are not anchors at all any more (CLOSING_EVENTS
+// below), so they could never be the `prev` of a gap and listing them here would be dead weight.
+const TURN_END_EVENTS = new Set(['stop', 'session_start']);
+
+// Turn STARTS: the human pressed Send. scripts/prompt-submit.mjs writes `prompt` on
+// `beforeSubmitPrompt`; the three aliases are the spellings delta-cursor and
+// lib/session-name-cursor.mjs have always recognised for the same line.
+//
+// Why this exists (verified on a real CLI session): a turn that calls no tool leaves nothing in the
+// sidecar but the `gen` + `stop` pair stop.mjs writes at its END. With only turn ends to go on,
+// every gap in such a session followed a `stop`, so every gap drew as `waiting_user`, the first turn
+// (which happened before the first line) was never drawn at all, and the portal showed a session of
+// almost nothing but "User input". A prompt line is the other edge of the turn: the gap BEFORE it
+// is the user's, the gap AFTER it is the agent's.
+const PROMPT_EVENTS = new Set(['prompt', 'user', 'user_message', 'user_prompt']);
+
+// Session CLOSE lines, which are not period anchors at all.
+//
+// `sessionEnd` fires when the user closes the CLI or the composer, which is whenever they get round
+// to it — minutes or hours after the last turn ended. As an anchor it drew that whole stretch as a
+// trailing "User input" band (the gap after the last `stop`) and stretched the axis to it, so every
+// session ENDED on the human, however much work it did. The last thing that actually happened in a
+// session is its last turn's end, and that is where the timeline now stops. Billing never used it
+// as an anchor either (delta-cursor, SESSION_LIFECYCLE_EVENTS).
+const CLOSING_EVENTS = new Set(['end', 'session_end']);
+
+// The anchors buildPeriods classifies, sorted, each tagged with the one fact the classifier needs.
+//
+// Two rules live here rather than in the loop, because the session span (computeSessionTimeline)
+// has to be measured over exactly the same list — otherwise the axis runs past the first or last
+// drawn period and the portal shows a blank tail:
+//
+//   - CLOSING_EVENTS are dropped. See above.
+//   - Leading `session_start` anchors are dropped when the first real anchor is a prompt. This is
+//     the Claude plugin's `dropLeadIn` (beezi-claude-plugins, lib/session-timeline.mjs): the
+//     timeline starts when the human first speaks. The minutes between opening the CLI and typing
+//     are not a turn, and once a prompt says exactly when the first turn began there is nothing
+//     left for that band to mean. Without a prompt (`-p`, an older build, an old sidecar) the
+//     session_start stays, and the lead-in draws as the user's wait exactly as it did before.
+function periodAnchors(events) {
+  const anchors = [];
+  for (const event of events) {
+    const ts = timestampOf(event);
+    if (ts === null) continue;
+    const ev = event == null ? undefined : event.ev;
+    if (CLOSING_EVENTS.has(ev)) continue;
+    anchors.push({
+      ts,
+      prompt: PROMPT_EVENTS.has(ev),
+      endsTurn: TURN_END_EVENTS.has(ev),
+      sessionStart: ev === 'session_start',
+    });
+  }
+  anchors.sort((a, b) => a.ts - b.ts);
+  let lead = 0;
+  while (lead < anchors.length && anchors[lead].sessionStart) lead += 1;
+  if (lead > 0 && lead < anchors.length && anchors[lead].prompt) return anchors.slice(lead);
+  return anchors;
+}
 
 // Re-exported from the dependency-free module that owns it — same function, one implementation. See
 // the note there for why it lives on that side of the import.
@@ -233,13 +298,16 @@ export function buildPeriods(events, options = {}) {
   // pre-break vocabulary, where a long wait stays `waiting_user`.
   const allowBreakState = options.allowBreakState !== false;
   const markers = validMarkers(options.permissionMarkers);
-  const anchors = [];
-  for (const event of events) {
-    const ts = timestampOf(event);
-    if (ts === null) continue;
-    anchors.push({ ts, endsTurn: TURN_END_EVENTS.has(event == null ? undefined : event.ev) });
-  }
-  anchors.sort((a, b) => a.ts - b.ts);
+  const anchors = periodAnchors(events);
+
+  // A wait on the human: `break` past BREAK_MS when the caller allows it, `waiting_user` otherwise,
+  // with the validated subtype when a marker covers the whole gap. One function because two rules
+  // below reach it and a subtype honoured by one of them only would label a stop→prompt gap
+  // differently from a stop→gen one for the same wait.
+  const userWait = (prev, cur) => {
+    if (allowBreakState && cur.ts - prev.ts >= BREAK_MS) return { state: STATE.BREAK, subtype: null };
+    return { state: STATE.WAITING_USER, subtype: subtypeFor(markers, prev.ts, cur.ts) };
+  };
 
   const merged = [];
   for (let i = 1; i < anchors.length; i++) {
@@ -247,27 +315,37 @@ export function buildPeriods(events, options = {}) {
     const cur = anchors[i];
     if (cur.ts <= prev.ts) continue;
     const gap = cur.ts - prev.ts;
-    let state;
-    let subtype = null;
-    // WHO WAS WAITING decides the state; how long only ever splits a user wait into `break`.
+    let judged;
+    // WHO WAS WAITING decides the state; how long only ever splits a user wait into `break`. Each
+    // gap is judged on its own two edges and the first rule that matches wins:
     //
-    // The turn boundary comes FIRST, and that is the fix for the misclassification this module
-    // shipped with: the idle threshold used to be tested before it, so any think-time over five
-    // minutes stopped being the user's. Sixteen real minutes of a person reading a diff drew as
-    // `idle` — which the portal renders as "Subagents working" — in the middle of a session where
-    // no subagent was running.
+    //   1. `cur` is a prompt: the human was composing it, so the gap is theirs. This outranks
+    //      everything, including a `prev` that is a tool call — a turn the user aborted without a
+    //      `stop` still ends when they type the next prompt.
+    //   2. `prev` is a prompt: Send was pressed, the turn is the agent's. `idle` past the idle
+    //      threshold (the agent waiting on a slow model or a long think, the same boundary billing
+    //      drops the gap at), `working` under it — and NEVER `waiting_user`, which is exactly the
+    //      mislabel that drew no-tool CLI turns as "User input" from end to end.
+    //   3. `prev` is a turn end (`stop`, or the `session_start` boundary): the rule this module has
+    //      always had, and now the FALLBACK for a turn with no prompt line — `-p`, older builds and
+    //      every sidecar written before the hook existed classify exactly as they did.
+    //   4. anything else is mid-turn: `idle` past the threshold, `working` under it.
+    //
+    // The turn boundary comes before the idle threshold, and that is the fix for the
+    // misclassification this module shipped with: the threshold used to be tested first, so any
+    // think-time over five minutes stopped being the user's. Sixteen real minutes of a person
+    // reading a diff drew as `idle` — which the portal renders as "Subagents working" — in the
+    // middle of a session where no subagent was running.
     //
     // Length never moves a gap OUT of the user's column except past BREAK_MS, and length never
     // moves an agent-side gap INTO it: a four-hour background script is the agent waiting, not the
     // human, so it stays `idle` whatever the clock says.
-    if (prev.endsTurn) {
-      if (allowBreakState && gap >= BREAK_MS) state = STATE.BREAK;
-      else {
-        state = STATE.WAITING_USER;
-        subtype = subtypeFor(markers, prev.ts, cur.ts);
-      }
-    } else if (gap >= IDLE_GAP_MS) state = STATE.IDLE;
-    else state = STATE.WORKING;
+    if (cur.prompt) judged = userWait(prev, cur);
+    else if (prev.prompt) judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
+    else if (prev.endsTurn) judged = userWait(prev, cur);
+    else judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
+    const state = judged.state;
+    const subtype = judged.subtype;
 
     const last = merged[merged.length - 1];
     // State AND subtype: merging a labelled wait into an unlabelled one would spread an observation
@@ -339,7 +417,11 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
     if (ts > maxTs) maxTs = ts;
   }
   // Events exist but none is timestamped: that is a writer/reader schema mismatch, not an idle
-  // session, and reporting a zero-length timeline would hide it.
+  // session, and reporting a zero-length timeline would hide it. Measured over EVERY line, not the
+  // period anchors below: a sidecar holding nothing but `session_end` is a real session with no
+  // drawable period, not a schema mismatch. The raw maximum is also the subagent correlator's
+  // ceiling for a synthetic close, unchanged, so no worker's span moves because of how the
+  // periods are anchored.
   if (minTs === Infinity) return null;
 
   // No collapse available means no subagents — never a doubled list. See the import note.
@@ -365,12 +447,39 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
   const capped = spans.length > MAX_SUBAGENTS ? spans.slice(-MAX_SUBAGENTS) : spans;
   const entries = capped.map(toSubagentEntry);
 
+  // The session span: the same anchors the periods were drawn from, widened by any subagent span.
+  //
+  // Not the raw min/max any more. The raw maximum is the trailing `session_end`, which is not a
+  // period anchor (CLOSING_EVENTS), and the raw minimum is a `session_start` the lead-in rule may
+  // have dropped — measured from those, the axis would run minutes or hours past the first or last
+  // drawn period and the portal would show a blank tail at either end. Subagent spans widen it
+  // because a lane is drawn on the same axis. Falls back to the raw bounds only when no anchor is
+  // left at all (a sidecar holding nothing but a shutdown line).
+  let spanStart = Infinity;
+  let spanEnd = -Infinity;
+  for (const anchor of periodAnchors(window)) {
+    if (anchor.ts < spanStart) spanStart = anchor.ts;
+    if (anchor.ts > spanEnd) spanEnd = anchor.ts;
+  }
+  // `started_ms` / `ended_ms`, the spelling correlateSubagents returns (lib/subagents-cursor.mjs).
+  // Codex review, MAJOR: this loop once read `startedMs` / `endedMs` — the correlator's INTERNAL
+  // names, which it never ships — so it widened nothing, and a background subagent synthetically
+  // closed at session_end was drawn as a lane running past the end of the timeline's own axis.
+  for (const span of spans) {
+    if (Number.isFinite(span.started_ms) && span.started_ms < spanStart) spanStart = span.started_ms;
+    if (Number.isFinite(span.ended_ms) && span.ended_ms > spanEnd) spanEnd = span.ended_ms;
+  }
+  if (spanStart === Infinity || spanEnd === -Infinity) {
+    spanStart = minTs;
+    spanEnd = maxTs;
+  }
+
   const timeline = {
     periods: trimmedPeriods,
     plan_events: [],
     subagents: entries,
-    started_at: new Date(minTs).toISOString(),
-    ended_at: new Date(maxTs).toISOString(),
+    started_at: new Date(spanStart).toISOString(),
+    ended_at: new Date(spanEnd).toISOString(),
     generated_at: new Date().toISOString(),
   };
 
