@@ -159,7 +159,17 @@ export async function maybeRunPulse(input, deps = {}, budgetMs = 0) {
       : deps.runCheckpoint;
     // emitTimeline, like `stop` and `sessionEnd`: a turn reported mid-flight must not leave the
     // session timeline describing only the part before the pulse.
-    await runCheckpoint(input, {}, { emitTimeline: true, budgetMs });
+    const result = await runCheckpoint(input, {}, { emitTimeline: true, budgetMs });
+    // A checkpoint that could not tell whether this conversation is a Cursor CLI subagent chat
+    // (lib/checkpoint.mjs, the ownership guard) resolved without doing anything. Stamping that `ok`
+    // would buy a quarter hour of silence for a window nobody has looked at — a real session whose
+    // chat store was locked for a moment would report fifteen minutes late for no reason. It is a
+    // failure for this gate's purposes: the short retry. A child the guard DID recognise
+    // (`skippedChild`) is a complete answer and takes the full interval, like any other run.
+    if (result != null && result.deferred === true) {
+      writeState(stateFile, { lastAt: now(), ok: false }, deps);
+      return { ran: true, ok: false, reason: 'deferred' };
+    }
     writeState(stateFile, { lastAt: now(), ok: true }, deps);
     return { ran: true, ok: true, reason: 'ran' };
   } catch {

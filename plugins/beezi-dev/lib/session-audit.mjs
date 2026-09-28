@@ -723,6 +723,7 @@ export async function runAudit(deps = {}, options = {}) {
     const reports = [];
     let sessionErrors = [];
     let deltaFailed = false;
+    let deferred = false;
     try {
       const checkpoint = await runCheckpoint(
         { session_id: entry.sessionId, cwd: recordedCwd(entry.sessionId) },
@@ -738,6 +739,7 @@ export async function runAudit(deps = {}, options = {}) {
       );
       sessionErrors = checkpoint == null || checkpoint.sessionErrors == null ? [] : checkpoint.sessionErrors;
       deltaFailed = checkpoint != null && checkpoint.deltaFailed === true;
+      deferred = checkpoint != null && checkpoint.deferred === true;
     } catch {
       // One unreadable sidecar must not end the run — but it is not silent either.
       result.unreadable += 1;
@@ -748,10 +750,13 @@ export async function runAudit(deps = {}, options = {}) {
     processed += 1;
     if (reports.length === 0) {
       // Classify rather than drop on the floor: telling a user that a session we FAILED to read
-      // "held no usage data" is the silent loss this exists to end. Only one failure can reach
-      // here now — the checkpoint's other no-report causes were unreachable branches — so `empty`
-      // is the answer once an unreadable sidecar has been ruled out.
-      if (deltaFailed) {
+      // "held no usage data" is the silent loss this exists to end. Two failures can reach here: an
+      // unparseable sidecar, and a checkpoint whose CLI ownership guard could not tell yet whether
+      // this is a subagent chat (`deferred` — nothing was read at all). Both leave the session
+      // retryable and hold the seal open the first time, through the one path that already does
+      // that. A recognised CLI child produces no reports and no flag, and is `empty` — correctly:
+      // its parent's reports carry it.
+      if (deltaFailed || deferred) {
         result.unreadable += 1;
         noteUnreadable(entry.sessionId);
       } else result.empty += 1;
@@ -1222,6 +1227,9 @@ export async function runSync(deps = {}, options = {}) {
           }
           const reports = extracted == null || !Array.isArray(extracted.reports) ? [] : extracted.reports;
           if (reports.length === 0) {
+            // The CLI ownership guard could not tell yet whether this is a subagent chat, so
+            // nothing was looked at: a later run is what answers it, exactly like a lock miss.
+            if (extracted != null && extracted.deferred === true) return 'deferred';
             return extracted != null && extracted.deltaFailed === true ? 'unreadable' : 'empty';
           }
 

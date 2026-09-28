@@ -16,7 +16,7 @@ import { resolveRepoRoot } from './repo-timeline.mjs';
 import { POST_TIMEOUT_MS } from './http.mjs';
 import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { HOOK_GUARD_MARGIN_MS } from './hook-runner.mjs';
-import { safeName } from './sidecar.mjs';
+import { eventsFileFor, safeName } from './sidecar.mjs';
 import { lazyRecordIssue } from './diagnostics-sink.mjs';
 import { sessionLockPath, withLock } from './lock.mjs';
 import { deliverQueue } from './queue-delivery.mjs';
@@ -27,6 +27,8 @@ import {
   timelineStatusOf, writeTimelineOutbox,
 } from './timeline-outbox.mjs';
 import { withCliSubagents } from './cli-subagents-cursor.mjs';
+import { classifyCliChat } from './cli-chats-cursor.mjs';
+import { readChildOwner, writeChildOwner } from './cli-child-owner.mjs';
 import { cursorVersionAt } from './sidecar-events.mjs';
 import { planAttributionRuns } from './attribution-cursor.mjs';
 import { detectBillingSource } from './billing.mjs';
@@ -244,7 +246,9 @@ export const HOOK_BUDGET_MS = HOOK_TIMEOUT_SEC * 1000 - HOOK_GUARD_MARGIN_MS;
 //
 // This is also, permanently, a SUBAGENT segment's answer. The two events that do carry a turn's
 // usage key it to a generation, and nothing anywhere in Cursor attributes a generation to the worker
-// that made it — which is why a subagent segment carries time and identity and nothing else.
+// that made it — which is why a subagent segment carries time and identity and no tokens. (A Cursor
+// CLI worker's row does also carry its own code changes and operations, which ARE attributable: they
+// come from the worker's own sidecar. See the fold in the subagent loop.)
 const NO_TOKENS = Object.freeze({
   token_total: 0,
   token_input: 0,
@@ -449,6 +453,13 @@ function subagentModelsFrom(entries) {
   return out;
 }
 
+// The least hook budget a CLI worker's fold may START on (see the fold in the subagent loop). The
+// fold parses the worker's whole sidecar — a few hundred lines on a real explore worker, milliseconds
+// — but it runs per worker, before the batch is made durable and before the timeline POST, and both
+// of those matter more than line counts that the next turn-end can fold instead. Below this the row
+// goes out as it always did, carrying the last fold already sent if there is one.
+const FOLD_MIN_BUDGET_MS = 1000;
+
 // Which of the Cursor account's two money streams paid for this segment. Coarser than the per-entry
 // `billing_pool` by construction — one segment can be part seat and part credits, and only the
 // entries can say how much of each — so it is deliberately derived from them rather than tracked
@@ -577,6 +588,12 @@ export function createCheckpointCaches() {
 // buffered rather than POSTed; deltaFailed says the sidecar could not be parsed at all, which is
 // what lets the backfill report a session as unreadable rather than as one that genuinely held no
 // usage. Nothing else can now explain a run that produced no report — see `deltaFailed` below.
+//
+// Two more keys, each present only on the run it describes (see the ownership guard): `skippedChild:
+// true` says this conversation is a Cursor CLI subagent chat, reported by its parent and never on
+// its own, which is a complete answer and not a failure; `deferred: true` says the guard could not
+// tell yet, so nothing was read, written or sent and the caller must RETRY rather than record "no
+// usage" — the pulse stamps it as a failure, the backfill as an unreadable session.
 //
 // ── options
 //
@@ -742,6 +759,69 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       fetchImpl, now, ...(deadline === null ? {} : { deadline }), ...snapshotDeps,
     });
     return { enqueued: 0, flush, sessionErrors: collectedErrors, deltaFailed: false };
+  }
+
+  // ── ownership: a Cursor CLI subagent chat is never a session of its own
+  //
+  // CLI 2026.09.23 fires postToolUse, afterShellExecution and afterFileEdit INSIDE a subagent chat,
+  // under the child's own conversation_id, so a child has a sidecar and the mid-turn pulse
+  // checkpointed it like any conversation. Nothing asked what the id was: every child reached
+  // /sessions/report and the timeline as a nameless top-level session (the portal's "N/A"), while
+  // its parent was already reporting the same worker as an `is_subagent` row — its time twice,
+  // under two sessions. The parent owns its children (and, since a child is never reported, every
+  // deeper descendant: listCliSubagents), so a child's checkpoint does NOTHING.
+  //
+  // Here, and nowhere later, because everything below reads or writes something that belongs to a
+  // session: the name resolver can read the sidecar, pending recovery re-queues saved payloads, and
+  // the rest reads the sidecar, takes the lock, writes state and POSTs a timeline. Below the token
+  // and tracking gates, so an unlinked or tracking-off machine pays nothing for it. AUDIT mode runs
+  // it too: the backfill must never upload a child as a session either.
+  //
+  // The durable marker FIRST (lib/cli-child-owner.mjs): a child's chat store can vanish or lock, and
+  // the marker is what keeps it a child with no chat-store read at all. Only then the store
+  // (classifyCliChat). A child is recorded and REFRESHED on every hit, so the marker ages with the
+  // child's activity under prune rather than from the first time it was seen — this is the one write
+  // a child's checkpoint makes, and it is ownership metadata, not reporting state.
+  //
+  // `unknown` (the deadline cut the lookup short, or a store with no meta.json could not be read) is
+  // a DEFERRAL, not "no usage": nothing is read, written or sent, and `deferred: true` tells the
+  // caller to come back. Reporting it would be the bug this guard exists for; dropping it could lose
+  // a real session. The one SQLite read this adds sits here, on the checkpoint path — never on the
+  // pulse's not-due path or on a non-git afterShellExecution, neither of which reaches runCheckpoint.
+  //
+  // The chat-store reader judges the deadline on `deps.now` when it is given one, and this is the
+  // only chat-store read where that matters: every other one costs enrichment when a clock and a
+  // deadline disagree, while this one would defer the whole checkpoint. So it gets this run's clock.
+  //
+  // Both early returns still drain the machine-wide queue, exactly as the tracking gate above does:
+  // the backlog has nothing to do with this conversation.
+  const flushOthers = () => (skipFlush ? null : flushQueue(token, {
+    fetchImpl,
+    now,
+    ...(deadline === null ? {} : { deadline }),
+    ...(deps.auth == null ? {} : { auth: deps.auth }),
+    ...snapshotDeps,
+  }));
+  const classifyDeps = {
+    ...deadlineDeps,
+    ...(deps.sqlite === undefined ? {} : { sqlite: deps.sqlite }),
+    ...(typeof deps.chatsDir === 'string' ? { chatsDir: deps.chatsDir } : {}),
+    now,
+  };
+  let owner = readChildOwner(session_id);
+  let ownership = null;
+  if (owner === null) {
+    ownership = classifyCliChat(session_id, classifyDeps);
+    if (ownership.kind === 'child') owner = { parent: ownership.parentAgentId, root: ownership.rootParentAgentId };
+  }
+  if (owner !== null) {
+    writeChildOwner(session_id, owner);
+    const flush = await flushOthers();
+    return { enqueued: 0, flush, sessionErrors: collectedErrors, deltaFailed: false, skippedChild: true };
+  }
+  if (ownership !== null && ownership.kind === 'unknown') {
+    const flush = await flushOthers();
+    return { enqueued: 0, flush, sessionErrors: collectedErrors, deltaFailed: false, deferred: true };
   }
 
   // Both below the token gate: skip this work entirely on an unlinked machine.
@@ -1137,6 +1217,45 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       && !Array.isArray(state.sentSubagents) ? { ...state.sentSubagents } : {};
     let sentSubagentsDirty = false;
 
+    // `agent_id` -> `{ sig, code_changes, operations }`: the CLI worker's own work as last SENT on
+    // its row (the fold, in the subagent loop below). Two jobs, like `sentSubagents` beside it:
+    //
+    //   the signature   what stops an unchanged worker being re-queued at every turn-end, and what
+    //                   makes a worker that did MORE go out again even when its duration did not
+    //                   move — the duration-only skip would otherwise drop every metric update.
+    //   the figures     what a row carries when the fold cannot run this time (short budget, a
+    //                   worker sidecar that failed to parse, could not be read, or shrank). The server upserts a subagent row by
+    //                   sourceRef and REPLACES its values, so a CLI worker's row re-sent without its
+    //                   fold would wipe the folded figures (controller amendment A3). A row never
+    //                   goes out with fewer metrics than were already sent.
+    //
+    // Only CLI workers ever get an entry, one per worker, so it grows with delegations the same way
+    // `sentSubagents` does. A state file from before the fold has none, which reads as "changed"
+    // exactly once: one upsert per worker, then quiet. NEVER REACHES THE WIRE: it lives on `state`.
+    // Each entry also carries `account` and `sentAt` (fix round 3): it is reused only under the
+    // account that staged it, and an entry written before those existed is not reused at all.
+    //
+    // AUDIT mode reads it from the LIVE state file, READ-ONLY, where every other carry is withheld
+    // (`freshState`). Codex review (fix round 1): with no stored fold, a backfill or sync of a
+    // session whose worker sidecar has since been pruned emitted that worker's row bare, and the
+    // server's upsert replaced the folded figures with nothing. This one carry is safe to borrow
+    // because it only ever RAISES what a row says, never widens a window or moves a cursor — and
+    // only from a state stamped with the account this run reports under, the same rule
+    // lib/sidecar-index.mjs `liveCursorOf` applies: another tenant's figures are not this tenant's
+    // history. Nothing computed here is written back; the save guard below still holds. This is the
+    // FIRST place a prior fold is looked for; the worker's ownership marker is the second, and the
+    // only one a fold staged by a backfill or sync is recorded in (see the subagent loop).
+    const workSource = (() => {
+      if (!freshState) return state.sentSubagentWork;
+      let live = null;
+      try { live = loadState(session_id); } catch { live = null; }
+      if (live == null || live.account == null || accountStamp == null || live.account !== accountStamp) return null;
+      return live.sentSubagentWork;
+    })();
+    const sentSubagentWork = workSource != null && typeof workSource === 'object'
+      && !Array.isArray(workSource) ? { ...workSource } : {};
+    let sentSubagentWorkDirty = false;
+
     // delta-cursor returns ONE main segment per checkpoint — the sidecar is a single ordered stream
     // per conversation, so there is no per-turn cwd to re-segment on the way Codex's rollout has.
     // Repo and branch therefore come from the hook's own cwd, refined by anything the delta chose to
@@ -1276,7 +1395,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     //
     // Cursor exposes NO per-subagent token usage anywhere — no sub-transcript, no usage block, no
     // per-agent cost — so `duration_sec` is the only quantitative thing one of these segments can
-    // carry, and getting it right is the whole feature. It is the residual: the part of this
+    // carry about SPEND, and getting it right is the whole feature. (A CLI worker's row also carries
+    // its own line counts and operations; see the fold below.) It is the residual: the part of this
     // worker's span that neither the main segment nor an earlier-billed sibling already claimed.
     //
     // Only on the turn-end path, because correlation is whole-session by contract. A worker's start
@@ -1287,11 +1407,102 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // subagent time is not lost, it is billed by the next turn-end, and coverage is what makes that
     // safe to do twice.
     //
-    // No `code_changes` and no `operations`: Cursor gives no way to attribute an edit or a tool call
-    // to the worker that made it (whether a subagent's own tool calls even reach `postToolUse` under
-    // the parent's conversation_id is UNVERIFIED), and the backend stamps both once per segment and
-    // sums them session-wide with no `is_subagent` filter — so a guess here would double the
-    // session's line counts, not enrich them.
+    // `code_changes` and `operations` only for a CLI worker, and only its OWN. Nothing in the
+    // PARENT's stream attributes an edit or a tool call to the worker that made it, and the backend
+    // stamps both once per segment and sums them session-wide with no `is_subagent` filter — so for
+    // an IDE worker a guess here would double the session's line counts, not enrich them, and its
+    // row carries neither. A Cursor CLI worker is different, and measured: since CLI 2026.09.23 its
+    // own tool calls fire postToolUse, afterShellExecution and afterFileEdit under the WORKER's own
+    // conversation_id, into a sidecar of its own that the ownership guard above refuses to report as
+    // a session. Its work is therefore never in the parent's lines (Codex verified zero overlap of
+    // edit paths on a real six-worker session), and with the guard it would reach the server
+    // nowhere at all — 671 added lines in one worker there. So its row carries them: the fold below.
+    //
+    // THE FOLD, per CLI worker this session owns:
+    //   - owned: its marker or its chat store says it is a CLI child whose parent or root is THIS
+    //     session, and it has a sidecar. IDE spans never qualify, so their rows are untouched.
+    //   - cumulative: the worker's WHOLE sidecar through the ordinary delta engine, because the row's
+    //     segmentId is stable and the server replaces its values on every upsert.
+    //   - events only: the machine-wide ai-code-tracking database is time-windowed, not
+    //     conversation-scoped, so over the worker's lifetime it would count the parent's edits (and
+    //     anything else the machine did) as the worker's. The worker's own `edit` lines are exactly
+    //     what it did. Likewise no usage read, no chat-store read and no git: models, tokens, cost
+    //     and attribution on this row stay the parent's zeroed identity, as before — only
+    //     `code_changes` and `operations` are added, two keys the main segment already sends.
+    //   - re-sent on change: see `sentSubagentWork`; a row whose fold cannot run carries the last one
+    //     sent, never less.
+    //   - supersede-safe: a row carrying a fold spans `from_line: 0` (controller amendment A4). The
+    //     backend retires earlier rows of this session and agent whose window the new row contains,
+    //     and a parent whose model changed between turn-ends changes the row's sourceRef — so a
+    //     window-scoped row would survive beside its successor and the fold would be summed twice.
+    //   - budgeted: skipped below FOLD_MIN_BUDGET_MS, and retried at the next turn-end.
+    //   - only from a read that WORKED, and never downwards (Codex review, fix round 1): the delta
+    //     engine answers an unreadable sidecar (EACCES, a scanner's lock) with an EMPTY stream rather
+    //     than a throw, and a fold of that is all zeros; and a sidecar is append-only, so cumulative
+    //     figures below the stored ones mean a truncated or recreated file, not less work. Either way
+    //     the stored fold is what the row carries, and it stays what is on record.
+    //   - exactly one of three per row (controller ruling, fix round 2): a fresh valid fold; else the
+    //     last fold staged, from this session's state (account-matched in audit mode) or else from
+    //     the worker's ownership marker, which keeps it beside the ids in EVERY mode — the one record
+    //     a backfill or sync (which keep no state) leaves behind; else the BARE duration row, exactly
+    //     as before the fold existed. A worker with no fold anywhere was never folded, so its bare
+    //     row overwrites nothing. Round 1 withheld that row instead; Codex re-review showed it could
+    //     drop a legitimate worker's duration row for good (a sidecar gone for good, or a sync that
+    //     failed and then answered `upToDate` without ever retrying the child).
+    //   - the marker ages with the PARENT: every turn-end that sees the worker rewrites it, sidecar
+    //     or not, keeping its fold — so while the parent is active neither is pruned.
+    const foldDeps = { readUsageData: () => null, cliStoreFacts: null, cliMeta: null, aiCodeTrackingDbFile: null, ...deadlineDeps };
+    const ownsWorker = (owner) => owner != null && (owner.parent === session_id || owner.root === session_id);
+    // `{ parent, root, recorded }` when this worker is a CLI child that has a sidecar right now, else
+    // null. `recorded` says the ownership came from the marker (`marker`, already read) rather than
+    // the chat store.
+    const provenCliWorker = (agentId, marker) => {
+      if (typeof agentId !== 'string' || agentId === session_id) return null;
+      // Cheapest first: an IDE worker has no sidecar of its own, and that costs one stat.
+      const sidecar = eventsFileFor(agentId);
+      try { if (sidecar === null || !fs.statSync(sidecar).isFile()) return null; } catch { return null; }
+      if (marker !== null) return { parent: marker.parent, root: marker.root, recorded: true };
+      const verdict = classifyCliChat(agentId, classifyDeps);
+      if (verdict.kind !== 'child') return null;
+      return {
+        parent: verdict.parentAgentId,
+        root: verdict.rootParentAgentId == null ? verdict.parentAgentId : verdict.rootParentAgentId,
+        recorded: false,
+      };
+    };
+    const opsCount = (operations) => Object.keys(operations).reduce((n, key) => {
+      const bucket = operations[key];
+      return n + (bucket != null && Number.isFinite(bucket.count) ? bucket.count : 0);
+    }, 0);
+    const shrank = (fresh, prior) => {
+      if (prior === null || prior.code_changes == null || prior.operations == null) return false;
+      const a = fresh.code_changes;
+      const b = prior.code_changes;
+      return a.files_changed < b.files_changed || a.lines_added < b.lines_added
+        || a.lines_removed < b.lines_removed || opsCount(fresh.operations) < opsCount(prior.operations);
+    };
+    const foldWorker = (agentId, prior) => {
+      const left = timeLeft();
+      if (left !== null && left < FOLD_MIN_BUDGET_MS) return null;
+      let work = null;
+      try { work = computeDelta(agentId, 0, foldDeps); } catch { return null; }
+      if (work == null || work.code_changes == null || work.operations == null) return null;
+      // Evidence the read worked: the whole stream came back with lines in it. A sidecar that could
+      // not be read comes back as an empty one, and an empty one has nothing to fold anyway.
+      if (!(Number.isFinite(work.to) && work.to > 0)) return null;
+      const fresh = {
+        // The signature is the serialised pair: exactly what the wire would carry, the
+        // non-enumerable `diagnostics` and `mcpAliases` excluded by JSON.stringify itself.
+        sig: JSON.stringify({ code_changes: work.code_changes, operations: work.operations }),
+        code_changes: work.code_changes,
+        operations: work.operations,
+        // Local bookkeeping, never on the wire (the payload takes the two fields above): whose
+        // fold this is and when it was staged, which is what scopes its reuse (see `oursNewest`).
+        account: accountStamp,
+        sentAt: now(),
+      };
+      return shrank(fresh, prior) ? null : fresh;
+    };
     if (dedupedEvents) {
       const { subagents, diagnostics } = correlateSubagents(dedupedEvents);
       onSubagentDiagnostics(diagnostics);
@@ -1328,6 +1539,48 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         // total, and the server's upsert lands on the right number instead of replacing the earlier
         // figure with the increment.
         const durationSec = (alreadySent == null ? 0 : alreadySent) + residualSec;
+        // A CLI worker's own work (the fold, above). `fresh` is this run's; `work` is what the row
+        // carries — the fresh fold, else the last one staged (A3), else nothing: the bare row.
+        //
+        // The prior fold is NOT gated on ownership being provable this run: a state entry exists
+        // only because an ownership-verified run sent it, and a marker's fold only because one
+        // staged it under a marker that names this session. The worker's sidecar is pruned 14 days
+        // after its last line while the parent can go on or be resumed; a row re-sent bare on the
+        // same sourceRef then would wipe the fold server-side. Only a FRESH fold needs the worker
+        // proven now. Two sources: this session's state (account-matched in audit mode) and the
+        // marker (every mode's record, and the only one a backfill or sync leaves).
+        //
+        // SCOPED BY ACCOUNT AND FRESHNESS (Codex re-review, fix round 3; controller ruling). Only a
+        // fold stamped with THIS run's account is ours — the marker is shared by every account on the
+        // machine, and one staged before the stamp existed has none, so it is not ours either. Of the
+        // two, the NEWER `sentAt` wins, and an undated one loses: state held a live fold of 5 lines
+        // while a later backfill had staged 10 on the marker, and "state first" re-sent 5 over it.
+        const marker = typeof span.agent_id === 'string' ? readChildOwner(span.agent_id) : null;
+        const ours = (w) => w != null && typeof w === 'object' && typeof w.sig === 'string'
+          && w.code_changes != null && w.operations != null
+          && accountStamp != null && w.account === accountStamp;
+        const storedWork = sentSubagentWork[span.agent_id];
+        const stateWork = ours(storedWork) ? storedWork : null;
+        const markerWork = marker !== null && ownsWorker(marker) && ours(marker.work) ? marker.work : null;
+        const oursNewest = (a, b) => {
+          if (a === null || b === null) return a === null ? b : a;
+          const ta = Number.isFinite(a.sentAt) ? a.sentAt : null;
+          const tb = Number.isFinite(b.sentAt) ? b.sentAt : null;
+          if (tb === null) return a;
+          if (ta === null) return b;
+          return tb > ta ? b : a;
+        };
+        const priorWork = oursNewest(stateWork, markerWork);
+        const workerOwner = provenCliWorker(span.agent_id, marker);
+        const fresh = ownsWorker(workerOwner) ? foldWorker(span.agent_id, priorWork) : null;
+        const work = fresh !== null ? fresh : priorWork;
+        const workChanged = fresh !== null && (priorWork === null || fresh.sig !== priorWork.sig);
+        // The ownership marker, rewritten on EVERY turn-end that sees this worker (controller ruling,
+        // fix round 2) — sidecar or not, fold kept — so it ages with the parent's activity and is not
+        // pruned while the parent is live. First recorded here when the chat store proves the worker,
+        // where the queue and the outbox can see it too.
+        const knownOwner = workerOwner !== null ? workerOwner : marker;
+        if (knownOwner !== null) writeChildOwner(span.agent_id, { parent: knownOwner.parent, root: knownOwner.root });
         // Nothing new to say: this worker has already been reported with exactly this duration.
         //
         // THIS is what stops the re-derivation from re-queueing, and it is deliberately NOT the
@@ -1338,7 +1591,10 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
         // timeline's own gantt lanes (a different endpoint, derived straight from the spans) drew
         // all fifteen. A zero-duration row is the honest shape here - Cursor exposes no per-subagent
         // tokens, and the seconds are already billed on the parent.
-        if (alreadySent != null && durationSec === alreadySent) continue;
+        //
+        // AND with exactly this work, for a CLI worker whose fold ran: a worker that edited more
+        // lines in a turn where its duration did not move must still go out again.
+        if (alreadySent != null && durationSec === alreadySent && !workChanged) continue;
         // Only now is a git shell-out worth spending: a session that delegated nothing must not pay
         // for one. Memoized inside `attributionOf`, so a fifteen-worker fan-out costs exactly one.
         const { branch, remote } = attributionOf();
@@ -1360,7 +1616,9 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
             sessionId: session_id,
             remote,
             branch,
-            from_line: delta.from,
+            // The window it was derived in, except on a row carrying a CLI worker's fold, which
+            // spans from line 0 so it contains every earlier row of this worker (A4, above).
+            from_line: work === null ? delta.from : 0,
             to_line: delta.to,
             models,
             ...NO_TOKENS,
@@ -1376,6 +1634,9 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
             is_subagent: true,
             agent_id: span.agent_id,
             agent_type: span.agent_type,
+            // A CLI worker's own cumulative work (the fold). Absent, not zeroed, on every other row:
+            // an IDE worker's work is not observable apart from its parent's.
+            ...(work === null ? {} : { code_changes: work.code_changes, operations: work.operations }),
             // The worker's own task description. Redacted and truncated here rather than trusted: it
             // is free text from whoever spawned the agent, an over-long value fails validation for
             // the whole report, and free text is exactly where a pasted credential turns up (see
@@ -1402,6 +1663,25 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
           // unreported, which is the safe direction: the row is simply sent again.
           sentSubagents[span.agent_id] = durationSec;
           sentSubagentsDirty = true;
+          // The fold is recorded on the same condition, when it RAN — or when the one re-sent came
+          // from the marker and is newer than what state holds, so state stops trailing it. A fold
+          // re-sent from state taught us nothing, and a skipped one leaves the signature where it was
+          // so the next turn-end folds instead. Stored plain (the queue would serialise it anyway),
+          // with its account and staging time, so a re-send carries exactly the bytes that went out
+          // and keeps the `sentAt` it was first staged with: a re-send is not a newer fold.
+          if (work !== null && work !== stateWork) {
+            sentSubagentWork[span.agent_id] = JSON.parse(JSON.stringify(work));
+            sentSubagentWorkDirty = true;
+          }
+          // And beside the owner marker, whenever a fold is staged — fresh or re-sent, live or
+          // AUDIT. The state entry above is never written back by a backfill or sync, so without
+          // this a fold they sent is recorded nowhere, and the next run after the sidecar is pruned
+          // would send the row bare. Written at staging rather than on a confirmed delivery: these
+          // are the worker's own real figures, so a later re-send of them is never wrong. A worker
+          // with no known owner this run (marker gone AND sidecar gone) is not given an invented one.
+          if (work !== null && knownOwner !== null) {
+            writeChildOwner(span.agent_id, { parent: knownOwner.parent, root: knownOwner.root, work });
+          }
           enqueued += 1;
         } catch { /* keep going; an unqueued subagent claims nothing and retries next turn-end */ }
       }
@@ -1537,6 +1817,11 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // payload.
     if (sentSubagentsDirty) {
       next.sentSubagents = sentSubagents;
+    }
+    // The CLI workers' folded work, on the same gate: written only beside a staged row, and
+    // committed with it or not at all, so a fold nobody received never counts as sent.
+    if (sentSubagentWorkDirty) {
+      next.sentSubagentWork = sentSubagentWork;
     }
     // ── C-10 steps 2-3: the batch becomes durable before a single item is queued
     //
@@ -1812,6 +2097,10 @@ export async function extractAuditReports(input, deps = {}, options = {}) {
     reports,
     sessionErrors: checkpoint == null || checkpoint.sessionErrors == null ? [] : checkpoint.sessionErrors,
     deltaFailed: checkpoint != null && checkpoint.deltaFailed === true,
+    // The ownership guard could not tell whether this is a CLI subagent chat: no reports, and a
+    // session the caller must leave retryable rather than count as empty (runSync answers it as
+    // deferred).
+    deferred: checkpoint != null && checkpoint.deferred === true,
   };
 }
 

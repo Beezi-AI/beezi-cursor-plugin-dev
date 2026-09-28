@@ -363,6 +363,18 @@ test('a queue flush worker holding the session through the in-flight barrier def
   assert.equal(order.some((o) => o.startsWith('extract')), false);
 });
 
+test('an extraction that deferred on CLI ownership is counted deferred, never empty', async () => {
+  const { deps, saved } = makeDeps({
+    extractAuditReports: async () => ({ reports: [], sessionErrors: [], deltaFailed: false, deferred: true }),
+  });
+
+  const result = await runSync(deps, {});
+
+  assert.equal(result.deferred, 1);
+  assert.equal(result.empty, 0);
+  assert.equal(saved.length, 0, 'no progress recorded for a session nobody looked at');
+});
+
 test('the in-flight barrier is always released, even when the session fails', async () => {
   const released = [];
   const { deps } = makeDeps({

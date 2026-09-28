@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  findCliChatDir, readCliChatMeta, readCliStoreFacts, listCliSubagents, clearCliChatCache,
+  findCliChatDir, readCliChatMeta, readCliStoreFacts, listCliSubagents, clearCliChatCache, classifyCliChat,
 } from '../lib/cli-chats-cursor.mjs';
 
 // Fixtures mirror the Cursor CLI store observed on CLI 2026.09.18 (plan evidence E5/E6):
@@ -184,6 +184,106 @@ test('readCliChatMeta with an expired deadline opens no store', { skip: !sqlite 
   const spy = spySqlite();
   assert.equal(readCliChatMeta('c4', { chatsDir: root, sqlite: spy.sqlite, deadline: Date.now() - 1 }), null);
   assert.deepEqual(spy.opened, []);
+});
+
+// ─── classifyCliChat ────────────────────────────────────────────────────────
+//
+// Whether a conversation id is a CLI subagent chat, a top-level one, or cannot be told yet. The
+// checkpoint refuses to report a child as a session of its own and DEFERS on unknown, so each branch
+// below is a reporting decision, not an enrichment.
+
+test('classifyCliChat: a store carrying subagentInfo is a child of its parentAgentId', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', KID_A, {
+    storeMeta: { ...childMeta('parent', 2000), subagentInfo: { parentAgentId: 'mid', rootParentAgentId: 'parent', toolCallId: 't', typeName: 'explore' } },
+  });
+  const verdict = classifyCliChat(KID_A, { chatsDir: root });
+  assert.deepEqual(verdict, { kind: 'child', parentAgentId: 'mid', rootParentAgentId: 'parent' });
+  assert.equal(JSON.stringify(verdict).includes('SECRET'), false);
+});
+
+test('classifyCliChat: a readable store with no subagentInfo is top-level', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'c1', { storeMeta: { name: 'n', createdAt: 5, blobEncryptionKey: 'SECRET' } });
+  assert.deepEqual(classifyCliChat('c1', { chatsDir: root }), { kind: 'top' });
+});
+
+test('classifyCliChat: an unreadable store beside a meta.json is top-level (only top-level chats have one)', () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'c1', { meta: { title: 't' }, garbageStore: true });
+  assert.deepEqual(classifyCliChat('c1', { chatsDir: root }), { kind: 'top' });
+});
+
+test('classifyCliChat: an unreadable store and no meta.json is unknown, and is not remembered', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  const dir = makeChat(root, 'h', KID_A, { garbageStore: true });
+  assert.deepEqual(classifyCliChat(KID_A, { chatsDir: root }), { kind: 'unknown' });
+  // The store becomes readable (the lock clears): the next call reads it rather than a cached miss.
+  fs.rmSync(path.join(dir, 'store.db'));
+  makeStore(path.join(dir, 'store.db'), childMeta('parent', 2000));
+  assert.equal(classifyCliChat(KID_A, { chatsDir: root }).kind, 'child');
+});
+
+test('classifyCliChat: no chat dir at all, with time left, is top-level (an IDE conversation)', () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'other', { meta: {} });
+  assert.deepEqual(classifyCliChat('ide-conv', { chatsDir: root }), { kind: 'top' });
+  assert.deepEqual(classifyCliChat('ide-conv', { chatsDir: path.join(root, 'missing') }), { kind: 'top' });
+});
+
+test('classifyCliChat: an expired deadline is unknown, never top, and opens nothing', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000) });
+  const spy = spySqlite();
+  assert.deepEqual(classifyCliChat(KID_A, { chatsDir: root, sqlite: spy.sqlite, deadline: Date.now() - 1 }), { kind: 'unknown' });
+  assert.deepEqual(classifyCliChat('ide-conv', { chatsDir: root, deadline: Date.now() - 1 }), { kind: 'unknown' });
+  assert.deepEqual(spy.opened, []);
+  // The injected clock is the one the deadline is judged on.
+  assert.equal(classifyCliChat(KID_A, { chatsDir: root, deadline: 1000, now: () => 500 }).kind, 'child');
+});
+
+test('classifyCliChat: a dir found before the deadline but a store not yet read is unknown', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000) });
+  assert.ok(findCliChatDir(KID_A, { chatsDir: root }), 'dir cached');
+  assert.deepEqual(classifyCliChat(KID_A, { chatsDir: root, deadline: Date.now() - 1 }), { kind: 'unknown' });
+});
+
+// A lookup that could not LOOK is not a lookup that found nothing. Codex review (fix round 1): a
+// chats dir that could not be listed (EACCES) was cached as a confirmed miss, so the classifier said
+// `top` and a child with no marker yet was reported as a session.
+const eacces = () => Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+
+test('classifyCliChat: a chats dir that cannot be listed is unknown, and the failure is not cached', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000) });
+  const fsImpl = { ...fs, readdirSync: () => { throw eacces(); } };
+  assert.deepEqual(classifyCliChat(KID_A, { chatsDir: root, fsImpl }), { kind: 'unknown' });
+  assert.equal(findCliChatDir(KID_A, { chatsDir: root, fsImpl }), null, 'callers still see "no dir"');
+  // Nothing was remembered: with the listing readable again the child is found.
+  assert.equal(classifyCliChat(KID_A, { chatsDir: root }).kind, 'child');
+});
+
+test('classifyCliChat: a candidate that cannot be stat\'ed is unknown, not absent', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000) });
+  const fsImpl = { ...fs, statSync: (p, o) => { if (String(p).includes(KID_A)) throw eacces(); return fs.statSync(p, o); } };
+  assert.deepEqual(classifyCliChat(KID_A, { chatsDir: root, fsImpl }), { kind: 'unknown' });
+  assert.equal(classifyCliChat(KID_A, { chatsDir: root }).kind, 'child');
+});
+
+test('classifyCliChat: a chats dir that does not exist is still a confirmed miss', () => {
+  const root = tmpChats();
+  const missing = path.join(root, 'nope');
+  const fsImpl = { ...fs, readdirSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); } };
+  assert.deepEqual(classifyCliChat('ide-conv', { chatsDir: missing, fsImpl }), { kind: 'top' });
+});
+
+test('classifyCliChat never throws, and refuses an unsafe id as top-level', () => {
+  const root = tmpChats();
+  assert.deepEqual(classifyCliChat('../etc', { chatsDir: root }), { kind: 'top' });
+  assert.deepEqual(classifyCliChat(null, { chatsDir: root }), { kind: 'top' });
+  assert.doesNotThrow(() => classifyCliChat('x', null));
 });
 
 // ─── readCliStoreFacts ──────────────────────────────────────────────────────
@@ -559,15 +659,49 @@ test('listCliSubagents opens exactly the children named in the parent store', { 
   assert.equal(JSON.stringify(kids).includes('SECRET'), false);
 });
 
-test('listCliSubagents drops a child whose parentAgentId is someone else', { skip: !sqlite }, () => {
+// Rewritten, not loosened: this used to assert that a child whose ROOT is `parent` but whose direct
+// parent is another chat was DROPPED. A CLI child is no longer reported as a session of its own
+// (lib/checkpoint.mjs, the ownership guard), so its root is the only place a grandchild can be
+// reported at all; dropping it here would drop it everywhere. What must still be dropped is a chat
+// that belongs to someone else on both counts.
+test('listCliSubagents keeps a descendant rooted at this parent and drops a chat owned by someone else', { skip: !sqlite }, () => {
+  const KID_C = 'cccccccc-2222-4333-8444-555555555555';
   const root = tmpChats();
-  makeChat(root, 'h', 'parent', { meta: {}, storeMeta: { name: 'p' }, blobs: [taskResult(KID_A), taskResult(KID_B)] });
+  makeChat(root, 'h', 'parent', { meta: {}, storeMeta: { name: 'p' }, blobs: [taskResult(KID_A), taskResult(KID_B), taskResult(KID_C)] });
   makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000) });
-  // Only the root points at `parent`: a grandchild is not a direct child.
+  // A grandchild: its direct parent is another chat, its root is `parent`.
   makeChat(root, 'h', KID_B, {
-    storeMeta: { createdAt: 2000, subagentInfo: { parentAgentId: 'other', rootParentAgentId: 'parent', toolCallId: 't', typeName: 'x' } },
+    storeMeta: { createdAt: 2100, subagentInfo: { parentAgentId: 'other', rootParentAgentId: 'parent', toolCallId: 't', typeName: 'x' } },
   });
-  assert.deepEqual(listCliSubagents('parent', { chatsDir: root }).map((k) => k.agentId), [KID_A]);
+  // Named in the parent's store, but neither its parent nor its root is `parent`.
+  makeChat(root, 'h', KID_C, {
+    storeMeta: { createdAt: 2200, subagentInfo: { parentAgentId: 'other', rootParentAgentId: 'other', toolCallId: 't', typeName: 'x' } },
+  });
+  assert.deepEqual(listCliSubagents('parent', { chatsDir: root }).map((k) => k.agentId), [KID_A, KID_B]);
+});
+
+test('listCliSubagents finds a grandchild through the child that spawned it, once', { skip: !sqlite }, () => {
+  const GRAND = 'dddddddd-2222-4333-8444-555555555555';
+  const root = tmpChats();
+  // The parent's store names only its own child; the grandchild is named in the CHILD's store, and
+  // also (a quoted reply) a second time in the parent's, which must not list it twice.
+  makeChat(root, 'h', 'parent', { meta: {}, storeMeta: { name: 'p' }, blobs: [taskResult(KID_A), taskResult(GRAND)] });
+  makeChat(root, 'h', KID_A, { storeMeta: childMeta('parent', 2000), blobs: [taskResult(GRAND)] });
+  makeChat(root, 'h', GRAND, {
+    storeMeta: { createdAt: 2500, subagentInfo: { parentAgentId: KID_A, rootParentAgentId: 'parent', toolCallId: 't', typeName: 'explore' } },
+  });
+  assert.deepEqual(listCliSubagents('parent', { chatsDir: root }).map((k) => k.agentId), [KID_A, GRAND]);
+  clearCliChatCache();
+  // Without the parent quoting it: found only by descending into the child.
+  makeChat(root, 'h', 'parent2', { meta: {}, storeMeta: { name: 'p' }, blobs: [taskResult(KID_B)] });
+  makeChat(root, 'h', KID_B, { storeMeta: childMeta('parent2', 2000), blobs: [taskResult('eeeeeeee-2222-4333-8444-555555555555')] });
+  makeChat(root, 'h', 'eeeeeeee-2222-4333-8444-555555555555', {
+    storeMeta: { createdAt: 2600, subagentInfo: { parentAgentId: KID_B, rootParentAgentId: 'parent2', toolCallId: 't', typeName: 'explore' } },
+  });
+  assert.deepEqual(
+    listCliSubagents('parent2', { chatsDir: root }).map((k) => k.agentId),
+    [KID_B, 'eeeeeeee-2222-4333-8444-555555555555'],
+  );
 });
 
 test('listCliSubagents with an expired deadline returns [] and opens nothing', { skip: !sqlite }, () => {

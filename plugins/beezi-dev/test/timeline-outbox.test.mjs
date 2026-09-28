@@ -273,6 +273,24 @@ for (const status of [500, 503]) {
   });
 }
 
+// A timeline queued under a Cursor CLI subagent chat's own id (a build that still reported
+// children as sessions wrote these). Posted, it would create the standalone child session the
+// checkpoint's ownership guard now prevents; the parent's timeline already draws the child's lane.
+test("a recorded CLI child's timeline is dropped unsent; the parent's still goes", async (t) => {
+  tmpHome(t);
+  const { writeChildOwner } = await import('../lib/cli-child-owner.mjs');
+  const KID = '11111111-2222-4333-8444-555555555555';
+  writeChildOwner(KID, { parent: 'conv-1', root: 'conv-1' });
+  seedEntry(KID, { ageMs: 2000 });
+  seedEntry('conv-1', { ageMs: 1000 });
+  const stub = stubFetch(200);
+  const flush = await flushQueue('tok', { fetchImpl: stub.fetchImpl, auth: auth() });
+  assert.deepEqual(stub.calls.map((c) => c.body.sessionId), ['conv-1']);
+  assert.deepEqual(outboxFiles(), []);
+  assert.equal(flush.timelines.dropped, 1);
+  assert.equal(flush.timelines.sent, 1);
+});
+
 test('the drain keeps an entry on a network failure', async (t) => {
   tmpHome(t);
   seedEntry('conv-1');

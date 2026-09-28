@@ -122,11 +122,25 @@ function storeDeps(deps) {
   return { ...deps, noSnapshot: true };
 }
 
-function listDir(dir) {
+// `deps.fsImpl` is the directory-lookup seam (a test's injected EACCES); everything else reads `fs`.
+function fsOf(deps) {
+  return deps != null && deps.fsImpl != null ? deps.fsImpl : fs;
+}
+
+// Errors that mean "nothing is there", as opposed to "we could not look". Only these may become a
+// cached miss: an EACCES, EPERM, EBUSY or EIO says nothing about whether the chat exists.
+function isAbsence(error) {
+  const code = error == null ? undefined : error.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+// `{ names, failed }`. A root that does not exist is an empty, successful listing (a machine with no
+// CLI); a root that exists but cannot be read is a failure.
+function listDir(dir, fsImpl) {
   try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
+    return { names: fsImpl.readdirSync(dir), failed: false };
+  } catch (error) {
+    return { names: [], failed: !isAbsence(error) };
   }
 }
 
@@ -139,24 +153,39 @@ function str(value) {
 // The dir is found by listing, not by hashing the cwd: MD5 is case-sensitive over the exact cwd
 // spelling the CLI used, which a hook payload does not reliably reproduce. `chats/` has one entry per
 // workspace, so this is a handful of stats.
+//
+// A miss is cached only when it is one: every workspace was listed and every candidate answered
+// "not here". A listing or a stat that FAILED (EACCES and the like) returns null uncached, exactly
+// like a deadline cut, so a caller sees "no dir" as before but the next call looks again — and
+// classifyCliChat, which reads the cache to tell a real miss from a cut-short one, answers
+// `unknown` rather than `top`. Codex review (fix round 1): caching that failure as absence made an
+// unmarked child `top`, and it was reported as a session of its own.
 export function findCliChatDir(chatId, deps = {}) {
   if (typeof chatId !== 'string' || !SAFE_ID.test(chatId)) return null;
   const root = chatsDirOf(deps);
   const cacheKey = `${root}\u001f${chatId}`;
   if (dirCache.has(cacheKey)) return dirCache.get(cacheKey);
   if (expired(deps)) return null;
+  const fsImpl = fsOf(deps);
+  const listing = listDir(root, fsImpl);
+  if (listing.failed) return null;
   let found = null;
-  for (const hash of listDir(root)) {
+  let lookFailed = false;
+  for (const hash of listing.names) {
     // Cut short: say nothing, and cache nothing, rather than cache a miss that is not one.
     if (expired(deps)) return null;
     const candidate = path.join(root, hash, chatId);
     try {
-      if (fs.statSync(candidate).isDirectory()) {
+      if (fsImpl.statSync(candidate).isDirectory()) {
         found = candidate;
         break;
       }
-    } catch { /* not in this workspace */ }
+    } catch (error) {
+      // Not in this workspace — unless the stat could not answer at all.
+      if (!isAbsence(error)) lookFailed = true;
+    }
   }
+  if (found === null && lookFailed) return null;
   dirCache.set(cacheKey, found);
   return found;
 }
@@ -226,15 +255,11 @@ function copyMeta(meta) {
   };
 }
 
-// `{ title, name, lastUsedModel, createdAt, subagentInfo }`, or null when neither file is readable.
-// `title` comes from meta.json only (a child has none); `name` is the store's, and is the placeholder
-// "New Agent" on brand-new and headless chats, which callers must not mistake for a title.
-export function readCliChatMeta(chatId, deps = {}) {
-  const dir = findCliChatDir(chatId, deps);
-  if (dir === null) return null;
-  const useCache = cacheable(deps);
-  if (useCache && metaCache.has(dir)) return copyMeta(metaCache.get(dir));
-  if (expired(deps)) return null;
+// Both files, merged, plus WHICH of them answered. The merge alone hides that, and the difference
+// matters to classifyCliChat: a meta that came from meta.json alone says nothing about whether the
+// store (the only place `subagentInfo` lives) would have named a parent. Never cached here; the
+// callers own the caching rule.
+function readBothMetas(dir, deps) {
   const json = readJsonFile(path.join(dir, 'meta.json'));
   let store = null;
   try { store = readStoreMeta(dir, deps); } catch { store = null; }
@@ -252,11 +277,96 @@ export function readCliChatMeta(chatId, deps = {}) {
       subagentInfo: s.subagentInfo === undefined ? null : s.subagentInfo,
     };
   }
+  return { meta, jsonRead: json !== null, storeRead: store !== null };
+}
+
+// `{ title, name, lastUsedModel, createdAt, subagentInfo }`, or null when neither file is readable.
+// `title` comes from meta.json only (a child has none); `name` is the store's, and is the placeholder
+// "New Agent" on brand-new and headless chats, which callers must not mistake for a title.
+export function readCliChatMeta(chatId, deps = {}) {
+  const dir = findCliChatDir(chatId, deps);
+  if (dir === null) return null;
+  const useCache = cacheable(deps);
+  if (useCache && metaCache.has(dir)) return copyMeta(metaCache.get(dir));
+  if (expired(deps)) return null;
+  const read = readBothMetas(dir, deps);
   // A store that could not be read (most often a brief lock: the CLI is mid-write and the no-snapshot
   // rule leaves no fallback) is NOT remembered — caching that miss would hide the title and the
   // subagent back-pointer for the rest of this process. Only a result that saw the store is final.
-  if (useCache && store !== null) metaCache.set(dir, meta);
-  return copyMeta(meta);
+  if (useCache && read.storeRead) metaCache.set(dir, read.meta);
+  return copyMeta(read.meta);
+}
+
+// ─── classification ─────────────────────────────────────────────────────────
+
+const TOP = Object.freeze({ kind: 'top' });
+const UNKNOWN = Object.freeze({ kind: 'unknown' });
+
+// Is this conversation a CLI subagent chat? Exactly one of:
+//
+//   { kind: 'child', parentAgentId, rootParentAgentId }   the store was read and names a parent
+//   { kind: 'top' }                                         it is not, as far as the disk can say
+//   { kind: 'unknown' }                                     the question could not be answered yet
+//
+// WHY IT EXISTS. CLI 2026.09.23 fires postToolUse, afterShellExecution and afterFileEdit INSIDE a
+// subagent chat, under the child's own conversation_id, so the child gets a sidecar of its own and
+// the mid-turn pulse checkpoints it like any session. Nothing classified the id, and every child was
+// reported as a nameless top-level session ("N/A" in the portal) while its parent was already
+// reporting the same worker as an `is_subagent` row — the time twice, under two sessions. The
+// checkpoint asks this before it reports anything (lib/checkpoint.mjs, the ownership guard).
+//
+// `top` covers three cases, each positive evidence rather than a shrug:
+//   - the store was read and carries no `subagentInfo`;
+//   - the store could NOT be read but meta.json exists. Deliberate (controller amendment A2): a
+//     top-level CLI chat's store.db is written constantly during a turn and lib/vscdb.mjs has a
+//     250 ms busy timeout, so reading "locked" as unknown would keep deferring real main sessions at
+//     `stop`. Only top-level chats have a meta.json: no child has ever been observed with one, on
+//     CLI 2026.09.18 or 2026.09.23;
+//   - the listing of `chats/` ran to the end and found no dir: an IDE conversation, or no CLI at all.
+//
+// `unknown` is everything else: the deadline cut the lookup short or the lookup itself failed (a
+// listing or stat that answered EACCES and the like — a miss that is not one), or the
+// dir exists and neither file could be read (a child's store mid-write — a child has no meta.json to
+// fall back on). The caller DEFERS on it and asks again; it must never read it as `top`, which would
+// report a child, nor as `child`, which would drop a session.
+//
+// A child is only a child when `parentAgentId` is a non-empty string: that is the back-pointer the
+// parent's own listing (listCliSubagents) matches on, so a child without one has no row to fold into.
+// Never throws: it sits on the checkpoint's path, and a throw here is answered as `unknown`.
+export function classifyCliChat(chatId, deps = {}) {
+  try {
+    const d = deps == null ? {} : deps;
+    // No CLI chat can live under an id with a separator in it (findCliChatDir refuses one outright).
+    if (typeof chatId !== 'string' || !SAFE_ID.test(chatId)) return TOP;
+    const dir = findCliChatDir(chatId, d);
+    if (dir === null) {
+      // findCliChatDir caches a miss only when its listing ran to the end and every lookup answered,
+      // and says nothing (and caches nothing) when the deadline cut it short or a readdir/stat
+      // failed. So the cache is exactly "this miss is real".
+      return dirCache.has(`${chatsDirOf(d)}\u001f${chatId}`) ? TOP : UNKNOWN;
+    }
+    let read;
+    if (cacheable(d) && metaCache.has(dir)) {
+      // Only a result that saw the store is ever cached (readCliChatMeta), so this one did.
+      read = { meta: metaCache.get(dir), storeRead: true, jsonRead: false };
+    } else {
+      if (expired(d)) return UNKNOWN;
+      read = readBothMetas(dir, d);
+      // The same caching rule as readCliChatMeta, so the name resolver that runs next in the same
+      // checkpoint reads this answer instead of opening the store a second time.
+      if (cacheable(d) && read.storeRead) metaCache.set(dir, read.meta);
+    }
+    if (read.storeRead) {
+      const info = read.meta === null ? null : read.meta.subagentInfo;
+      if (info != null && info.parentAgentId !== null) {
+        return { kind: 'child', parentAgentId: info.parentAgentId, rootParentAgentId: info.rootParentAgentId };
+      }
+      return TOP;
+    }
+    return read.jsonRead ? TOP : UNKNOWN;
+  } catch {
+    return UNKNOWN;
+  }
 }
 
 // ─── blob facts ─────────────────────────────────────────────────────────────
@@ -553,26 +663,46 @@ function lastWriteMs(dir) {
 // The parent's CLI subagents, `[{ agentId, typeName, toolCallId, startMs, endMs }]` by start time.
 //
 // Discovered by exact id, with no directory scan: the parent's own CallDynamicTool results name each
-// child, and a child is kept only if its store says this parent is its direct parent. That opens
-// exactly the parent's children, cannot be starved by other sessions' chats, and gives the same answer
-// in every fresh hook process. A worker still running has no result yet and shows up at the next
-// checkpoint, which is fine: a lane with no end cannot be drawn anyway.
+// child, and a child is kept only if its store says this parent is its direct parent OR its root.
+// That opens exactly the parent's descendants, cannot be starved by other sessions' chats, and gives
+// the same answer in every fresh hook process. A worker still running has no result yet and shows up
+// at the next checkpoint, which is fine: a lane with no end cannot be drawn anyway.
+//
+// THE ROOT OWNS EVERY DESCENDANT. A CLI child is never reported as a session of its own (see
+// classifyCliChat), so a depth-2 worker — whose direct parent is itself a child — has exactly one
+// place left to be reported: the root's subagent rows. Hence the `rootParentAgentId` match, and
+// hence the walk: a grandchild is named in its PARENT's store, not the root's, so each kept child's
+// own CallDynamicTool results are read too. Only kept children are descended into, one queue with one
+// `seen` set, so nobody is listed twice and a chat that belongs to another root is never walked. The
+// walk is bounded the way the listing always was: MAX_CHILD_DB_OPENS distinct child chats and the
+// deadline. Measured on a real six-worker CLI session, each descent (one blob scan of a child store)
+// cost 15-28 ms.
 export function listCliSubagents(parentId, deps = {}) {
   if (typeof parentId !== 'string' || !SAFE_ID.test(parentId)) return [];
   if (expired(deps)) return [];
   const facts = readCliStoreFacts(parentId, deps);
   if (facts === null) return [];
   const out = [];
+  const seen = new Set([parentId]);
+  const pending = facts.childAgentIds.slice();
   let opens = 0;
-  for (const agentId of facts.childAgentIds) {
+  while (pending.length > 0) {
     if (opens >= MAX_CHILD_DB_OPENS || expired(deps)) break;
-    if (agentId === parentId) continue;
+    const agentId = pending.shift();
+    if (seen.has(agentId)) continue;
+    seen.add(agentId);
     const dir = findCliChatDir(agentId, deps);
     if (dir === null) continue;
     opens += 1;
     const meta = readCliChatMeta(agentId, deps);
     const info = meta === null ? null : meta.subagentInfo;
-    if (info === null || info.parentAgentId !== parentId) continue;
+    if (info === null || (info.parentAgentId !== parentId && info.rootParentAgentId !== parentId)) continue;
+    // This child's own workers, whether or not it has a usable start below: its lane may be
+    // undrawable while theirs are not.
+    if (!expired(deps)) {
+      const own = readCliStoreFacts(agentId, deps);
+      if (own !== null) for (const id of own.childAgentIds) if (!seen.has(id)) pending.push(id);
+    }
     const startMs = meta.createdAt;
     if (!Number.isFinite(startMs)) continue;
     out.push({

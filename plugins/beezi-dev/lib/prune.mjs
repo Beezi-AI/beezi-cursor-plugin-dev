@@ -4,6 +4,7 @@ import { beeziCursorHome, eventsDir, pendingDir, queueDir, stateDir, timelineOut
 import { captureDir } from './hook-dump.mjs';
 import { applyCaptureRetention } from './capture-retention.mjs';
 import { RETENTION_WINDOW_MS } from './retention-window.mjs';
+import { CHILD_OWNER_EXT, CHILD_OWNER_RETENTION_MS } from './cli-child-owner.mjs';
 // vscdb.mjs loads node:sqlite lazily, inside functions, never at import time (loadSqlite's `probed`
 // starts undefined and is only set on a call) — so pulling in its sweeper here adds no sqlite work
 // to the sessionStart path that does not already touch it.
@@ -77,14 +78,22 @@ export function pruneStale(now = Date.now(), maxAgeMs = RETENTION_WINDOW_MS, dep
     if (elapsed >= 0 && elapsed < PRUNE_THROTTLE_MS) return;
   }
 
-  for (const dir of [stateDir(), queueDir(), eventsDir(), pendingDir(), timelineOutboxDir()]) {
+  // One exception to the horizon: a Cursor CLI worker's ownership marker (`state/<id>.cli-owner`,
+  // lib/cli-child-owner.mjs) is kept CHILD_OWNER_RETENTION_MS (180 days), or the caller's horizon if
+  // that is longer. It is the only record of the fold its parent last sent, and a parent resumed
+  // after the normal horizon still lists the worker from its chat store; without the marker that
+  // resume sends the worker's row bare and wipes the server's fold (Codex re-review, fix round 3).
+  const stateRoot = stateDir();
+  const ownerMaxAgeMs = Math.max(maxAgeMs, CHILD_OWNER_RETENTION_MS);
+  for (const dir of [stateRoot, queueDir(), eventsDir(), pendingDir(), timelineOutboxDir()]) {
     let files;
     try { files = fsImpl.readdirSync(dir); } catch { continue; } // dir missing → skip
     for (const file of files) {
       const p = path.join(dir, file);
+      const horizon = dir === stateRoot && file.endsWith(CHILD_OWNER_EXT) ? ownerMaxAgeMs : maxAgeMs;
       try {
         const { mtimeMs } = fsImpl.statSync(p);
-        if (now - mtimeMs > maxAgeMs) fsImpl.unlinkSync(p);
+        if (now - mtimeMs > horizon) fsImpl.unlinkSync(p);
       } catch { /* skip unreadable/racing file */ }
     }
   }

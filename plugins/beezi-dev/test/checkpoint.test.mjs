@@ -1378,21 +1378,27 @@ test('a live deadline lets the checkpoint recover a CLI subagent from the chat s
   assert.equal('sqlite' in seen.delta, false);
 });
 
-test('an expired deadline through runCheckpoint opens no CLI store at all', { skip: !nodeSqlite }, async (t) => {
+// REWRITTEN for a new contract, not loosened. This used to end "the main segment is unaffected: a
+// late budget costs the enrichment, never the report". Since the CLI ownership guard, the first
+// chat-store question a checkpoint asks is whether this conversation is a CLI subagent chat at all,
+// and a deadline that has already passed cannot answer it: reporting anyway is exactly how every
+// child became a standalone session. So an expired deadline now DEFERS the whole checkpoint —
+// nothing queued, no state, `deferred: true` for the caller to retry on — and still opens no store.
+test('an expired deadline through runCheckpoint opens no CLI store and defers the checkpoint', { skip: !nodeSqlite }, async (t) => {
   const spy = sqliteSpy();
   const seen = {};
   const d = cliRun(t, spy, seen);
   // A negative budget is the simplest expired deadline: `now() + budgetMs` lands in the past on the
-  // same wall clock lib/cli-chats-cursor.mjs checks it against. (A faked `deps.now` would not: the
-  // chat-store reader keeps its own clock.)
-  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, d, { emitTimeline: true, budgetMs: -1 });
+  // same wall clock lib/cli-chats-cursor.mjs checks it against.
+  const result = await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, d, { emitTimeline: true, budgetMs: -1 });
 
   assert.deepEqual(spy.opened, []);
-  assert.equal(queued().some((payload) => payload.is_subagent === true), false);
-  assert.ok(seen.name.deadline <= Date.now(), 'the name reader was handed the expired deadline');
-  assert.equal(seen.delta.deadline, seen.name.deadline);
-  // The main segment is unaffected: a late budget costs the enrichment, never the report.
-  assert.ok(queued().some((payload) => payload.is_subagent !== true));
+  assert.equal(result.deferred, true);
+  assert.deepEqual(queued(), [], 'nothing is reported for a conversation nobody could classify');
+  assert.equal(fs.existsSync(path.join(stateDir(), 'conv-1.json')), false, 'the cursor does not move');
+  // Deferred BEFORE the name and delta readers run: nothing about the session was read.
+  assert.equal(seen.name, undefined);
+  assert.equal(seen.delta, undefined);
 });
 
 test('with no budget no deadline is invented for the CLI readers', { skip: !nodeSqlite }, async (t) => {

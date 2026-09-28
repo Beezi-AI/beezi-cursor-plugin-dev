@@ -44,6 +44,7 @@ import { seedFirstQueuedAt } from './queue-maintenance.mjs';
 import { readQueueRecord } from './queue-record.mjs';
 import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
 import { sanitizeQueuedPayloadRemote } from './git.mjs';
+import { readChildOwner } from './cli-child-owner.mjs';
 
 // The one 403 body code that means the tenant turned tracking off, as the server spells it. Shared
 // with lib/audit-flush.mjs's reading of the same field; a second spelling is how the gate and the
@@ -103,9 +104,10 @@ function corruptName(fsImpl, dir, file, ts) {
 // the whole queue go than a partial flush.
 //
 // Returns { sent, flushed, rejected, failed, deferred, expired, stuck, gated, trackingDisabled,
-// quarantined, quarantineFailed, lastError }. `sent` is an ALIAS of `flushed`, not a replacement:
-// CONTRACTS §6 names the new field and scripts/track.mjs reads the old one, so both are emitted and
-// they are always equal.
+// quarantined, quarantineFailed, superseded, lastError }. `sent` is an ALIAS of `flushed`, not a
+// replacement: CONTRACTS §6 names the new field and scripts/track.mjs reads the old one, so both are
+// emitted and they are always equal. `superseded` counts records dropped unsent because they are
+// filed under a Cursor CLI subagent chat's own id (see the ownership check below).
 export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) {
   const fsImpl = deps.fsImpl == null ? fs : deps.fsImpl;
   const now = deps.now == null ? Date.now : deps.now;
@@ -137,6 +139,7 @@ export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) 
     trackingDisabled: false,
     quarantined: 0,
     quarantineFailed: 0,
+    superseded: 0,
     lastError: null,
   };
 
@@ -251,6 +254,30 @@ export async function deliverQueue({ auth, deadlineAt = null, deps = {} } = {}) 
     if (isExpired(payload, now())) {
       result.expired += 1;
       try { fsImpl.unlinkSync(filePath); } catch { result.stuck += 1; }
+      continue;
+    }
+
+    // A report filed UNDER a Cursor CLI subagent chat's own id: its `sessionId` is a recorded child
+    // (lib/cli-child-owner.mjs). The checkpoint's ownership guard no longer builds these, but one
+    // queued before the guard existed, or before this child's ownership was first recorded, would
+    // create exactly the standalone "N/A" session the guard prevents — and delivery bypasses the
+    // checkpoint entirely. Dropped, not held: the root reports the same worker (and every deeper
+    // one) on its own rows, so holding it only waits for a send that must never happen.
+    //
+    // WHATEVER its `is_subagent`. An `is_subagent` row used to be spared here, on the reasoning that
+    // a subagent row never invents a session; Codex review (fix round 1) refuted that — the backend
+    // (session-report.service.ts) upserts the session for a subagent report too, so an old build's
+    // child -> grandchild row under the child's sessionId recreates the child as a session. The
+    // root's own rows are unaffected: they carry the ROOT's sessionId, which has no marker.
+    //
+    // The marker file and nothing else: one small read, no chat-store access, because this loop runs
+    // on every hook's flush. A child whose ownership was never recorded is not caught here; its
+    // next checkpoint records it, and the next flush drops what it had queued.
+    if (typeof payload.sessionId === 'string' && readChildOwner(payload.sessionId) !== null) {
+      try {
+        fsImpl.unlinkSync(filePath);
+        result.superseded += 1;
+      } catch { result.stuck += 1; }
       continue;
     }
 

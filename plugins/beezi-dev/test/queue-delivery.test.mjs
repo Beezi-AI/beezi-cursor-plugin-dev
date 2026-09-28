@@ -107,8 +107,50 @@ test('the result carries every legacy counter plus stable defaults for the new o
     trackingDisabled: false,
     quarantined: 0,
     quarantineFailed: 0,
+    superseded: 0,
     lastError: null,
   });
+});
+
+// ─── CLI subagent chats ─────────────────────────────────────────────────────────────────────────
+
+// A report queued under a Cursor CLI child's own id, by a build that still reported children as
+// sessions (or by any path that reached the queue before the ownership was recorded). Delivered, it
+// would create exactly the standalone "N/A" session the checkpoint's ownership guard now prevents.
+// Whatever its `is_subagent`: the backend (session-report.service.ts) upserts the SESSION for a
+// subagent report too, so an old build's child -> grandchild row under the child's own sessionId
+// recreates the standalone child session just as a main segment would (Codex review, fix round 1).
+// The root's own rows carry the root's sessionId and are untouched.
+test("every queued report under a recorded CLI child's id is dropped; the parent's subagent row still goes", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-deliver-home-'));
+  const prev = process.env.BEEZI_CURSOR_HOME;
+  process.env.BEEZI_CURSOR_HOME = home;
+  t.after(() => {
+    if (prev === undefined) delete process.env.BEEZI_CURSOR_HOME;
+    else process.env.BEEZI_CURSOR_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const { writeChildOwner } = await import('../lib/cli-child-owner.mjs');
+  const KID = '11111111-2222-4333-8444-555555555555';
+  writeChildOwner(KID, { parent: 'parent-1', root: 'parent-1' });
+
+  const dir = tmpQueue(t);
+  seed(dir, 'child-main.json', { segmentId: `${KID}:0-9`, sessionId: KID }, START);
+  // The parent's own row about that worker: its sessionId is the PARENT, so the child's marker does
+  // not touch it.
+  seed(dir, 'parent-sub.json', { segmentId: `parent-1:${KID}`, sessionId: 'parent-1', is_subagent: true, agent_id: KID }, START);
+  // The child's OWN subagent row (child -> grandchild) from an old build: it would upsert the child
+  // as a session, so it goes too.
+  seed(dir, 'kid-sub.json', { segmentId: `${KID}:grand`, sessionId: KID, is_subagent: true }, START);
+  const { auth } = fakeAuth();
+  const { fetchImpl, now, calls } = scripted([{ status: 200 }]);
+
+  const result = await deliverQueue({ auth, deps: { dir, fetchImpl, now, isTrackingAllowed: allowed() } });
+
+  assert.equal(result.superseded, 2);
+  assert.equal(result.sent, 1);
+  assert.deepEqual(calls.map((c) => c.body.segmentId), [`parent-1:${KID}`]);
+  assert.deepEqual(fs.readdirSync(dir), [], 'the dropped records leave the queue too');
 });
 
 test('a delivered record is counted as both sent and flushed and the file is removed', async (t) => {

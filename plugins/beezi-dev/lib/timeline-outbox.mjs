@@ -26,6 +26,9 @@
 //            overwritten by a timeline that may be missing lanes). The drain rebuilds a partial
 //            entry from the sidecar before sending it, and sends only a rebuild that was complete.
 //   expire   lib/prune.mjs sweeps `timelines/` on the same clock as the queue.
+//   child    an entry under a recorded Cursor CLI subagent chat's id (lib/cli-child-owner.mjs) is
+//            dropped by the drain, never sent: a child is not a session (lib/checkpoint.mjs, the
+//            ownership guard), and its parent's timeline draws its lane.
 //
 // This module must NOT import lib/checkpoint.mjs (which imports it): it builds the state path and
 // takes the session lock itself, through the same owners checkpoint uses. No top-level work: the
@@ -39,6 +42,7 @@ import { sessionLockPath, withLock } from './lock.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline-cursor.mjs';
 import { POST_TIMEOUT_MS } from './http.mjs';
 import { currentAccountKey } from './tracking.mjs';
+import { readChildOwner } from './cli-child-owner.mjs';
 
 // A version bump is how a future entry shape announces itself; this build leaves one it cannot read.
 // `partial` is an optional flag on the same shape, not a new version: a build that predates it reads
@@ -352,6 +356,17 @@ export async function drainTimelineOutbox({
       const entry = readEntry(filePath);
       if (entry === null) return GONE;
       if (!sameAccountKey(entry.account, account)) return FOREIGN;
+      // A timeline under a recorded Cursor CLI subagent chat's own id (lib/cli-child-owner.mjs),
+      // queued by a build that still reported children as sessions. Posting it would create the
+      // standalone child session the checkpoint's ownership guard prevents, and the drain bypasses
+      // that guard; the parent's own timeline already draws this worker's lane. Dropped, never
+      // sent — after the account check, so another tenant's entry stays where it is for prune, like
+      // every foreign entry. No state write: a child has no session state worth a status. The marker
+      // file only, never the chat store: this runs on every hook's flush.
+      if (readChildOwner(entry.sessionId) !== null) {
+        try { fs.unlinkSync(filePath); } catch { /* prune collects it */ }
+        return DROPPED;
+      }
       if (!(await sameLogin())) return FENCED;
       if (outOfBudget()) return BUDGET;
 

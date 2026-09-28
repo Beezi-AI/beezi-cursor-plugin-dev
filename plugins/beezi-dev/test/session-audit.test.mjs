@@ -529,6 +529,23 @@ test('an unreadable sidecar is counted and keeps the pull open', async () => {
   assert.equal(result.finalized, false);
 });
 
+// The checkpoint's ownership guard could not tell whether this is a Cursor CLI subagent chat (a
+// store locked mid-write, no meta.json to fall back on). Counting that as `empty` would let the
+// one-time seal fire over a session nobody has looked at yet.
+test('a checkpoint that deferred on CLI ownership is retryable and keeps the pull open', async () => {
+  const { deps } = makeDeps({
+    listConversations: () => [conversation('undecided')],
+    runCheckpointImpl: async () => checkpointResult({ deferred: true }),
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.empty, 0);
+  assert.equal(result.unreadable, 1);
+  assert.equal(result.retriableUnreadable, 1);
+  assert.equal(result.finalized, false);
+});
+
 test('a throwing checkpoint counts as unreadable and keeps the pull open', async () => {
   const { deps } = makeDeps({
     listConversations: () => [conversation('boom')],

@@ -9,6 +9,14 @@ import { listCliSubagents as _listCliSubagents } from './cli-chats-cursor.mjs';
 // `subagent_start` / `subagent_stop` lines the hooks would have written — at READ time, so sessions
 // recorded before this existed are repaired too, and nothing is ever appended out of order.
 //
+// What the worker does INSIDE its own chat is another matter. Since CLI 2026.09.23 its own tool
+// calls do fire postToolUse, afterShellExecution and afterFileEdit — under the WORKER's
+// conversation_id, never the parent's — so a worker has a sidecar of its own holding its gen, tool,
+// shell and edit lines, and no session_start, prompt or stop. None of that lands in the parent's
+// stream, which is why the lines here still come from the store. That sidecar must never be reported
+// as a session of its own: lib/checkpoint.mjs's ownership guard (classifyCliChat) stops it, and the
+// parent is the only thing that reports the worker.
+//
 // Only when the stream has no subagent line of its own. An IDE session carries real hook lines; a
 // second, disk-derived copy of the same workers would draw every lane twice. The check also means an
 // IDE session with delegation never pays for a single chat-store read here.
