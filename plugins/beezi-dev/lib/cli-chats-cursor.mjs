@@ -16,7 +16,9 @@ import { cursorConfigDir } from './paths-cursor.mjs';
 // parsed, and the parsed object never leaves the query callback: only an allowlist of fields is
 // copied out. From `blobs` exactly two things are extracted: the per-reply `modelName` and the child
 // agent ids in `CallDynamicTool` results, whether the message is a JSON row or a JSON object embedded
-// in a binary row. Message content is never returned, cached or logged.
+// in a binary row. Besides those, countCliTurnStarts returns two integers SQLite computes over the
+// user rows — how many were typed sends and how many were host notifications — and no byte of any
+// row. Message content is never returned, cached or logged.
 //
 // Every store read passes `noSnapshot`. The snapshot fallback in withDatabase copies .db + -wal to a
 // temp dir, which here would be a copy of the encryption key that a hook killed at its deadline never
@@ -642,6 +644,59 @@ export function readCliStoreFacts(chatId, deps = {}) {
   // Same rule as the meta cache: an unreadable store (scan === null) is retried, never remembered.
   if (useCache && scan !== null && !scan.cutByDeadline) factsCache.set(dir, facts);
   return copyFacts(facts);
+}
+
+// ─── turn starts ────────────────────────────────────────────────────────────
+
+// How many turns in this chat a PERSON started and how many the CLI started itself, `{ human,
+// system }`, or null when the store cannot be read.
+//
+// The CLI restarts a parent on its own when a background task finishes — a subagent or a shell job —
+// and that restart fires no beforeSubmitPrompt, so the sidecar shows a turn with no prompt line in
+// front of it. The store tells the two kinds apart (observed on CLI 2026.09.23, sessions 68e34165 and
+// 90fa86a6): both are `role: user` rows, but a typed Send holds `<user_query>`, and a host restart
+// opens with `<system_notification>` straight after its timestamp — byte 89-90 on every real row —
+// one row per finished task. The last notification of a batch carries a `<user_query>` of its own,
+// canned text the CLI wrote ("Perform any necessary follow-up actions…"), which is why a row that
+// opens with the notification tag is the host's however much else it holds. "Opens with" is the
+// exact byte sequence `</timestamp>\n<system_notification>` (the newline JSON-escaped, as the row
+// stores it) inside the row's head. A person can paste the tag into a prompt, even as its first
+// word, but it then sits behind `<user_query>`, never straight after the timestamp.
+//
+// PRIVACY: every byte is compared inside SQLite. The one query returns two integers; no message
+// byte — not the 24-byte head readCliStoreFacts classifies rows by — reaches this process. Not
+// cached: the store grows during the session, and every caller is a fresh hook process anyway.
+// Not capped either: one aggregate pass measured 4-8 ms on the largest real stores (5.7 MB plus a
+// 4 MB WAL), a quarter of readCliStoreFacts' capped scan of the same files.
+const NOTIFICATION_HEAD_BYTES = 192;
+const NOTIFICATION_OPENING = '</timestamp>\\n<system_notification>';
+
+export function countCliTurnStarts(chatId, deps = {}) {
+  if (typeof chatId !== 'string' || !SAFE_ID.test(chatId)) return null;
+  const dir = findCliChatDir(chatId, deps);
+  if (dir === null) return null;
+  if (expired(deps)) return null;
+  try {
+    const counts = withDatabase(
+      path.join(dir, 'store.db'),
+      (db) => {
+        const row = db.prepare(
+          'SELECT coalesce(sum(n), 0) AS system, coalesce(sum(CASE WHEN q AND NOT n THEN 1 ELSE 0 END), 0) AS human FROM ('
+          + ' SELECT instr(substr(CAST(data AS BLOB), 1, ?), CAST(? AS BLOB)) > 0 AS n,'
+          + ' instr(CAST(data AS BLOB), CAST(? AS BLOB)) > 0 AS q'
+          + ' FROM blobs WHERE substr(CAST(data AS BLOB), 1, 14) = CAST(? AS BLOB))',
+        ).get(NOTIFICATION_HEAD_BYTES, NOTIFICATION_OPENING, '<user_query>', '{"role":"user"');
+        if (row == null) return null;
+        const system = Number(row.system);
+        const human = Number(row.human);
+        return Number.isInteger(system) && Number.isInteger(human) ? { human, system } : null;
+      },
+      storeDeps(deps),
+    );
+    return counts == null ? null : counts;
+  } catch {
+    return null;
+  }
 }
 
 // ─── subagents ──────────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   findCliChatDir, readCliChatMeta, readCliStoreFacts, listCliSubagents, clearCliChatCache, classifyCliChat,
+  countCliTurnStarts,
 } from '../lib/cli-chats-cursor.mjs';
 
 // Fixtures mirror the Cursor CLI store observed on CLI 2026.09.18 (plan evidence E5/E6):
@@ -758,4 +759,65 @@ test('every reader returns null/[] without node:sqlite, never a throw', () => {
   const deps = { chatsDir: root, sqlite: null };
   assert.equal(readCliStoreFacts('p', deps), null);
   assert.deepEqual(listCliSubagents('p', deps), []);
+});
+
+// ─── countCliTurnStarts ─────────────────────────────────────────────────────
+//
+// Rows as CLI 2026.09.23 writes them (session 68e34165): a typed Send is a user row whose text holds
+// `<user_query>`, sometimes kilobytes in, behind other context tags; a background task finishing is
+// a user row that opens with `<system_notification>` right after its timestamp, and the last one of
+// a batch also carries the CLI's own canned `<user_query>`.
+const stamp = '<timestamp>Monday, Sep 28, 2026, 11:47 AM (UTC+3)</timestamp>\n';
+const humanRow = (text) => ({ role: 'user', content: `${stamp}<user_query>\n${text}\n</user_query>` });
+const notificationRow = (withQuery = false) => ({
+  role: 'user',
+  content: `${stamp}<system_notification>\nThe following task has finished.\n<task>\nkind: subagent\nstatus: error\n</task>\n</system_notification>`
+    + (withQuery ? '\n<user_query>\nPerform any necessary follow-up actions.\n</user_query>' : ''),
+});
+
+test('countCliTurnStarts counts typed sends and host notifications, and nothing else', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'p', {
+    meta: {},
+    storeMeta: { name: 'p' },
+    blobs: [
+      { role: 'user', content: '<user_info>\nOS: win32\n</user_info>' },
+      humanRow('explore the plugin'),
+      // Context tags in front push the query deep into the row; it is still a typed send.
+      { role: 'user', content: `${stamp}<system_reminder>\n${'x'.repeat(4000)}\n</system_reminder>\n<user_query>\ngo\n</user_query>` },
+      assistant('m1'),
+      notificationRow(),
+      notificationRow(true),
+      // A typed prompt that QUOTES the tag is still typed: only a row that opens with it is the host's.
+      humanRow(`${'y'.repeat(300)} <system_notification> pasted`),
+      // Even one that STARTS with it: the tag then sits behind `<user_query>`, not straight after the
+      // timestamp, though well inside the head window.
+      humanRow('<system_notification> is what I pasted'),
+      // Not a user row: an assistant that mentions both tags counts as neither.
+      { role: 'assistant', content: [{ type: 'text', text: '<system_notification> <user_query>' }] },
+    ],
+  });
+  assert.deepEqual(countCliTurnStarts('p', { chatsDir: root }), { human: 4, system: 2 });
+});
+
+test('countCliTurnStarts reads no message byte into the plugin', { skip: !sqlite }, () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'p', { meta: {}, storeMeta: { name: 'p' }, blobs: [humanRow('secret prompt'), notificationRow(true)] });
+  const spy = spySqlite();
+  assert.deepEqual(countCliTurnStarts('p', { chatsDir: root, sqlite: spy.sqlite }), { human: 1, system: 1 });
+  const blobQueries = spy.calls.filter((c) => /FROM blobs/.test(c.sql));
+  assert.equal(blobQueries.length, 1, 'one aggregate query');
+  assert.match(blobQueries[0].sql, /SELECT\s+coalesce\(sum/i);
+  assert.doesNotMatch(blobQueries[0].sql, /SELECT\s+(data|substr)/i);
+});
+
+test('countCliTurnStarts degrades to null: missing chat, unsafe id, expired deadline, no sqlite, garbage store', () => {
+  const root = tmpChats();
+  makeChat(root, 'h', 'p', { meta: {}, storeMeta: { name: 'p' }, blobs: [humanRow('x')] });
+  makeChat(root, 'h', 'g', { meta: {}, garbageStore: true });
+  assert.equal(countCliTurnStarts('nope', { chatsDir: root }), null);
+  assert.equal(countCliTurnStarts('../p', { chatsDir: root }), null);
+  assert.equal(countCliTurnStarts('p', { chatsDir: root, deadline: 0 }), null);
+  assert.equal(countCliTurnStarts('p', { chatsDir: root, sqlite: null }), null);
+  assert.equal(countCliTurnStarts('g', { chatsDir: root }), null);
 });

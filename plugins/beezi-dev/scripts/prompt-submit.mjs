@@ -147,7 +147,10 @@ const leave = () => process.exit(0);
 // attachment list, and a pasted log can make that large; this is the point past which the gate
 // stops buffering it. Everything the line needs is two short ids, so a payload the cap cut short is
 // DROPPED rather than guessed at — its turn falls back to the timeline's turn-end rule, the same as
-// a build that never fires this hook. The cost, stated: the bytes past the cap are left unread, and
+// a build that never fires this hook. A dropped line also switches the timeline's host-restart rule
+// off for that whole session (lib/session-timeline-cursor.mjs, hostStartedTurns): the chat store then
+// shows one more typed send than there are prompt lines, and a turn with no line can no longer be
+// told from one the CLI started itself. The cost, stated: the bytes past the cap are left unread, and
 // on Windows the PowerShell stage writing them may log a broken pipe. That trade is taken knowingly;
 // buffering an unbounded paste in front of Send is the worse one.
 const MAX_STDIN_BYTES = 1024 * 1024;
@@ -186,6 +189,9 @@ if (!RECORDER) {
 //
 // It fires in the interactive CLI (receptron/mulmoterminal#2064, 2026.09.10) and not in headless
 // `agent -p`; the timeline falls back to its turn-end rule for any turn without a prompt line.
+// It does NOT fire when the CLI restarts a turn by itself after a background subagent or shell job
+// finishes (CLI 2026.09.23); the timeline tells those turns apart through the chat store instead
+// (buildPeriods, rule 3a).
 
 // NO `enterProjectDir()` HERE — the one hook entry without it (the carve-out is documented in
 // test/plugin-manifest.test.mjs). Codex review, BLOCKING, the third time round: that call is an

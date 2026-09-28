@@ -860,3 +860,219 @@ test('fitPeriodsToBudget drops the OLDEST periods first and keeps the rest in or
   const withEnvelope = fitPeriodsToBudget(periods, bytes(periods.slice(3)), bytes(periods.slice(2)));
   assert.deepEqual(withEnvelope, periods.slice(3));
 });
+
+// ─── a gap while subagents run is the agent's, even after a stop ───────────
+//
+// Seen on a real CLI session (2026.09.23-86fc751): the parent started six background `explore`
+// workers, and its own turn ended with a `stop` 30 seconds later while all six were still running.
+// The workers ran for nine more minutes. Nobody typed: the CLI resumed the parent on its own once
+// they finished, with no prompt line. The stop rule drew those nine minutes as "User input", right
+// above six lanes that said otherwise.
+const bgKids = [20000, 23500, 27000, 30500, 34000, 38000].map((startMs, i) => ({
+  agentId: `bg${i}`, typeName: 'explore', toolCallId: `tc${i}`, startMs: T + startMs, endMs: T + 580000 + i * 400,
+}));
+
+test('the wait after a stop while background workers run is idle, not the user', () => {
+  const tl = computeSessionTimeline('bg-parent', {
+    readEvents: () => [
+      promptAt(0, 'g1'),
+      genAt(20000, 'g1'),
+      toolAt(20001),
+      stopAt(58000),
+      // The CLI's own resume once the workers are done: no prompt in front of it.
+      genAt(625000, 'g2'),
+      stopAt(625001),
+      genAt(648000, 'g3'),
+      toolAt(649000),
+      stopAt(700000),
+    ],
+    listCliSubagents: () => bgKids,
+  });
+  assert.equal(tl.subagents.length, 6);
+  assert.deepEqual(shape(tl).slice(0, 3), [
+    ['working', 0, 58000],
+    ['idle', 58000, 580000],
+    ['working', 580000, 625001],
+  ]);
+});
+
+test('a short wait after a stop while a worker runs is working, not the user', () => {
+  // Covered gaps follow the mid-turn rule, threshold included: under IDLE_GAP_MS is working.
+  const tl = computeSessionTimeline('bg-short', {
+    readEvents: () => [promptAt(0, 'g1'), stopAt(5000), genAt(70000, 'g2'), stopAt(71000)],
+    listCliSubagents: () => [{ agentId: 'k', typeName: 'explore', toolCallId: 't', startMs: T + 2000, endMs: T + 60000 }],
+  });
+  assert.deepEqual(shape(tl), [['working', 0, 71000]]);
+});
+
+test('a synthetically closed worker never turns a user wait into idle', () => {
+  // The IDE's background-subagent bug: a start with no stop, closed by the correlator at the last
+  // activity in the stream. That end is a guess, and counting it as coverage would draw every wait
+  // on the human after it — up to the end of the session — as "Subagents working".
+  const tl = computeSessionTimeline('bg-synthetic', {
+    readEvents: () => [
+      promptAt(0, 'g1'),
+      { ts: T + 1000, ev: 'subagent_start', sid: 'sa_bg', stype: 'general-purpose', task: 'bg' },
+      stopAt(2000),
+      genAt(600000, 'g2'),
+      stopAt(601000),
+    ],
+  });
+  assert.equal(tl.subagents.length, 1);
+  assert.equal(tl.subagents[0].ended_at, iso(601000));
+  assert.deepEqual(shape(tl), [['working', 0, 2000], ['waiting_user', 2000, 600000], ['working', 600000, 601000]]);
+});
+
+test('running workers outrank a prompt typed while they run', () => {
+  // The CLI takes a new prompt while background workers are still going. The workers were working
+  // the whole time, and billing counts their interval as active either way, so the band says so.
+  const tl = computeSessionTimeline('bg-prompt', {
+    readEvents: () => [promptAt(0, 'g1'), stopAt(58000), promptAt(480000, 'g2'), stopAt(900500)],
+    listCliSubagents: () => [{ agentId: 'k', typeName: 'explore', toolCallId: 't', startMs: T + 20000, endMs: T + 900000 }],
+  });
+  // One band: the prompt at 480000 splits nothing, both sides of it are covered.
+  assert.deepEqual(shape(tl).slice(0, 2), [['working', 0, 58000], ['idle', 58000, 900000]]);
+});
+
+test('only a gap the workers cover end to end leaves the user column', () => {
+  const events = [stop(0), gen(10)];
+  assert.deepEqual(buildPeriods(events, { subagentIntervals: [[at(5), at(15)]] }).map((p) => p.state), ['waiting_user']);
+  assert.deepEqual(buildPeriods(events, { subagentIntervals: [[at(0), at(10)]] }).map((p) => p.state), ['idle']);
+  // Two workers that overlap cover the gap between them together.
+  assert.deepEqual(buildPeriods(events, { subagentIntervals: [[at(0), at(6)], [at(4), at(10)]] }).map((p) => p.state), ['idle']);
+  // Malformed entries are ignored, not repaired.
+  assert.deepEqual(buildPeriods(events, { subagentIntervals: [null, [at(10), at(0)], ['x', 1]] }).map((p) => p.state), ['waiting_user']);
+});
+
+test('with the collapse withheld there are no lanes and so no coverage', () => {
+  const tl = computeSessionTimeline('bg-nocollapse', {
+    readEvents: () => [promptAt(0, 'g1'), stopAt(58000), genAt(600000, 'g2'), stopAt(601000)],
+    dedupeEvents: null,
+    listCliSubagents: () => bgKids,
+  });
+  assert.deepEqual(tl.subagents, []);
+  assert.equal(shape(tl)[1][0], 'waiting_user');
+});
+
+// ─── a turn the host started itself is the agent's ─────────────────────────
+//
+// Seen on a real CLI session (2026.09.23, 68e34165): once its background workers finished, the CLI
+// restarted the parent by itself — no Send, no beforeSubmitPrompt, so no prompt line — and the 22
+// seconds between the previous stop and the restarted turn's first line drew as "User input". The
+// chat store proves who started it (lib/cli-chats-cursor.mjs, countCliTurnStarts), and the rule is
+// only switched on when it does (`hostResumes`).
+const resumeStream = [promptAt(0, 'g1'), stopAt(60000), genAt(82000, 'g2'), toolAt(83000), stopAt(90000)];
+
+test('with hostResumes, a stop followed by no prompt is the agent working', () => {
+  const periods = buildPeriods(resumeStream, { hostResumes: true });
+  assert.deepEqual(periods.map((p) => p.state), ['working']);
+});
+
+test('with hostResumes, a restart after hours of background work is idle, never a break', () => {
+  const late = BREAK_MS + 60000;
+  const periods = buildPeriods([promptAt(0, 'g1'), stopAt(1000), genAt(late, 'g2'), stopAt(late + 1000)], { hostResumes: true });
+  assert.deepEqual(periods.map((p) => p.state), ['working', 'idle', 'working']);
+});
+
+test('without hostResumes the stop rule is unchanged', () => {
+  assert.deepEqual(buildPeriods(resumeStream).map((p) => p.state), ['working', 'waiting_user', 'working']);
+});
+
+test('hostResumes never touches a stop that came before the first prompt', () => {
+  // A sidecar started before the prompt hook existed, or a plugin upgraded mid-session: until the
+  // hook has fired once there is no telling a missing prompt from a host restart.
+  const periods = buildPeriods([genAt(0, 'g0'), stopAt(1000), genAt(60000, 'g1'), stopAt(61000), promptAt(120000, 'g2'), stopAt(121000)], { hostResumes: true });
+  assert.deepEqual(periods.map((p) => p.state), ['working', 'waiting_user', 'working', 'waiting_user', 'working']);
+});
+
+test('hostResumes keeps a typed prompt and the session_start lead-in on the user side', () => {
+  const typed = buildPeriods([promptAt(0, 'g1'), stopAt(1000), promptAt(60000, 'g2'), stopAt(61000)], { hostResumes: true });
+  assert.deepEqual(typed.map((p) => p.state), ['working', 'waiting_user', 'working']);
+  // `agent --resume` opens a new process: a session_start after an earlier prompt is still a boundary.
+  const reopened = buildPeriods([promptAt(0, 'g1'), stopAt(1000), sessionStart(2000), genAt(60000, 'g2'), stopAt(61000)], { hostResumes: true });
+  assert.deepEqual(reopened.map((p) => p.state), ['working', 'waiting_user', 'working']);
+});
+
+const resumeTimeline = (counts, extra = {}) => {
+  let calls = 0;
+  const tl = computeSessionTimeline('resume', {
+    readEvents: () => extra.events || resumeStream,
+    listCliSubagents: () => [],
+    countCliTurnStarts: (id, deps) => { calls += 1; assert.equal(id, 'resume'); assert.equal(deps.deadline, extra.deadline); if (counts instanceof Error) throw counts; return counts; },
+    ...(extra.deadline === undefined ? {} : { deadline: extra.deadline }),
+    ...(extra.deps || {}),
+  });
+  return { states: tl.periods.map((p) => p.state), calls };
+};
+
+test('the store proves the restart: every typed send has its prompt line and a notification exists', () => {
+  const { states, calls } = resumeTimeline({ human: 1, system: 1 }, { deadline: T + 5 });
+  assert.equal(calls, 1);
+  assert.deepEqual(states, ['working']);
+});
+
+test('a typed send with no prompt line switches the rule off for the whole session', () => {
+  // Two human rows, one prompt line: a Send whose line was lost (a paste over the gate's 1 MiB cap,
+  // the gate's wall guard, a recorder that failed). The unprompted turn may be that Send.
+  assert.deepEqual(resumeTimeline({ human: 2, system: 1 }).states, ['working', 'waiting_user', 'working']);
+});
+
+test('no notification, no human row, an unreadable store or a throwing reader: the stop rule stands', () => {
+  for (const counts of [{ human: 1, system: 0 }, { human: 0, system: 3 }, null, new Error('locked')]) {
+    assert.deepEqual(resumeTimeline(counts).states, ['working', 'waiting_user', 'working'], String(JSON.stringify(counts)));
+  }
+});
+
+test('the store is read only when the stream has an unprompted turn after a prompt', () => {
+  const typedOnly = [promptAt(0, 'g1'), stopAt(1000), promptAt(60000, 'g2'), stopAt(61000)];
+  assert.equal(resumeTimeline({ human: 2, system: 1 }, { events: typedOnly }).calls, 0);
+  assert.equal(resumeTimeline({ human: 1, system: 1 }, { deps: { dedupeEvents: null } }).calls, 0);
+});
+
+// With hook subagent lines already in it, so the chat-store LISTING never runs and cannot be the
+// one reporting: whatever onEnrichment hears comes from the turn-start count alone.
+const hookedResumeStream = [
+  ...resumeStream,
+  { ts: T + 1000, ev: 'subagent_start', sid: 'h1', stype: 'explore' },
+  { ts: T + 2000, ev: 'subagent_stop', sid: 'h1', stype: 'explore', status: 'completed' },
+];
+
+test('a store read the deadline cut short reports the timeline incomplete', () => {
+  // The checkpoint must not post the stop-rule band over a queued timeline that had the evidence:
+  // the same "could not look" the subagent listing reports (lib/cli-subagents-cursor.mjs).
+  const seen = [];
+  const tl = computeSessionTimeline('resume', {
+    readEvents: () => hookedResumeStream,
+    listCliSubagents: () => [],
+    deadline: T + 10,
+    now: () => T + 20,
+    countCliTurnStarts: () => null,
+    onEnrichment: (info) => seen.push(info.complete),
+  });
+  assert.ok(seen.includes(false));
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working', 'waiting_user', 'working']);
+});
+
+test('a store that answered — evidence or not — never reports incomplete', () => {
+  for (const counts of [{ human: 1, system: 0 }, { human: 1, system: 1 }, null]) {
+    const seen = [];
+    computeSessionTimeline('resume', {
+      readEvents: () => hookedResumeStream,
+      listCliSubagents: () => [],
+      deadline: T + 10,
+      now: () => T,
+      countCliTurnStarts: () => counts,
+      onEnrichment: (info) => seen.push(info.complete),
+    });
+    assert.equal(seen.includes(false), false, JSON.stringify(counts));
+  }
+  // A reader that throws is a store that cannot be read, not a cut: no evidence, and complete.
+  const seen = [];
+  computeSessionTimeline('resume', {
+    readEvents: () => hookedResumeStream,
+    listCliSubagents: () => [],
+    countCliTurnStarts: () => { throw new Error('busy'); },
+    onEnrichment: (info) => seen.push(info.complete),
+  });
+  assert.equal(seen.includes(false), false);
+});

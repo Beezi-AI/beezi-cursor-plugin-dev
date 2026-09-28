@@ -1,6 +1,7 @@
 import { readEvents } from './sidecar-read.mjs';
-import { correlateSubagents, timestampOf } from './subagents-cursor.mjs';
+import { correlateSubagents, subagentIntervals, timestampOf } from './subagents-cursor.mjs';
 import { withCliSubagents } from './cli-subagents-cursor.mjs';
+import { countCliTurnStarts } from './cli-chats-cursor.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 import * as hostDelta from './delta-cursor.mjs';
 import * as hostTiming from './timing.mjs';
@@ -345,6 +346,41 @@ function subtypeFor(markers, startMs, endMs) {
   return null;
 }
 
+// The time some subagent was running, as sorted, merged [startMs, endMs] pairs — the shape
+// lib/subagents-cursor.mjs's subagentIntervals returns. Merged so two workers that overlap cover the
+// gap between them together; malformed pairs are dropped, the same rule as validMarkers.
+function mergedIntervals(intervals) {
+  if (!Array.isArray(intervals)) return [];
+  const valid = [];
+  for (const pair of intervals) {
+    if (!Array.isArray(pair)) continue;
+    const [startMs, endMs] = pair;
+    if (typeof startMs !== 'number' || !Number.isFinite(startMs)) continue;
+    if (typeof endMs !== 'number' || !Number.isFinite(endMs)) continue;
+    if (endMs <= startMs) continue;
+    valid.push([startMs, endMs]);
+  }
+  valid.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const pair of valid) {
+    const last = out[out.length - 1];
+    if (last && pair[0] <= last[1]) last[1] = Math.max(last[1], pair[1]);
+    else out.push(pair.slice());
+  }
+  return out;
+}
+
+// Whether workers were running for the WHOLE gap. Only full cover counts, the same rule as a
+// permission marker: a gap half inside a worker's run was half something else. In practice a gap
+// never straddles a worker edge anyway — every span's start and stop are lines in the stream, so
+// they are anchors, and the gaps are already cut at them.
+function coveredBy(intervals, startMs, endMs) {
+  for (const [from, to] of intervals) {
+    if (from <= startMs && to >= endMs) return true;
+  }
+  return false;
+}
+
 export function buildPeriods(events, options = {}) {
   // Opt-OUT, not opt-in. `break` is a member of CliAgentActivityState, the client renders it as
   // "Session break" and the backend excludes it from activity-breakdown totals; `state` is a
@@ -353,6 +389,10 @@ export function buildPeriods(events, options = {}) {
   // pre-break vocabulary, where a long wait stays `waiting_user`.
   const allowBreakState = options.allowBreakState !== false;
   const markers = validMarkers(options.permissionMarkers);
+  const running = mergedIntervals(options.subagentIntervals);
+  // Rule 3a's switch. Evidence, not policy: computeSessionTimeline sets it only when the CLI's chat
+  // store proves the session's unprompted turns were the host's (see hostStartedTurns there).
+  const hostResumes = options.hostResumes === true;
   const anchors = periodAnchors(events);
 
   // A wait on the human: `break` past BREAK_MS when the caller allows it, `waiting_user` otherwise,
@@ -365,22 +405,47 @@ export function buildPeriods(events, options = {}) {
   };
 
   const merged = [];
+  // Whether a prompt line has been seen at or before `prev` — the other half of rule 3a.
+  let promptSeen = false;
   for (let i = 1; i < anchors.length; i++) {
     const prev = anchors[i - 1];
     const cur = anchors[i];
+    if (prev.prompt) promptSeen = true;
     if (cur.ts <= prev.ts) continue;
     const gap = cur.ts - prev.ts;
     let judged;
     // WHO WAS WAITING decides the state; how long only ever splits a user wait into `break`. Each
     // gap is judged on its own two edges and the first rule that matches wins:
     //
+    //   0. subagents were running for the whole gap: the agent is waiting on its own workers, so the
+    //      gap is mid-turn — `idle` past the idle threshold, `working` under it — whatever its edges
+    //      say. This outranks everything, because the edges can lie about it: the CLI ends the
+    //      parent's turn with a `stop` while background workers are still running, then resumes the
+    //      parent by itself when they finish. Judged by its edges, that wait drew as "User input"
+    //      right above the lanes of the workers it was waiting on. It outranks a prompt too: a
+    //      prompt typed while workers run was typed while the agent was busy, and billing already
+    //      bills every second of a worker's run once — on the parent's segment, or as the worker's
+    //      residual where the parent was quiet (lib/checkpoint.mjs over lib/active-time.mjs's
+    //      interval union) — so the band now agrees with the bill.
     //   1. `cur` is a prompt: the human was composing it, so the gap is theirs. This outranks
-    //      everything, including a `prev` that is a tool call — a turn the user aborted without a
+    //      every rule below, including a `prev` that is a tool call — a turn the user aborted without a
     //      `stop` still ends when they type the next prompt.
     //   2. `prev` is a prompt: Send was pressed, the turn is the agent's. `idle` past the idle
     //      threshold (the agent waiting on a slow model or a long think, the same boundary billing
     //      drops the gap at), `working` under it — and NEVER `waiting_user`, which is exactly the
     //      mislabel that drew no-tool CLI turns as "User input" from end to end.
+    //  3a. `prev` is a `stop`, `cur` is not a prompt, a prompt line came earlier, and the chat store
+    //      proved the host restarts turns in this session (`hostResumes`): the CLI restarted the
+    //      agent itself. When a background task finishes — a subagent or a shell job — the CLI files
+    //      a notification and runs a new turn with no Send, so no beforeSubmitPrompt fires and no
+    //      prompt line precedes it. The gap is the agent's: `idle` past the threshold, `working`
+    //      under it, never `break` — a restart hours later is a background job that ran for hours.
+    //      Each condition closes a hole. A prompt earlier in the stream proves the hook fires here, so
+    //      a sidecar written before it existed, a `-p` run and a mid-session upgrade keep rule 3 until
+    //      it does. `session_start` is left out: `agent --resume` opens a new process, and the gap in
+    //      front of its first line is still the human's. And `hostResumes` itself is the guard
+    //      against a LOST prompt line — a paste over the gate's stdin cap, a gate that hit its wall
+    //      guard, a recorder that failed — which would otherwise put a typed turn's think-time here.
     //   3. `prev` is a turn end (`stop`, or the `session_start` boundary): the rule this module has
     //      always had, and now the FALLBACK for a turn with no prompt line — `-p`, older builds and
     //      every sidecar written before the hook existed classify exactly as they did.
@@ -395,8 +460,10 @@ export function buildPeriods(events, options = {}) {
     // Length never moves a gap OUT of the user's column except past BREAK_MS, and length never
     // moves an agent-side gap INTO it: a four-hour background script is the agent waiting, not the
     // human, so it stays `idle` whatever the clock says.
-    if (cur.prompt) judged = userWait(prev, cur);
+    if (coveredBy(running, prev.ts, cur.ts)) judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
+    else if (cur.prompt) judged = userWait(prev, cur);
     else if (prev.prompt) judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
+    else if (hostResumes && promptSeen && prev.endsTurn && !prev.sessionStart) judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
     else if (prev.endsTurn) judged = userWait(prev, cur);
     else judged = { state: gap >= IDLE_GAP_MS ? STATE.IDLE : STATE.WORKING, subtype: null };
     const state = judged.state;
@@ -417,6 +484,82 @@ export function buildPeriods(events, options = {}) {
     // after upgrade for no change in content.
     ...(m.subtype === null ? {} : { waiting_subtype: m.subtype }),
   }));
+}
+
+// On the chat-store reader's clock: `deps.now` when injected, else the wall clock.
+function deadlinePassed(deps) {
+  if (typeof deps.deadline !== 'number') return false;
+  const now = typeof deps.now === 'function' ? deps.now() : Date.now();
+  return now >= deps.deadline;
+}
+
+// Whether the stream holds a gap rule 3a could judge: a `stop` after a prompt, followed by something
+// that is not a prompt. The chat store is opened only when it can change a period — a session whose
+// every turn was typed never pays for the read.
+function hasUnpromptedTurn(anchors) {
+  let promptSeen = false;
+  for (let i = 1; i < anchors.length; i++) {
+    const prev = anchors[i - 1];
+    const cur = anchors[i];
+    if (prev.prompt) promptSeen = true;
+    if (promptSeen && prev.endsTurn && !prev.sessionStart && !cur.prompt && cur.ts > prev.ts) return true;
+  }
+  return false;
+}
+
+// The prompt lines in the stream, one per Send: the same generation id is one Send however many
+// registries wrote it, and a line without an id counts on its own. `events` is already collapsed by
+// the caller, so this only guards against a copy the collapse let through — which would inflate the
+// count and weaken the check below, never tighten it.
+function promptCount(events) {
+  const ids = new Set();
+  let anonymous = 0;
+  for (const event of events) {
+    if (event == null || !PROMPT_EVENTS.has(event.ev) || timestampOf(event) === null) continue;
+    if (typeof event.eid === 'string' && event.eid !== '') ids.add(event.eid);
+    else anonymous += 1;
+  }
+  return ids.size + anonymous;
+}
+
+// Rule 3a's evidence (buildPeriods): true only when the CLI's chat store PROVES that this session's
+// unprompted turns were started by the host.
+//
+//   - at least one host notification: the CLI did restart a turn itself here;
+//   - at least one typed send: a store that shows none while the sidecar holds prompt lines is a
+//     format this reader does not know, and an unknown format proves nothing;
+//   - a prompt line for EVERY typed send. This is the guard against a lost line. The prompt hook can
+//     drop one while every other hook keeps writing (scripts/prompt-submit.mjs: a paste over its
+//     stdin cap, its wall guard, a recorder that failed), and that typed turn would then look exactly
+//     like a host restart. More typed sends than lines means one is missing somewhere, so the rule is
+//     off for the WHOLE session: the store's rows carry minute-precision timestamps at best, which
+//     cannot say which unprompted turn was the typed one. The same check fails closed on a sidecar
+//     pruned under a store that kept everything.
+//
+// Only the CLI has this store; an IDE session's lookup finds no chat and returns null, so the IDE
+// keeps the stop rule. Never throws: a store that cannot be read is no evidence.
+//
+// A read the DEADLINE cut short is not "no evidence", though: it answers exactly like one, and the
+// timeline built from it would draw the stop rule's band over a queued one that had the evidence.
+// So it is reported through `onEnrichment({ complete: false })`, the channel the subagent listing
+// already uses for the same failure (lib/cli-subagents-cursor.mjs), and the checkpoint and the
+// outbox then refuse to let it overwrite anything. Measured the same way — the deadline has passed
+// right after the read — and ONLY that: a store that is locked, garbled or unreadable without
+// node:sqlite stays unreadable, and calling it incomplete would park the timeline until prune.
+function hostStartedTurns(conversationId, events, deps) {
+  if (!hasUnpromptedTurn(periodAnchors(events))) return false;
+  const count = deps.countCliTurnStarts == null ? countCliTurnStarts : deps.countCliTurnStarts;
+  let turns;
+  try {
+    turns = count(conversationId, deps);
+  } catch {
+    return false;
+  }
+  if (turns == null && deadlinePassed(deps) && typeof deps.onEnrichment === 'function') {
+    try { deps.onEnrichment({ complete: false }); } catch { /* the caller's problem, never the hook's */ }
+  }
+  if (turns == null || !Number.isInteger(turns.human) || !Number.isInteger(turns.system)) return false;
+  return turns.system >= 1 && turns.human >= 1 && promptCount(events) >= turns.human;
 }
 
 // The four keys the backend's timeline DTO accepts on a subagent entry — and ONLY those four.
@@ -499,7 +642,19 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
   // looking at, not the one from four hours ago. This bounds the ARRAY LENGTH only — the body-budget
   // fit below (fitPeriodsToBudget) bounds its BYTE SIZE, which a session well under MAX_PERIODS can
   // still blow past on its own (finding D1).
-  const periods = buildPeriods(window, options);
+  //
+  // The workers' runs go in with the events, so a wait on them is drawn as the agent's (buildPeriods,
+  // rule 0). Every span, not just the ones that ship: a lane dropped for the body budget still ran.
+  // Never a SYNTHETIC one: its end is the correlator's guess at the last activity in the stream, and
+  // counting it would draw every wait on the human after an unclosed IDE worker as "Subagents
+  // working" until the session ended.
+  const running = subagentIntervals(spans.filter((span) => span != null && span.synthetic !== true));
+  //
+  // `hostResumes` is evidence too (buildPeriods, rule 3a), and like the lanes it needs the collapse:
+  // an uncollapsed stream counts every prompt once per registry, which would pass the lost-line check
+  // it exists for.
+  const hostResumes = dedupe ? hostStartedTurns(conversationId, window, deps) : false;
+  const periods = buildPeriods(window, { ...options, subagentIntervals: running, hostResumes });
   const trimmedPeriods = periods.length > MAX_PERIODS ? periods.slice(-MAX_PERIODS) : periods;
   const capped = spans.length > MAX_SUBAGENTS ? spans.slice(-MAX_SUBAGENTS) : spans;
   const entries = capped.map(toSubagentEntry);
