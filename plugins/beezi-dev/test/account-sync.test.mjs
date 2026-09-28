@@ -34,7 +34,7 @@ const SCOPE_WITH_CURSOR = { ...SCOPE, cursorAccount: 'dev@example.com' };
 // The server's vocabulary, not ours: camelCase, and every name declared by
 // CliAgentAccountSyncRequestDto. Under forbidNonWhitelisted one wrong name 400s the whole request.
 const PAYLOAD = Object.freeze({
-  accountUuid: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T',
+  accountUuid: 'auth0|user_01TESTSEAT0000000000000000',
   email: 'dev@example.com',
   subscriptionType: 'pro',
 });
@@ -96,7 +96,7 @@ test('an unknown or secret-looking field is a schema failure, not a silent drop'
 });
 
 test('the hash covers the allowlisted fields and ignores key order', () => {
-  const reordered = { subscriptionType: 'pro', email: 'dev@example.com', accountUuid: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T' };
+  const reordered = { subscriptionType: 'pro', email: 'dev@example.com', accountUuid: 'auth0|user_01TESTSEAT0000000000000000' };
   assert.equal(hashCheckInPayload(PAYLOAD), hashCheckInPayload(reordered));
   assert.notEqual(hashCheckInPayload(PAYLOAD), hashCheckInPayload({ ...PAYLOAD, subscriptionType: 'ultra' }));
   assert.match(hashCheckInPayload(PAYLOAD), /^[0-9a-f]{64}$/);

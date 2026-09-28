@@ -413,7 +413,7 @@ test('the account section validates payloads with the same validator as the repo
   // An empty body is valid, a known field is valid, an unknown field is a whole-request 400.
   assert.deepEqual(validate({}, ACCOUNT, 'checkin'), []);
   assert.deepEqual(
-    validate({ accountUuid: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T', email: 'a@b.com', subscriptionType: 'pro' }, ACCOUNT, 'checkin'),
+    validate({ accountUuid: 'auth0|user_01TESTSEAT0000000000000000', email: 'a@b.com', subscriptionType: 'pro' }, ACCOUNT, 'checkin'),
     [],
   );
   assert.ok(validate({ plan: 'pro' }, ACCOUNT, 'checkin').includes('checkin: unknown property plan'));

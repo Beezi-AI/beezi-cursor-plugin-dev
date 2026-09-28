@@ -82,6 +82,45 @@ test('the name is truncated to 200 characters', () => {
   );
 });
 
+// ─── Credential redaction (P2) ──────────────────────────────────────────────
+
+test('a title carrying a token is masked before it becomes the session name', () => {
+  const name = resolveSessionName('conv-1', {
+    ...NO_CLI,
+    composerData: { name: 'fix GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345 leak' },
+    ...NO_EVENTS,
+  });
+  assert.ok(!name.includes('ghp_abcdefghijklmnopqrstuvwxyz012345'));
+  assert.ok(name.startsWith('fix '));
+});
+
+test('a first-prompt fallback carrying a bearer token is masked', () => {
+  const name = resolveSessionName('conv-1', {
+    ...NO_CLI,
+    composerData: {},
+    readEvents: () => [{ ev: 'prompt', text: 'curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123" x' }],
+  });
+  assert.ok(!name.includes('eyJhbGciOiJIUzI1NiJ9'));
+});
+
+test('the name stays capped at 200 characters after redaction', () => {
+  const name = resolveSessionName('conv-1', { ...NO_CLI, composerData: { name: 'x'.repeat(500) }, ...NO_EVENTS });
+  assert.equal(name.length, 200);
+});
+
+// Accepted trade-off (see lib/redact.mjs's Authorization-header rule): a prose title that merely
+// USES the word "Authorization" is over-masked, same as a real header would be. Pinned here,
+// deliberately, so a future change to that rule is a decision made with this case in view, not an
+// accident discovered in production.
+test('a prose title starting with "Authorization" is over-masked — accepted trade-off', () => {
+  const name = resolveSessionName('conv-1', {
+    ...NO_CLI,
+    composerData: { name: 'Authorization: add role checks to admin routes' },
+    ...NO_EVENTS,
+  });
+  assert.equal(name, 'Authorization: [REDACTED]');
+});
+
 test('a blank title falls through instead of becoming the name', () => {
   const name = resolveSessionName('conv-1', {
     ...NO_CLI,

@@ -188,7 +188,13 @@ test('the headers and the body share one budget rather than each getting a full 
   assert.equal(r.failure, GrantFailure.TIMEOUT);
   // The headers took 200ms of a 300ms budget, so the body may have at most the remaining 100.
   // Giving it a fresh 300 — which is what a per-phase timer does — would cost 500ms.
-  assert.ok(elapsed < 450, `the body got a fresh budget: spent ${elapsed}ms`);
+  //
+  // Windows timer granularity: a timer there fires on the system clock tick (~15.6 ms by default),
+  // and on a loaded box each of the two timers here can land a tick or more late, which has carried
+  // an honest shared budget past 450. The slack stays strictly below 500, so a per-phase timer —
+  // which can only fire LATER than 500, never earlier — still fails.
+  const bound = process.platform === 'win32' ? 490 : 450;
+  assert.ok(elapsed < bound, `the body got a fresh budget: spent ${elapsed}ms`);
 });
 
 test('an over-long body is abandoned rather than buffered without limit', async () => {

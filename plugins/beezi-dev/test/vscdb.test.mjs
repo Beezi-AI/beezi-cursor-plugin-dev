@@ -11,6 +11,8 @@ import {
   readComposerData,
   readUsageData,
   withDatabase,
+  SNAPSHOT_PREFIX,
+  sweepStaleSnapshots,
 } from '../lib/vscdb.mjs';
 
 // The suite exercises the real node:sqlite path when it exists, and the degraded path always —
@@ -344,4 +346,75 @@ test('an unknown schema answers null WITHOUT copying the whole database', { skip
   // withDatabase answers a THROWN callback by reopening from a full temp copy (.db + -wal + -shm)
   // and running it again — seconds of I/O on a heavy store, to reach the same verdict.
   assert.deepEqual(copies, [], 'the unknown-schema verdict must not trigger the snapshot fallback');
+});
+
+// ─── sweepStaleSnapshots (P3): orphaned state.vscdb temp snapshots ──────────────────────────────
+//
+// openSnapshot copies state.vscdb (+ -wal/-shm, which can carry cursorAuth/* rows) into a directory
+// named SNAPSHOT_PREFIX under os.tmpdir(). A hook killed at its deadline never reaches the cleanup
+// that removes it, so the copy — including the auth rows — sits on disk forever. Nothing swept it.
+
+test('sweepStaleSnapshots removes only orphaned, aged-out snapshot dirs', (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-sweep-'));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const now = Date.now();
+  const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
+
+  // Created FIRST, then aged: writing into a directory after ageing it resets its mtime.
+  const oldDir = path.join(tmpDir, `${SNAPSHOT_PREFIX}old`);
+  fs.mkdirSync(oldDir);
+  fs.writeFileSync(path.join(oldDir, 'state.vscdb'), 'x');
+  fs.utimesSync(oldDir, twoHoursAgo, twoHoursAgo);
+
+  const newDir = path.join(tmpDir, `${SNAPSHOT_PREFIX}new`);
+  fs.mkdirSync(newDir);
+  fs.writeFileSync(path.join(newDir, 'state.vscdb'), 'x');
+
+  const unrelatedDir = path.join(tmpDir, 'unrelated-old');
+  fs.mkdirSync(unrelatedDir);
+  fs.utimesSync(unrelatedDir, twoHoursAgo, twoHoursAgo);
+
+  const removed = sweepStaleSnapshots({ now, maxAgeMs: 60 * 60 * 1000, tmpDir });
+
+  assert.equal(removed, 1);
+  assert.equal(fs.existsSync(oldDir), false, 'the aged orphan is gone');
+  assert.equal(fs.existsSync(newDir), true, 'a snapshot still young enough to be in use survives');
+  assert.equal(fs.existsSync(unrelatedDir), true, 'a directory outside the snapshot prefix is untouched');
+});
+
+test('sweepStaleSnapshots never throws — a missing or unreadable tmpDir answers 0', () => {
+  assert.equal(sweepStaleSnapshots({ tmpDir: path.join(os.tmpdir(), 'beezi-cursor-does-not-exist') }), 0);
+});
+
+test('sweepStaleSnapshots defaults now, maxAgeMs and tmpDir when called with no options', () => {
+  assert.doesNotThrow(() => sweepStaleSnapshots());
+});
+
+test('a directory rmDir could not actually remove is not counted as removed', (t) => {
+  // rmDir (module-private) is best-effort and swallows its own failure — a locked directory, EBUSY
+  // on Windows, is the realistic one, since these are copies SQLite may still hold open. That is not
+  // reproducible from a portable test without a real lock, so this simulates the same observable
+  // shape through the fsImpl seam: the removal is real (rmDir still runs against the real fs), but
+  // the post-removal existence check is made to lie and say the directory is still there — the exact
+  // signal a genuinely failed removal would produce.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-sweep-locked-'));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const now = Date.now();
+  const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
+
+  const lockedDir = path.join(tmpDir, `${SNAPSHOT_PREFIX}locked`);
+  fs.mkdirSync(lockedDir);
+  fs.writeFileSync(path.join(lockedDir, 'state.vscdb'), 'x');
+  fs.utimesSync(lockedDir, twoHoursAgo, twoHoursAgo);
+
+  const fsImpl = {
+    readdirSync: (...args) => fs.readdirSync(...args),
+    statSync: (...args) => fs.statSync(...args),
+    existsSync: () => true, // "still there", regardless of what rmDir actually did
+  };
+
+  const removed = sweepStaleSnapshots({ now, maxAgeMs: 60 * 60 * 1000, tmpDir, fsImpl });
+
+  assert.equal(removed, 0, 'a directory that answers "still there" after rmDir must not be counted');
 });

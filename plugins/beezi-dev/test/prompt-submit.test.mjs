@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { hookBudgetMs, HOOK_KIND_GATE } from '../lib/hook-runner.mjs';
+import { startupMs } from './helpers/node-startup.mjs';
 
 // scripts/prompt-submit.mjs, run the way Cursor runs it: payload on stdin, its own process,
 // `--via plugin-hooks`, and a throwaway home.
@@ -39,6 +40,9 @@ import { hookBudgetMs, HOOK_KIND_GATE } from '../lib/hook-runner.mjs';
 // Broken-module paths live in test/hook-bootstrap.test.mjs with every other hook.
 
 const SCRIPT = fileURLToPath(new URL('../scripts/prompt-submit.mjs', import.meta.url));
+// What the recorder process runs: the script above, in `--record` mode, loads this module to do its
+// work. The runtime tests go through the script; the structural ones read both.
+const RECORDER_LIB = fileURLToPath(new URL('../lib/prompt-recorder.mjs', import.meta.url));
 const ANSWER = '{"continue":true}';
 const SECRET = 'refactor the zebra module please';
 
@@ -78,12 +82,29 @@ function readLines(home) {
 }
 
 // Poll until `ready()` is true or the wait runs out. Returns whether it became true.
-async function until(ready, ms = LINE_WAIT_MS) {
+async function until(ready, ms = LINE_WAIT_MS, every = 15) {
   const deadline = Date.now() + ms;
   for (;;) {
     if (ready()) return true;
     if (Date.now() > deadline) return false;
-    await sleep(15);
+    await sleep(every);
+  }
+}
+
+// Whether the capture file's last line is a whole record yet. The file EXISTING is not enough: the
+// recorder's `fs.appendFile` creates it before the bytes land, so under load a reader can find it
+// empty or half-written, and a test that parsed it then failed for a recorder that did nothing wrong.
+// A missing file, an empty one and a torn last line all read as "not yet".
+const CAPTURE_WAIT_MS = 5000;
+const CAPTURE_POLL_MS = 25;
+function captureRecordLanded(captureFile) {
+  try {
+    const records = fs.readFileSync(captureFile, 'utf-8').split('\n').filter(Boolean);
+    if (records.length === 0) return false;
+    JSON.parse(records[records.length - 1]);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -108,8 +129,10 @@ async function run(input, { env = {}, preload = null, expect = 'line' } = {}) {
   const gateMs = Date.now() - startedAt;
   const captureFile = path.join(home, 'capture', 'hooks.jsonl');
   if (expect === 'line') await until(() => readLines(home).lines.length > 0);
-  else if (expect === 'capture') await until(() => readLines(home).lines.length > 0 && fs.existsSync(captureFile));
-  else await sleep(NO_LINE_GRACE_MS);
+  else if (expect === 'capture') {
+    await until(() => readLines(home).lines.length > 0);
+    await until(() => captureRecordLanded(captureFile), CAPTURE_WAIT_MS, CAPTURE_POLL_MS);
+  } else await sleep(NO_LINE_GRACE_MS);
   const { text, lines } = readLines(home);
   return { home, result, lines, eventsText: text, gateMs, startedAt };
 }
@@ -620,6 +643,13 @@ function runTimed(input, env, { workspace = null, preload = null } = {}) {
 
 const STALL_MS = 1500;
 
+// What the timed tests hold the gate to: the gate budget (hookBudgetMs, 500 ms) plus one measured
+// node start (test/helpers/node-startup.mjs). The window from answer to exit holds a `spawn` of the
+// recorder and the gate's teardown, and on a loaded box those alone can eat the budget — the suite
+// failed that way with nothing wrong in the gate. A gate that blocks still fails: what it costs is the
+// stall — seconds, paid on top of the same node start — not one extra process start.
+const gateBudgetMs = () => hookBudgetMs(HOOK_KIND_GATE) + startupMs();
+
 test('a stalled synchronous append cannot hold Send: the gate exits and closes its pipes inside the budget', async () => {
   // The Codex repro, made synchronous this time: the recorder blocks its only thread in
   // Atomics.wait for STALL_MS before appending, which no timer in any process could interrupt. The
@@ -628,7 +658,7 @@ test('a stalled synchronous append cannot hold Send: the gate exits and closes i
   assert.equal(res.code, 0);
   assert.equal(res.stdout, ANSWER);
   assert.ok(res.answerToExitMs !== null, 'the answer never reached stdout');
-  const budget = hookBudgetMs(HOOK_KIND_GATE);
+  const budget = gateBudgetMs();
   assert.ok(res.answerToExitMs < budget, `the gate lived ${res.answerToExitMs.toFixed(0)} ms after answering`);
   assert.ok(res.answerToCloseMs < budget, `the gate's pipes closed ${res.answerToCloseMs.toFixed(0)} ms after answering`);
   // And the line still lands — later, from the recorder, which is what proves the recorder and not
@@ -664,8 +694,10 @@ test('the recorder-stall seam is inert outside NODE_ENV=test', async () => {
   assert.equal(res.code, 0);
   assert.equal(res.stdout, ANSWER);
   assert.equal(res.lines.length, 1);
-  assert.ok(res.spawnToLineMs < STALL_MS, `the line took ${res.spawnToLineMs.toFixed(0)} ms: the seam applied`);
-  assert.ok(res.answerToExitMs < hookBudgetMs(HOOK_KIND_GATE), `${res.answerToExitMs} ms after answering`);
+  // One node start of slack, and no more: the line pays for two (the gate's and the recorder's)
+  // before it can land, so a seam that applied costs STALL_MS on top of both and still fails here.
+  assert.ok(res.spawnToLineMs < STALL_MS + startupMs(), `the line took ${res.spawnToLineMs.toFixed(0)} ms: the seam applied`);
+  assert.ok(res.answerToExitMs < gateBudgetMs(), `${res.answerToExitMs} ms after answering`);
 });
 
 // A STALLED FILESYSTEM, as the gate process sees it. Codex review, BLOCKING, the third time round:
@@ -689,7 +721,15 @@ test('the recorder-stall seam is inert outside NODE_ENV=test', async () => {
 // as well as to the default-export object, so neither spelling can slip past. The preload is
 // test-only by construction — it exists only on this file's command lines, and only on the GATE's
 // (the recorder is spawned with its own argv) — so production carries no seam for it.
-const FS_STALL_MS = 900;
+//
+// 2500 ms, not the 900 of the Codex repro. The timed test below allows one measured node start of
+// slack on top of the gate budget (gateBudgetMs), and that slack grows with load. At 900 ms a
+// single stalled call beat the widened bound by only ~360 ms on an idle box, so on a loaded one a
+// regression of ONE blocking call would have passed. At 2500 one blocked call costs seconds, and
+// the test caps the slack below the stall as well, so one call always fails, whatever the load.
+// A clean gate makes no stalled call at all, so the figure costs the passing run nothing; only the
+// positive control pays it, once per stalled call.
+const FS_STALL_MS = 2500;
 const FS_STALL = 'data:text/javascript,' + encodeURIComponent([
   'import fs from "fs";',
   'import { syncBuiltinESMExports } from "module";',
@@ -713,23 +753,32 @@ const FS_STALL = 'data:text/javascript,' + encodeURIComponent([
   'syncBuiltinESMExports();',
 ].join('\n'));
 
-test('the script holds no filesystem call a timer cannot interrupt, in the gate or the recorder', () => {
+test('the script and its recorder module hold no filesystem call a timer cannot interrupt', () => {
   // The structural half of the two runtime tests around it. Codex review, BLOCKING (the gate's
   // existsSync + chdir) and MAJOR (the recorder's synchronous append): the gate makes no filesystem
   // call at all, and the recorder's are asynchronous, so both processes' timers can always fire.
   // The answer's one `writeSync` to fd 1 is pinned in test/plugin-manifest.test.mjs. Code only —
   // the comments name these calls to explain why they are gone.
-  const body = fs.readFileSync(SCRIPT, 'utf-8').replace(/\/\/.*$/gm, '');
-  // `dumpHookPayload(` and the retention sweep too (Codex review, MAJOR): both are synchronous, and
-  // the recorder used to call the first for capture, which put its stall past the deadline.
-  for (const blocking of ['existsSync', 'chdir(', 'enterProjectDir', 'mkdirSync', 'statSync', 'appendFileSync', 'appendEvent(',
-    'dumpHookPayload(', 'CaptureRetention(']) {
-    assert.equal(body.includes(blocking), false, `${blocking} is back in the gate script`);
+  //
+  // Both files: the gate is the script, and the recorder process runs the script too but does its
+  // work in lib/prompt-recorder.mjs, which is where its appends now live.
+  const code = (file) => fs.readFileSync(file, 'utf-8').replace(/\/\/.*$/gm, '');
+  const gate = code(SCRIPT);
+  const recorder = code(RECORDER_LIB);
+  for (const [name, body] of [['the gate script', gate], ['the recorder module', recorder]]) {
+    // `dumpHookPayload(` and the retention sweep too (Codex review, MAJOR): both are synchronous, and
+    // the recorder used to call the first for capture, which put its stall past the deadline.
+    for (const blocking of ['existsSync', 'chdir(', 'enterProjectDir', 'mkdirSync', 'statSync', 'appendFileSync', 'appendEvent(',
+      'dumpHookPayload(', 'CaptureRetention(']) {
+      assert.equal(body.includes(blocking), false, `${blocking} is back in ${name}`);
+    }
   }
-  // And no synchronous call of any other name: the answer's one `writeSync` is the only one.
-  assert.deepEqual((body.match(/\w+Sync\(/g) || []).filter((call) => call !== 'writeSync('), []);
-  assert.match(body, /fs\.appendFile\(/, 'the recorder\'s append is the asynchronous one');
-  assert.match(body, /fs\.mkdir\(/, 'the recorder\'s mkdir is the asynchronous one');
+  // And no synchronous call of any other name: the answer's one `writeSync` is the only one, and it
+  // is the gate's. The recorder has none at all.
+  assert.deepEqual((gate.match(/\w+Sync\(/g) || []).filter((call) => call !== 'writeSync('), []);
+  assert.deepEqual(recorder.match(/\w+Sync\(/g) || [], []);
+  assert.match(recorder, /fs\.appendFile\(/, 'the recorder\'s append is the asynchronous one');
+  assert.match(recorder, /fs\.mkdir\(/, 'the recorder\'s mkdir is the asynchronous one');
 });
 
 test('the fs-stall preload really stalls: a positive control for the test below', () => {
@@ -763,7 +812,9 @@ test('a stalled filesystem cannot hold Send: the gate makes no fs call, so it ex
       assert.equal(res.code, 0, label);
       assert.equal(res.stdout, ANSWER, label);
       assert.ok(res.answerToExitMs !== null, `${label}: the answer never reached stdout`);
-      const budget = hookBudgetMs(HOOK_KIND_GATE);
+      // The slack is capped below one stall (see FS_STALL_MS): however slow node starts get, a gate
+      // that makes a single stalled call after answering lives at least FS_STALL_MS and fails.
+      const budget = Math.min(gateBudgetMs(), FS_STALL_MS - 100);
       assert.ok(res.answerToExitMs < budget, `${label}: the gate lived ${res.answerToExitMs.toFixed(0)} ms after answering`);
       assert.ok(res.answerToCloseMs < budget, `${label}: the gate's pipes closed ${res.answerToCloseMs.toFixed(0)} ms after answering`);
       // Still in time to hand off: the recorder (unstalled — it has its own argv) wrote the line.
@@ -835,7 +886,8 @@ test('with capture on, an unattributable payload is still captured as a run, and
       env: envFor(home, { BEEZI_CURSOR_DUMP_HOOKS: '1' }),
     });
     assert.equal(result.stdout, ANSWER);
-    assert.ok(await until(() => fs.existsSync(captureFile(home))), 'the run was not captured');
+    assert.ok(await until(() => captureRecordLanded(captureFile(home)), CAPTURE_WAIT_MS, CAPTURE_POLL_MS), 'the run was not captured');
+    // Still a grace before the no-line check: a line nobody expected would land after the assertion.
     await sleep(NO_LINE_GRACE_MS);
     const captured = fs.readFileSync(captureFile(home), 'utf-8');
     assert.equal(captured.includes('zebra'), false);

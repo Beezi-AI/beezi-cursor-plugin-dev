@@ -454,7 +454,13 @@ test('a foreign batch on a session with nothing new is left for prune', async (t
   assert.ok(pendingOf('conv-1'), 'and the record is still there');
 
   fs.utimesSync(path.join(pendingDir(), 'conv-1.json'), new Date(T0), new Date(T0));
-  pruneStale(T0 + 31 * 24 * 3600 * 1000);
+  // `now` here is a synthetic clock (T0 is a fixed 2026-01-01 constant, not Date.now()), so the
+  // orphaned-snapshot sweep pruneStale also runs must not be allowed to see the real os.tmpdir():
+  // an isolated, empty `deps.tmpDir` keeps it from touching (or racing) a real beezi-cursor-db-*
+  // snapshot elsewhere on the machine.
+  const sweepTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-sweep-sandbox-'));
+  t.after(() => fs.rmSync(sweepTmpDir, { recursive: true, force: true }));
+  pruneStale(T0 + 31 * 24 * 3600 * 1000, undefined, { tmpDir: sweepTmpDir });
   assert.equal(pendingOf('conv-1'), null, 'prune collects it in the end');
 });
 

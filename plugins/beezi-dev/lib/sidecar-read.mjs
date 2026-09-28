@@ -65,9 +65,9 @@ export function eventsFile(conversationId, deps = {}) {
 
 // Every read of the stream, with the provenance a caller needs to tell "no events" from
 // "no file" — the two look identical in an empty array and mean opposite things upstream.
-// { events, exists, lineCount, skipped, truncatedTail }
+// { events, exists, lineCount, skipped, truncatedTail, nextByte }
 export function readEventsDetailed(conversationId, deps = {}) {
-  const empty = { events: [], exists: false, lineCount: 0, skipped: 0, truncatedTail: false };
+  const empty = { events: [], exists: false, lineCount: 0, skipped: 0, truncatedTail: false, nextByte: 0 };
   if (!conversationId) return empty;
 
   const file = eventsFile(conversationId, deps);
@@ -113,7 +113,13 @@ export function readEventsDetailed(conversationId, deps = {}) {
     events.push(parsed);
   }
 
-  return { events, exists: true, lineCount: raw.length, skipped, truncatedTail };
+  // Byte offset one past the last COMPLETE line of the content already in hand — the same bound
+  // `readEventsFrom`'s resume path uses, computed here instead of by a second read of the same
+  // file. A trailing partial write (no terminating \n yet) is naturally excluded, so the next
+  // checkpoint's resume starts exactly where this read stopped trusting the tail.
+  const nextByte = Buffer.byteLength(content.slice(0, content.lastIndexOf('\n') + 1), 'utf-8');
+
+  return { events, exists: true, lineCount: raw.length, skipped, truncatedTail, nextByte };
 }
 
 export function readEvents(conversationId, deps = {}) {
@@ -222,17 +228,13 @@ export function readEventsFrom(conversationId, start = null, deps = {}) {
   const full = readEventsDetailed(conversationId, deps);
   if (!full.exists) return absent;
   // A full read has to report the byte offset too, or the next checkpoint cannot resume from it.
-  let nextByte = 0;
-  try {
-    const raw = typeof deps.readFile === 'function' ? deps.readFile(file) : fs.readFileSync(file, 'utf-8');
-    const cut = typeof raw === 'string' ? raw.lastIndexOf('\n') : -1;
-    nextByte = cut === -1 ? 0 : Buffer.byteLength(raw.slice(0, cut + 1), 'utf-8');
-  } catch { /* leave 0 — the next read is simply a full one again */ }
+  // `readEventsDetailed` already computed it from the content it read — reusing that instead of
+  // reading the file a second time here is the point of this path.
   return {
     events: full.events,
     exists: true,
     baseLine: 0,
-    nextByte,
+    nextByte: full.nextByte,
     resumed: false,
     skipped: full.skipped,
     truncatedTail: full.truncatedTail,

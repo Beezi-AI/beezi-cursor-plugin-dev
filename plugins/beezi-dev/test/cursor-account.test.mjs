@@ -177,19 +177,19 @@ const ADMIN_ID_KEY = 'adminSettings.cachedAuthId';
 const MEMBERSHIP_ID_KEY = 'cursorAuth/stripeMembershipAuthId';
 const STATUS_KEY = 'cursorAuth/stripeSubscriptionStatus';
 
-const AUTH0_ID = 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T';
+const AUTH0_ID = 'auth0|user_01TESTSEAT0000000000000000';
 
 test('the observed personal pro seat reads as one whole tuple', () => {
   const account = readCursorAccount(vscdb({
     [MEMBERSHIP_KEY]: '"pro"',
-    [EMAIL_KEY]: '"uliana.gerek@gmail.com"',
+    [EMAIL_KEY]: '"seat@example.com"',
     [MEMBERSHIP_ID_KEY]: `"${AUTH0_ID}"`,
     [STATUS_KEY]: '"active"',
     [SIGNED_IN_KEY]: `"${AUTH0_ID}"`,
     [ADMIN_ID_KEY]: `"${AUTH0_ID}"`,
   }));
   assert.equal(account.plan, 'pro');
-  assert.equal(account.email, 'uliana.gerek@gmail.com');
+  assert.equal(account.email, 'seat@example.com');
   assert.equal(account.accountId, AUTH0_ID);
   assert.equal(account.subscriptionId, AUTH0_ID);
   assert.equal(account.status, 'active');
@@ -302,7 +302,7 @@ test('a bare (non-JSON) id value is accepted and kept verbatim', () => {
 // `authInfo.authId` (both equal to the state.vscdb anchor on that machine), there is NO plan key
 // anywhere in the file, and `authInfo` sits beside credential material. The fixture copies that
 // layout, secrets included, so the no-leak assertions below are tested against the real hazard.
-const CLI_AUTH_ID = 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T';
+const CLI_AUTH_ID = 'auth0|user_01TESTSEAT0000000000000000';
 const CLI_SECRET = 'sk-cli-secret-0123456789';
 const CLI_REFRESH = 'rt-cli-refresh-9876543210';
 function realCliConfig(extra) {

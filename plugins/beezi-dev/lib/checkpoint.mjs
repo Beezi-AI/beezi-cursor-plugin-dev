@@ -34,6 +34,7 @@ import {
   readBillingConfig, subscriptionReportFields, thirdPartyReportFields, normalizeAccountAnchor,
 } from './billing-config.mjs';
 import { resolveSessionName } from './session-name-cursor.mjs';
+import { redactDetail } from './redact.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
@@ -325,6 +326,11 @@ function modelsFrom(entries) {
 // Enforced here rather than trusted: an over-long string is a validation failure, and a validation
 // failure takes the WHOLE report with it, not the field.
 const MAX_AGENT_NAME_CHARS = 200;
+
+// Mirrors lib/session-name-cursor.mjs's own MAX. Used only for the `state.sentSessionName` fallback
+// below, which reads back a value THIS module wrote in a possibly older run — not for the fresh
+// `resolveSessionName` result, which already caps and redacts itself.
+const MAX_SESSION_NAME_CHARS = 200;
 
 // ── who this session belongs to (plan §4 D)
 //
@@ -837,10 +843,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       ? { cursor: options.startCursor == null ? 0 : options.startCursor, sentSessionName: null, anchor: null }
       : loadState(session_id);
     // When the conversation record is unreadable (name resolves to null), keep the last name we sent
-    // rather than overwriting the stored name with null.
+    // rather than overwriting the stored name with null. Re-redacted on the way back out: a state
+    // file written before credential redaction shipped may still hold the OLD, unmasked name, and
+    // `redact()` is idempotent (lib/redact.mjs:131-132), so re-running it on an already-clean value
+    // changes nothing.
     const sessionName =
       resolvedSessionName != null ? resolvedSessionName
-        : state.sentSessionName != null ? state.sentSessionName
+        : state.sentSessionName != null ? redactDetail(state.sentSessionName, MAX_SESSION_NAME_CHARS)
           : null;
     // The session timeline and the subagent correlation are both whole-session by definition, so a
     // turn-end hook has to parse the entire sidecar anyway. Parse it ONCE here and hand the same
@@ -1367,11 +1376,12 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
             is_subagent: true,
             agent_id: span.agent_id,
             agent_type: span.agent_type,
-            // The worker's own task description. Truncated here rather than trusted: it is free text
-            // from whoever spawned the agent, and an over-long value fails validation for the whole
-            // report. Null when the host sent none — a fabricated name would be indistinguishable
-            // from a real one.
-            agent_name: span.task === null ? null : span.task.slice(0, MAX_AGENT_NAME_CHARS),
+            // The worker's own task description. Redacted and truncated here rather than trusted: it
+            // is free text from whoever spawned the agent, an over-long value fails validation for
+            // the whole report, and free text is exactly where a pasted credential turns up (see
+            // lib/redact.mjs). Null when the host sent none — a fabricated name would be
+            // indistinguishable from a real one.
+            agent_name: span.task === null ? null : redactDetail(span.task, MAX_AGENT_NAME_CHARS),
             // `spawn_depth` is DELIBERATELY ABSENT and must stay absent. Cursor's payloads expose
             // `parent_conversation_id`, which only separates depth-1 from depth-≥2, and a subagent's
             // own conversation id is never exposed, so the graph cannot be walked. The field is an

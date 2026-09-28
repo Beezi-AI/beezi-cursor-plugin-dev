@@ -1101,8 +1101,8 @@ function writeBilling(home, anchor, extra) {
 // A seat whose Cursor knows both halves of its identity — the ordinary case on a signed-in machine.
 function fullAnchor(over) {
   return {
-    email: 'uliana.gerek@gmail.com',
-    accountId: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T',
+    email: 'seat@example.com',
+    accountId: 'auth0|user_01TESTSEAT0000000000000000',
     subscriptionId: SUBSCRIPTION_SENTINEL,
     source: 'state_vscdb',
     ...(over == null ? {} : over),
@@ -1116,8 +1116,8 @@ test('a report carries the account id and email the anchor holds', async (t) => 
   await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta() }));
 
   const [payload] = queued();
-  assert.equal(payload.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T');
-  assert.equal(payload.account_email, 'uliana.gerek@gmail.com');
+  assert.equal(payload.account_uuid, 'auth0|user_01TESTSEAT0000000000000000');
+  assert.equal(payload.account_email, 'seat@example.com');
   // Beside the plan fields, not instead of them: the two answer different questions and the backend
   // stores them in different places.
   assert.equal(payload.subscription_plan, 'pro');
@@ -1136,7 +1136,7 @@ test('account_uuid is OMITTED, never null, when the machine has no seat id', asy
   // says "I have nothing to say about this column", null says "set this column to null" — which
   // would blank an id the check-in path already taught the backend.
   assert.equal('account_uuid' in payload, false, 'an explicit null would blank a known id');
-  assert.equal(payload.account_email, 'uliana.gerek@gmail.com', 'the half we do know still goes');
+  assert.equal(payload.account_email, 'seat@example.com', 'the half we do know still goes');
 });
 
 test('account_email is OMITTED, never null, when the machine has no address', async (t) => {
@@ -1147,7 +1147,7 @@ test('account_email is OMITTED, never null, when the machine has no address', as
 
   const [payload] = queued();
   assert.equal('account_email' in payload, false);
-  assert.equal(payload.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T', 'the stronger half still goes');
+  assert.equal(payload.account_uuid, 'auth0|user_01TESTSEAT0000000000000000', 'the stronger half still goes');
 });
 
 test('no anchor at all emits neither field, and reports everything else as before', async (t) => {
@@ -1220,8 +1220,47 @@ test('the subagent segment carries the same identity as its parent', async (t) =
   // A subagent's spend is the parent seat's spend. A segment that reached the backend without an
   // identity would fall through to the OAuth-fingerprint resolution step, or to nothing at all, and
   // the ten minutes it bills would sit on no subscription.
-  assert.equal(subagent.account_uuid, 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T');
-  assert.equal(subagent.account_email, 'uliana.gerek@gmail.com');
+  assert.equal(subagent.account_uuid, 'auth0|user_01TESTSEAT0000000000000000');
+  assert.equal(subagent.account_email, 'seat@example.com');
+});
+
+test('agent_name carrying a credential is masked before it reaches the wire', async (t) => {
+  const home = tmpHome(t);
+  writeBilling(home, fullAnchor());
+  writeSidecar(home, [
+    { ts: 1, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1', token_input: 10, token_output: 2 },
+    { ts: 2000, ev: 'subagent_start', sid: 'sa-1', stype: 'general-purpose', task: 'deploy with AKIAABCDEFGHIJKLMNOP' },
+    { ts: 602000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'deploy with AKIAABCDEFGHIJKLMNOP' },
+    { ts: 603000, ev: 'stop' },
+  ]);
+
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps(), { emitTimeline: true });
+
+  const subagent = queued().find((payload) => payload.is_subagent === true);
+  assert.ok(subagent, 'the subagent segment must exist for this assertion to mean anything');
+  // A non-vacuous check first: a null or empty agent_name would also satisfy "does not include the
+  // key", so the surrounding prose must survive before the credential is asserted absent.
+  assert.ok(subagent.agent_name.startsWith('deploy with '), 'the surrounding prose must survive the redaction');
+  assert.ok(!subagent.agent_name.includes('AKIAABCDEFGHIJKLMNOP'), 'the access key id must not reach the wire');
+});
+
+test('a session name carried forward from older, unredacted state is masked before it is sent', async (t) => {
+  tmpHome(t);
+  // Stands in for a state file written before credential redaction shipped: `sentSessionName` holds
+  // the raw token verbatim, exactly as an old run would have persisted it.
+  fs.mkdirSync(stateDir(), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir(), 'conv-1.json'),
+    JSON.stringify({ cursor: 0, sentSessionName: 'fix GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345 leak', anchor: null }),
+  );
+
+  // A null resolver is what forces the fallback to `state.sentSessionName` at all — with a name
+  // resolved fresh, the carried value is never consulted.
+  await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ computeDelta: () => delta(), resolveSessionName: () => null }));
+
+  const [payload] = queued();
+  assert.ok(payload.session_name.startsWith('fix '), 'the surrounding prose must survive the redaction');
+  assert.ok(!payload.session_name.includes('ghp_abcdefghijklmnopqrstuvwxyz012345'), 'the carried-forward token must not reach the wire');
 });
 
 test('a 200-char SSO id is OMITTED, never truncated, while the rest of the report still ships', async (t) => {
@@ -1248,7 +1287,7 @@ test('a 200-char SSO id is OMITTED, never truncated, while the rest of the repor
   //              row, and the next check-in carrying a short-enough id absorbs it. Attributed a
   //              little later, never attributed WRONG.
   assert.equal('account_uuid' in payload, false, 'an over-length id must be omitted, not truncated');
-  assert.equal(payload.account_email, 'uliana.gerek@gmail.com', 'the email anchor still ships — this is the fallback resolution path');
+  assert.equal(payload.account_email, 'seat@example.com', 'the email anchor still ships — this is the fallback resolution path');
   // The rest of the report is unaffected: the whole point of omitting is that nothing else is lost.
   assert.ok(payload.models, 'the report itself must still be intact');
 });

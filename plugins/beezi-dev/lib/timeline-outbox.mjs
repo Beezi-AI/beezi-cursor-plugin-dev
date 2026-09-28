@@ -43,14 +43,14 @@ import { currentAccountKey } from './tracking.mjs';
 // A version bump is how a future entry shape announces itself; this build leaves one it cannot read.
 // `partial` is an optional flag on the same shape, not a new version: a build that predates it reads
 // a partial entry as an ordinary one and sends it, which is exactly what it did before the flag.
-export const OUTBOX_VERSION = 1;
+const OUTBOX_VERSION = 1;
 
 // How many directory entries one drain may STAT. Codex review (DO NOT SHIP): the listing stat'ed the
 // whole directory before the first budget check, so 10,000 stranded entries under an expired
 // deadline cost 10,000 stats on a hook path. The names come from one `readdirSync`; only this many
 // are stat'ed, the deadline checked between each, and the drain picks the oldest of those. Ten times
 // OUTBOX_DRAIN_MAX, so foreign or contended entries in the window rarely starve the sends.
-export const OUTBOX_LIST_MAX = 50;
+const OUTBOX_LIST_MAX = 50;
 
 // The signature the checkpoint compares against `state.sentTimelineSig`, in ONE place: the drain now
 // rebuilds partial entries and records the rebuilt signature, and two copies of the formula would
@@ -103,7 +103,7 @@ export function timelineStatusOf(result) {
 
 // The entry file for one conversation, or null when the id cannot be made into a filename — the
 // same sanitizer the state file, the lock and the sidecar use, so all four agree on the name.
-export function timelineOutboxFileFor(sessionId) {
+function timelineOutboxFileFor(sessionId) {
   const name = safeName(sessionId);
   return name === null ? null : timelineOutboxFile(name);
 }

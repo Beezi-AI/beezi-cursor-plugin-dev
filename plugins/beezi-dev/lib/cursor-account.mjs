@@ -22,14 +22,14 @@ import { hostPath } from './paths-cursor.mjs';
 // VERIFIED 2026-09-21 on a real machine — %APPDATA%\Cursor\User\globalStorage\state.vscdb,
 // table ItemTable:
 //
-//   cursorAuth/cachedEmail              => "uliana.gerek@gmail.com"
+//   cursorAuth/cachedEmail              => "seat@example.com"
 //   cursorAuth/stripeMembershipType     => "pro"
-//   cursorAuth/stripeMembershipAuthId   => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
+//   cursorAuth/stripeMembershipAuthId   => "auth0|user_01TESTSEAT0000000000000000"
 //   cursorAuth/stripeSubscriptionStatus => "active"
 //   cursorAuth/cachedSignUpType         => "Auth_0"
-//   cursorAuth/cachedScopedProfile      => "{\"displayName\":\"Uliana Herek\"}"
-//   glass.lastSignedInAuthId            => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
-//   adminSettings.cachedAuthId          => "auth0|user_01KESV726FDEFJEV6CX7GHWQ8T"
+//   cursorAuth/cachedScopedProfile      => "{\"displayName\":\"Seat Holder\"}"
+//   glass.lastSignedInAuthId            => "auth0|user_01TESTSEAT0000000000000000"
+//   adminSettings.cachedAuthId          => "auth0|user_01TESTSEAT0000000000000000"
 //
 // That machine is a PERSONAL `pro` seat, where all three id keys agree. Team-plan divergence —
 // where `stripeMembershipAuthId` is plausibly the paying OWNER while the other two name this seat

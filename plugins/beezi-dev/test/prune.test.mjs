@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pruneStale } from '../lib/prune.mjs';
+import { SNAPSHOT_PREFIX } from '../lib/vscdb.mjs';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,16 @@ function ageFile(p, ageMs, now = Date.now()) {
   // utimesSync takes seconds
   const timeSec = (now - ageMs) / 1000;
   fs.utimesSync(p, timeSec, timeSec);
+}
+
+// An isolated directory for `deps.tmpDir` — never the real os.tmpdir(). Any test that drives
+// pruneStale on a synthetic clock MUST pass one: sweepStaleSnapshots ages directories by
+// `now - mtimeMs`, and a `now` that is not real wall-clock time can make a real, possibly
+// still-in-use `beezi-cursor-db-*` snapshot elsewhere on the machine look arbitrarily stale.
+function makeSweepTmpDir(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-sweep-sandbox-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 // ─── test 1: prunes old state file ──────────────────────────────────────────
@@ -197,4 +208,86 @@ test('pruneStale collects an expired timeline outbox entry and keeps a fresh one
 
   assert.equal(fs.existsSync(old), false, 'an undeliverable timeline is not immortal');
   assert.equal(fs.existsSync(fresh), true, 'a timeline awaiting the next hook survives');
+});
+
+// ─── throttle: the retention sweep itself runs at most every 6 hours (H2) ───────────────────────
+
+// Every fs call pruneStale (and the capture sweep it triggers) can make, with `readdirSync` counted
+// so a test can tell "the sweep walked the directories" from "the throttle skipped it outright".
+function countingFsImpl() {
+  let readdirCalls = 0;
+  return {
+    fsImpl: {
+      readdirSync: (...args) => { readdirCalls += 1; return fs.readdirSync(...args); },
+      statSync: (...args) => fs.statSync(...args),
+      lstatSync: (...args) => fs.lstatSync(...args),
+      unlinkSync: (...args) => fs.unlinkSync(...args),
+      renameSync: (...args) => fs.renameSync(...args),
+      readFileSync: (...args) => fs.readFileSync(...args),
+      writeFileSync: (...args) => fs.writeFileSync(...args),
+      existsSync: (...args) => fs.existsSync(...args),
+    },
+    get readdirCalls() { return readdirCalls; },
+    resetCalls() { readdirCalls = 0; },
+  };
+}
+
+test('the retention sweep itself runs at most once every 6 hours', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  // Isolated: two of these calls use a clock ahead of real wall-clock time (+1min, +7h), and
+  // without a sandboxed tmpDir that would make any real beezi-cursor-db-* snapshot elsewhere on
+  // this machine look arbitrarily stale to sweepStaleSnapshots.
+  const tmpDir = makeSweepTmpDir(t);
+  const now = Date.now();
+  const counter = countingFsImpl();
+
+  pruneStale(now, undefined, { fsImpl: counter.fsImpl, tmpDir });
+  assert.ok(counter.readdirCalls > 0, 'the first call actually walks the directories');
+
+  counter.resetCalls();
+  pruneStale(now + 60 * 1000, undefined, { fsImpl: counter.fsImpl, tmpDir }); // 1 minute later
+  assert.equal(counter.readdirCalls, 0, 'a call inside the 6h window performs no directory listing');
+
+  counter.resetCalls();
+  pruneStale(now + 7 * 60 * 60 * 1000, undefined, { fsImpl: counter.fsImpl, tmpDir }); // 7 hours later
+  assert.ok(counter.readdirCalls > 0, 'a call past the 6h window walks the directories again');
+});
+
+test('pruneStale sweeps an orphaned state.vscdb temp snapshot under the same throttled call', (t) => {
+  // openSnapshot (lib/vscdb.mjs) copies state.vscdb — including cursorAuth/* rows — under
+  // os.tmpdir(), not under beeziCursorHome(), so nothing in the dir loop above can ever reach it.
+  // A hook killed at its deadline never runs openSnapshot's own cleanup, so this is the only sweep.
+  const home = makeTmpDir(t);
+  setHome(home);
+  const now = Date.now();
+  const twoHoursAgo = new Date(now - 2 * 60 * 60 * 1000);
+
+  // Isolated via deps.tmpDir — never the real os.tmpdir() — so this test cannot reach (or race) a
+  // real snapshot directory elsewhere on the machine.
+  const tmpDir = makeSweepTmpDir(t);
+  const orphan = path.join(tmpDir, `${SNAPSHOT_PREFIX}orphan`);
+  fs.mkdirSync(orphan);
+  fs.writeFileSync(path.join(orphan, 'state.vscdb'), 'x');
+  fs.utimesSync(orphan, twoHoursAgo, twoHoursAgo);
+
+  pruneStale(now, undefined, { tmpDir });
+
+  assert.equal(fs.existsSync(orphan), false, 'the orphaned snapshot was swept inside pruneStale');
+});
+
+test('a stamp in the future re-runs immediately — a clock that moved backwards is not a real wait', (t) => {
+  const home = makeTmpDir(t);
+  setHome(home);
+  // Isolated: the second call's clock is behind the first (a resync), which is still not real
+  // wall-clock time at the moment it runs — sandbox for the same reason as the test above.
+  const tmpDir = makeSweepTmpDir(t);
+  const now = Date.now();
+  const counter = countingFsImpl();
+
+  pruneStale(now, undefined, { fsImpl: counter.fsImpl, tmpDir });
+  counter.resetCalls();
+  // The next call's `now` is BEFORE the stamp we just wrote — a resync or a VM resume, not a wait.
+  pruneStale(now - 60 * 1000, undefined, { fsImpl: counter.fsImpl, tmpDir });
+  assert.ok(counter.readdirCalls > 0, 'a stamp from the future re-baselines instead of waiting it out');
 });

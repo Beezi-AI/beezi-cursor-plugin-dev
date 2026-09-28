@@ -206,11 +206,21 @@ export const MAX_PERIODS = 5000;
 
 // The cap that actually binds, and it is not either of the two above: Express's default JSON body
 // limit is ~100 KB and nobody has overridden it on this route. 1000 subagent entries at ~150 bytes
-// each is ~150 KB, and a 413 rejects the ENTIRE timeline — periods, plan events, session span, the
-// lot — for a session whose only sin was delegating a lot of work. 90 KB leaves room for the
-// envelope (`sessionId`, the timestamps) and for the difference between a byte count and whatever
-// the proxy in front of the API counts.
+// each is ~150 KB, and a long session's periods run well past that on their own — a period is drawn
+// for every working/idle/waiting_user/break transition, so a session that ran for hours produces
+// thousands of them, MAX_PERIODS notwithstanding (5000 periods at ~90 bytes each is ~450 KB). A 413
+// rejects the ENTIRE timeline — periods, plan events, session span, the lot — for a session whose
+// only sin was running a long time or delegating a lot of work. 90 KB leaves room for the envelope
+// (`sessionId`, the timestamps) and for the difference between a byte count and whatever the proxy
+// in front of the API counts.
 export const TIMELINE_BODY_BUDGET_BYTES = 90 * 1024;
+
+// The most periods will ever be asked to give up to make room for subagents that have not been
+// fitted yet — see fitPeriodsToBudget's use of it in computeSessionTimeline. Capped, not flat: a
+// session with no subagents (or a handful of tiny ones) must not lose 20 KB of periods for a reserve
+// nothing will ever fill. computeSessionTimeline narrows this to `Math.min(SUBAGENT_RESERVE_BYTES,
+// actualSubagentBytes)` before it ever reaches the budget passed in here.
+export const SUBAGENT_RESERVE_BYTES = 20 * 1024;
 
 // Drop the lowest-value subagent entries until the serialized body fits the budget.
 //
@@ -260,6 +270,51 @@ export function fitSubagentsToBudget(entries, baseBytes, budget = TIMELINE_BODY_
     total -= s.bytes;
   }
   return entries.filter((_, index) => !dropped.has(index));
+}
+
+// Drop the OLDEST periods until the serialized body fits the budget — finding D1: MAX_PERIODS caps
+// the array's length, never its byte size, and a session that ran long enough produces periods well
+// under that cap whose JSON still blows well past TIMELINE_BODY_BUDGET_BYTES on its own. Where
+// fitSubagentsToBudget picks its drops by value (shortest span first), periods have no such axis —
+// every one is a real, equally-true slice of the timeline — so the only defensible rule left is the
+// one the existing MAX_PERIODS trim already applies inside computeSessionTimeline (unchanged by
+// this function): newest first, drop from the front. A user re-opening a long session cares about
+// what just happened, not what happened four hours ago, and the trimmed periods still leave
+// `started_at`/`ended_at` at the full span (see the caller) so the axis does not lie about how
+// long the session ran.
+//
+// `envelopeBytes` is everything in the body that is NOT periods — the caller measures that once
+// itself, the same way baseBytes is measured below for fitSubagentsToBudget. `budget` is the ceiling
+// this call is held to, which the caller narrows by whatever it is reserving for something else (see
+// SUBAGENT_RESERVE_BYTES); this function has no opinion on that and only ever compares against what
+// it is given.
+//
+// Sizes are measured once per period, same technique as fitSubagentsToBudget above: a naive loop that
+// re-stringifies the whole array on every drop is O(n^2) against an array that can be thousands long.
+export function fitPeriodsToBudget(periods, envelopeBytes, budget = TIMELINE_BODY_BUDGET_BYTES) {
+  if (periods.length === 0) return periods;
+  const sized = periods.map((period) => {
+    try {
+      // +1 for the comma that joins it to its neighbour, matching fitSubagentsToBudget's accounting.
+      // `[]` itself is already inside envelopeBytes.
+      return Buffer.byteLength(JSON.stringify(period), 'utf-8') + 1;
+    } catch {
+      return 0;
+    }
+  });
+
+  let total = envelopeBytes;
+  for (const bytes of sized) total += bytes;
+  if (total <= budget) return periods;
+
+  // Drop from the front (oldest) until it fits, then keep the rest in their existing order — no
+  // reordering, no per-period value judgement, just the newest tail of what still fits.
+  let dropCount = 0;
+  while (dropCount < sized.length && total > budget) {
+    total -= sized[dropCount];
+    dropCount += 1;
+  }
+  return periods.slice(dropCount);
 }
 
 // The permission-wait windows the caller has VERIFIED, normalized to [startMs, endMs) pairs.
@@ -441,7 +496,9 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
   }
 
   // Newest first, then truncate: when a session blows the cap it is the recent fan-out the user is
-  // looking at, not the one from four hours ago.
+  // looking at, not the one from four hours ago. This bounds the ARRAY LENGTH only — the body-budget
+  // fit below (fitPeriodsToBudget) bounds its BYTE SIZE, which a session well under MAX_PERIODS can
+  // still blow past on its own (finding D1).
   const periods = buildPeriods(window, options);
   const trimmedPeriods = periods.length > MAX_PERIODS ? periods.slice(-MAX_PERIODS) : periods;
   const capped = spans.length > MAX_SUBAGENTS ? spans.slice(-MAX_SUBAGENTS) : spans;
@@ -483,8 +540,38 @@ export function computeSessionTimeline(conversationId, deps = {}, options = {}) 
     generated_at: new Date().toISOString(),
   };
 
+  // The envelope: everything the body carries that is NOT periods or subagents — `sessionId`, the
+  // (always empty) plan events, the session span, the generated_at stamp. Measured once, zeroing both
+  // arrays, so it costs one stringify regardless of how many periods or subagents there are.
+  let envelopeBytes = 0;
+  try {
+    envelopeBytes = Buffer.byteLength(
+      JSON.stringify({ sessionId: conversationId, ...timeline, periods: [], subagents: [] }),
+      'utf-8',
+    );
+  } catch { /* unserializable is impossible here; a throw leaves this at 0 — the envelope counts as empty and the fit still runs */ }
+
+  // Subagents get first claim on SUBAGENT_RESERVE_BYTES of whatever the envelope leaves, but never
+  // more than they actually need — `entries`, not `spans`: the DTO's four narrowed keys are what
+  // ships, and sizing the rich span instead (task, synthetic, the millisecond pair) would reserve for
+  // bytes that never reach the wire. A session that delegated nothing sizes to `"[]"` (2 bytes), so
+  // it reserves 2 bytes, not 20 KB: periods must not lose 20 KB to a reserve nothing will fill.
+  let subagentBytes = 0;
+  try {
+    subagentBytes = Buffer.byteLength(JSON.stringify(entries), 'utf-8');
+  } catch { /* unserializable is impossible here; a throw leaves this at 0, so the reserve below is 0 — none */ }
+  const reserve = Math.min(SUBAGENT_RESERVE_BYTES, subagentBytes);
+
+  // Not `started_at` / `ended_at`: those stay at the full span exactly as the MAX_PERIODS trim above
+  // already leaves them (the axis, not the drawn periods, tells the portal how long the session ran).
+  // Assigned onto the existing key rather than rebuilt, so `timeline`'s key order — and therefore its
+  // signature — is unchanged for the common case where nothing here drops anything.
+  timeline.periods = fitPeriodsToBudget(trimmedPeriods, envelopeBytes, TIMELINE_BODY_BUDGET_BYTES - reserve);
+
   // Measured against the body the caller actually sends — `sessionId` and all — because the limit
-  // that rejects it is counted on the wire, not on the part of it this module happens to own.
+  // that rejects it is counted on the wire, not on the part of it this module happens to own. Against
+  // `timeline.periods` as fitted just above, not the untrimmed array, so a subagent list that needed
+  // the reserve is not charged for periods that already made room for it.
   let baseBytes = 0;
   try {
     baseBytes = Buffer.byteLength(

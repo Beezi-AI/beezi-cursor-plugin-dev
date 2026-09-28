@@ -207,17 +207,24 @@ test('the prompt gate answers exactly once, first, and has no other way to reach
   assert.ok(at('installHookGuards(') !== -1 && at('installHookGuards(') < at(wall), 'the wall guard precedes the process guards');
   assert.ok(at(wall) !== -1 && at(wall) < at(answer), 'the wall guard is armed after the answer, or not at all');
   // `enterProjectDir()` is no longer on this list: the gate does not call it at all (see the
-  // project-directory test above). The recorder's append is `fs.appendFile(`, the asynchronous
-  // call that replaced `appendEvent(` so a stalled sidecar cannot outlive the recorder's deadline.
-  for (const later of ['process.stdin', 'import(', 'spawn(', 'fs.appendFile(']) {
+  // project-directory test above). The recorder's work — its `fs.appendFile(`, the asynchronous call
+  // that replaced `appendEvent(` so a stalled sidecar cannot outlive the recorder's deadline — lives
+  // in lib/prompt-recorder.mjs, so what must come after the answer here is the import that loads it.
+  const recorderImport = "import('../lib/prompt-recorder.mjs')";
+  for (const later of ['process.stdin', 'import(', 'spawn(', recorderImport]) {
     assert.ok(at(later) > at(answer), `${later} runs before the answer is written`);
   }
+  // Loaded, never imported statically: a static import is evaluated before the first line of the
+  // script, which is in front of the answer.
+  assert.equal(/from\s+['"][^'"]*prompt-recorder/.test(body), false, 'the recorder module is imported statically');
+  const recorder = fs.readFileSync(path.join(PLUGIN_ROOT, 'lib', 'prompt-recorder.mjs'), 'utf-8').replace(/\/\/.*$/gm, '');
+  assert.match(recorder, /fs\.appendFile\(/, 'the recorder\'s append is not the asynchronous one');
   // NO SYNCHRONOUS I/O IN THE GATE, and the recorder that does the write instead. Codex review,
   // BLOCKING, the second time round: a timer cannot interrupt a synchronous call, so a 900 ms
   // synchronous append stub kept the process — and the user's Send — alive 914 ms after answering,
   // wall guard or no wall guard. The gate now reads stdin through events and hands the line to a
   // detached recorder; the script itself holds no synchronous read of stdin and no synchronous
-  // write but the answer (the recorder's append is lib/sidecar.mjs's, reached by import).
+  // write but the answer (the recorder's append is lib/prompt-recorder.mjs's, reached by import).
   for (const sync of ['appendFileSync', 'writeFileSync', 'readFileSync(0', 'readSync(']) {
     assert.equal(body.includes(sync), false, `${sync} is back in the gate script`);
   }

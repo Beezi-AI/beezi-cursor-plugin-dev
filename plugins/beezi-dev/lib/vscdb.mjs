@@ -99,6 +99,11 @@ function openDirect(sqlite, dbFile) {
   }
 }
 
+// The prefix every snapshot temp directory is created under (below, and swept by
+// sweepStaleSnapshots). Exported so the sweeper's "is this one of ours" test and openSnapshot's own
+// mkdtemp call can never drift apart.
+export const SNAPSHOT_PREFIX = 'beezi-cursor-db-';
+
 // Cursor may be running and holding the write-ahead log, in which case a read-only open of the main
 // db either fails or returns a stale snapshot. Copying the whole set (.db + -wal + -shm) to temp and
 // reading the copy is the only way to observe a consistent, current view without touching the
@@ -107,7 +112,7 @@ function openSnapshot(sqlite, dbFile, deps = {}) {
   const mkdtemp = deps.mkdtemp == null ? ((prefix) => fs.mkdtempSync(prefix)) : deps.mkdtemp;
   let dir = null;
   try {
-    dir = mkdtemp(path.join(os.tmpdir(), 'beezi-cursor-db-'));
+    dir = mkdtemp(path.join(os.tmpdir(), SNAPSHOT_PREFIX));
     const base = path.basename(dbFile);
     const target = path.join(dir, base);
     fs.copyFileSync(dbFile, target);
@@ -132,6 +137,36 @@ function rmDir(dir) {
   } catch {
     /* best-effort */
   }
+}
+
+// Removes snapshot temp directories left behind by openSnapshot above. A hook killed at its
+// deadline never reaches openSnapshot's own cleanup (or withDatabase's `finally`), and the copy
+// carries Cursor's auth rows (cursorAuth/* in the WAL, or the main db) — the same P3 the
+// `noSnapshot` degrade on the CLI store exists for, except here there is no way to refuse the copy
+// up front, only to age it out afterward. Anything older than any hook could plausibly still be
+// running is an orphan. Never throws; returns the count removed.
+export function sweepStaleSnapshots(options = {}) {
+  const now = options.now == null ? Date.now() : options.now;
+  const maxAgeMs = options.maxAgeMs == null ? 60 * 60 * 1000 : options.maxAgeMs;
+  const tmpDir = options.tmpDir == null ? os.tmpdir() : options.tmpDir;
+  const fsImpl = options.fsImpl == null ? fs : options.fsImpl;
+  let removed = 0;
+  let names;
+  try { names = fsImpl.readdirSync(tmpDir); } catch { return 0; }
+  for (const name of names) {
+    if (name.indexOf(SNAPSHOT_PREFIX) !== 0) continue;
+    const dir = path.join(tmpDir, name);
+    try {
+      if (now - fsImpl.statSync(dir).mtimeMs <= maxAgeMs) continue;
+      rmDir(dir);
+      // rmDir is best-effort and swallows its own failure (a locked directory — EBUSY on Windows —
+      // is the expected one, since these are copies SQLite may still hold open). Confirm the
+      // directory is actually gone before counting it; a `removed` count a caller could ever use to
+      // believe a locked, still-live copy was cleared would be worse than an honest miss.
+      if (!fsImpl.existsSync(dir)) removed += 1;
+    } catch { /* raced or unreadable */ }
+  }
+  return removed;
 }
 
 // Run `fn(db)` against a read-only handle on `dbFile`. Returns fn's value, or null when the database

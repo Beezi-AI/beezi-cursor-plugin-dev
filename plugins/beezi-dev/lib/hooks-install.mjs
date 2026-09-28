@@ -112,7 +112,7 @@ export const GATE_EVENTS = Object.freeze(
   BEEZI_HOOKS.filter((h) => h.gate === true).map((h) => h.event),
 );
 
-export function isGateEvent(event) {
+function isGateEvent(event) {
   return GATE_EVENTS.indexOf(event) !== -1;
 }
 

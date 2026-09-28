@@ -1,9 +1,12 @@
 import { readComposerData } from './vscdb.mjs';
 import { readEvents } from './sidecar-read.mjs';
 import { readCliChatMeta } from './cli-chats-cursor.mjs';
+import { redactDetail } from './redact.mjs';
 
 // The session display name for a Cursor conversation: the title Cursor itself shows, falling back to
-// the first user prompt. Capped at 200 characters, matching the other two engines.
+// the first user prompt. Capped at 200 characters, matching the other two engines, and run through
+// the same credential redaction as error output — a title IS free text someone wrote, and Cursor's
+// auto-titler is happy to lift a pasted `curl` command or an env var assignment straight into it.
 //
 // Order: the IDE's composerData name, then the CLI chat's meta.json title, then its store.db name
 // (never the "New Agent" placeholder), then the first sidecar prompt, then a prompt inside
@@ -30,7 +33,9 @@ const MESSAGE_LISTS = ['conversation', 'messages', 'fullConversationHeadersOnly'
 function clean(value) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
-  return text === '' ? null : text.slice(0, MAX);
+  // redactDetail masks known credential shapes and THEN caps at MAX (redact.mjs:153) — one call
+  // does both jobs, and in that order, so a credential can never survive by hiding past the cutoff.
+  return text === '' ? null : redactDetail(text, MAX);
 }
 
 function pick(record, fields) {

@@ -5,8 +5,12 @@ import {
   postSessionTimeline,
   timestampOf,
   fitSubagentsToBudget,
+  fitPeriodsToBudget,
+  buildPeriods,
   TIMELINE_BODY_BUDGET_BYTES,
+  SUBAGENT_RESERVE_BYTES,
   MAX_SUBAGENTS,
+  MAX_PERIODS,
   BREAK_MS,
   IDLE_GAP_MS,
 } from '../lib/session-timeline-cursor.mjs';
@@ -762,4 +766,97 @@ test('a stream of nothing but session_end still yields a timeline, with no perio
   assert.deepEqual(tl.periods, []);
   assert.equal(tl.started_at, iso(0));
   assert.equal(tl.ended_at, iso(0));
+});
+
+// ─── periods fit to the body budget (D1) ────────────────────────────────────
+//
+// MAX_PERIODS caps the array's LENGTH, never its byte size. A session that ran long enough produces
+// periods well under that cap whose JSON still blows past TIMELINE_BODY_BUDGET_BYTES on its own — a
+// 413 that drops the ENTIRE timeline (periods included) for a session whose only sin was running a
+// long time, same as the subagent guard already exists for a session that delegated a lot.
+const budgetBase = 1_820_000_000_000;
+const budgetTool = (ms) => ({ ts: budgetBase + ms, ev: 'tool', tool: 'read_file', bytes: 10 });
+const budgetStop = (ms) => ({ ts: budgetBase + ms, ev: 'stop' });
+
+// `count` alternating working/waiting_user periods, none of which ever merge — adjacent states always
+// differ — and none of which collide with delta-cursor's own-registry dedupe (any two identical-content
+// lines land 1000 ms + IDLE_GAP_MS apart, well outside its 1000 ms window).
+function manyPeriodsWindow(count) {
+  const events = [budgetTool(0)];
+  let ms = 0;
+  for (let i = 0; i < count; i++) {
+    if (i % 2 === 0) {
+      ms += 1000; // a short "working" gap: tool -> stop
+      events.push(budgetStop(ms));
+    } else {
+      ms += IDLE_GAP_MS; // a turn ended, so the gap to the next anchor is "waiting_user"
+      events.push(budgetTool(ms));
+    }
+  }
+  return events;
+}
+
+test('a long session has its periods fit to the body budget instead of 413-dropped', () => {
+  const events = manyPeriodsWindow(3000);
+  const untrimmed = buildPeriods(events);
+  assert.ok(untrimmed.length >= 3000, `expected >= 3000 periods, got ${untrimmed.length}`);
+  assert.ok(untrimmed.length < MAX_PERIODS, 'this must exercise the budget fit, not the MAX_PERIODS cap');
+
+  const tl = timelineOf(events);
+  const body = Buffer.byteLength(JSON.stringify({ sessionId: 'conv-1', ...tl }), 'utf-8');
+  assert.ok(body <= TIMELINE_BODY_BUDGET_BYTES, `body was ${body} bytes`);
+  // Dropped OLDEST first, same direction as the existing MAX_PERIODS trim: the LAST period of the
+  // untrimmed build is exactly the last period returned.
+  assert.deepEqual(tl.periods[tl.periods.length - 1], untrimmed[untrimmed.length - 1]);
+  // A session with no subagents must not lose the whole SUBAGENT_RESERVE_BYTES (20 KB) reserve for
+  // nothing: an implementation that always carves out the flat constant (instead of Math.min-ing it
+  // against what subagents actually need, here zero) would still pass every assertion above while
+  // leaving ~20 KB of budget on the table.
+  assert.ok(
+    TIMELINE_BODY_BUDGET_BYTES - body < SUBAGENT_RESERVE_BYTES,
+    `left ${TIMELINE_BODY_BUDGET_BYTES - body} bytes of budget unused with zero subagents to reserve for`,
+  );
+});
+
+test('a small subagent list still ships alongside a body-budget-trimmed long session', () => {
+  // Thousands of periods compete for the same 90 KB with a handful of subagent bytes. Without the
+  // reserve, periods fill the budget right up to the envelope's edge and leave no room at all — the
+  // single subagent below is dropped by fitSubagentsToBudget an instant later. With the reserve
+  // (Math.min(SUBAGENT_RESERVE_BYTES, actual)) periods stop early enough that both ship.
+  const periodEvents = manyPeriodsWindow(3000);
+  const lastTs = periodEvents[periodEvents.length - 1].ts;
+  const events = [
+    ...periodEvents,
+    { ts: lastTs + 1000, ev: 'subagent_start', sid: 'sa_01', stype: 'general-purpose', task: 'audit' },
+    { ts: lastTs + 2000, ev: 'subagent_stop', stype: 'general-purpose', status: 'completed', task: 'audit' },
+  ];
+  const tl = timelineOf(events);
+  const body = Buffer.byteLength(JSON.stringify({ sessionId: 'conv-1', ...tl }), 'utf-8');
+  assert.ok(body <= TIMELINE_BODY_BUDGET_BYTES, `body was ${body} bytes`);
+  assert.deepEqual(tl.subagents.map((s) => s.agent_id), ['sa_01']);
+});
+
+test('fitPeriodsToBudget leaves a list that already fits completely alone', () => {
+  const periods = [{ state: 'working', started_at: 'x', ended_at: 'y' }];
+  assert.equal(fitPeriodsToBudget(periods, 0, TIMELINE_BODY_BUDGET_BYTES), periods);
+  assert.deepEqual(fitPeriodsToBudget([], 0, 10), []);
+});
+
+test('fitPeriodsToBudget drops the OLDEST periods first and keeps the rest in order', () => {
+  const period = (state, i) => ({ state, started_at: `s${i}`, ended_at: `e${i}` });
+  const periods = [period('working', 0), period('idle', 1), period('working', 2), period('idle', 3)];
+  const bytes = (list) =>
+    list.reduce((acc, p) => acc + Buffer.byteLength(JSON.stringify(p), 'utf-8') + 1, 0);
+
+  // Room for only the newest two.
+  const kept = fitPeriodsToBudget(periods, 0, bytes(periods.slice(2)));
+  assert.deepEqual(kept, periods.slice(2));
+
+  // Room for only the newest one.
+  const oneKept = fitPeriodsToBudget(periods, 0, bytes(periods.slice(3)));
+  assert.deepEqual(oneKept, periods.slice(3));
+
+  // The envelope counts against the same budget as the periods.
+  const withEnvelope = fitPeriodsToBudget(periods, bytes(periods.slice(3)), bytes(periods.slice(2)));
+  assert.deepEqual(withEnvelope, periods.slice(3));
 });

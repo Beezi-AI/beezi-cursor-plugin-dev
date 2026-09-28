@@ -42,8 +42,8 @@ const RECORD = {
   capturedAt: '2026-09-20T00:00:00.000Z',
   accountAnchor: {
     email: 'seat@example.com',
-    accountId: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T',
-    subscriptionId: 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T',
+    accountId: 'auth0|user_01TESTSEAT0000000000000000',
+    subscriptionId: 'auth0|user_01TESTSEAT0000000000000000',
     source: 'state_vscdb',
   },
   subscriptionStatus: 'active',
@@ -322,7 +322,7 @@ test('the refresh report of a plan-less machine sends nothing', async (t) => {
 // nothing to anchor, and the check-in answered NOTHING_TO_REPORT — so no session report from that
 // machine ever carried an `account_uuid`. Chained through the REAL reader, observation, reconcile
 // and payload builder, so a drop anywhere along the way fails here.
-const CLI_AUTH_ID = 'auth0|user_01KESV726FDEFJEV6CX7GHWQ8T';
+const CLI_AUTH_ID = 'auth0|user_01TESTSEAT0000000000000000';
 const CLI_SECRET = 'sk-cli-secret-0123456789';
 const CLI_ONLY = {
   stateVscdbFile: '/fake/state.vscdb',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readEvents, readEventsDetailed, countEvents, eventsFile } from '../lib/sidecar-read.mjs';
+import { readEvents, readEventsDetailed, readEventsFrom, countEvents, eventsFile } from '../lib/sidecar-read.mjs';
 
 function writeSidecar(text) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cursor-sidecar-'));
@@ -92,4 +92,25 @@ test('a traversal-shaped conversation id never resolves outside the events direc
 test('an empty conversation id reads as no events', () => {
   assert.deepEqual(readEvents(''), []);
   assert.equal(countEvents(null), 0);
+});
+
+test('a full read reads the sidecar file exactly once, and nextByte stops at the last complete line', () => {
+  // A multibyte char in the complete line makes a char-count offset wrong and a byte-count offset
+  // right; the partial trailing line (no terminating \n yet) must not count toward nextByte.
+  const complete = line({ ts: 1, ev: 'gen', model: 'sonnet-€' });
+  const partial = '{"ts":2,"ev":"too';
+  const deps = writeSidecar(complete + partial);
+  let calls = 0;
+  const countingDeps = {
+    ...deps,
+    readFile: (p) => {
+      calls += 1;
+      return fs.readFileSync(p, 'utf-8');
+    },
+  };
+
+  const result = readEventsFrom('conv-1', null, countingDeps);
+
+  assert.equal(calls, 1, 'the full-read path must read the file exactly once');
+  assert.equal(result.nextByte, Buffer.byteLength(complete, 'utf-8'));
 });
