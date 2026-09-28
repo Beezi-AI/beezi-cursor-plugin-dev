@@ -7,6 +7,7 @@ import { runCheckpoint, flushQueue } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir, timelineOutboxDir } from '../lib/paths-cursor.mjs';
 import { sessionLockPath, withLock } from '../lib/lock.mjs';
 import { OUTBOX_DRAIN_MAX, drainTimelineOutbox } from '../lib/timeline-outbox.mjs';
+import { computeDelta as realComputeDelta } from '../lib/delta-cursor.mjs';
 
 // Task 8, fix D. A Cursor CLI session gets one turn-end at most: `agent -p` fires exactly one
 // sessionEnd and an interactive exit may fire none. The timeline POST used to be retried only by
@@ -628,6 +629,56 @@ test('an exhausted checkpoint with no entry writes one flagged partial', async (
   await runCheckpoint({ session_id: 'conv-1', cwd: '/repo' }, deps({ fetchImpl: stub.fetchImpl }), { emitTimeline: true, budgetMs: -1 });
   assert.equal(stub.calls.length, 0);
   assert.equal(readEntry().partial, true);
+  assert.equal(stateOf().sentTimelineSig, undefined, 'nothing incomplete is ever recorded as sent');
+});
+
+test('an enrichment cut short INSIDE the timeline build still parks the timeline partial', async (t) => {
+  const home = tmpHome(t);
+  writeSidecar(home);
+  // The checkpoint lists CLI subagents twice: once for the shared stream, and again inside
+  // computeSessionTimeline, because a stream with no workers is still a stream with no subagent
+  // lines. Here the FIRST listing finishes in time and the SECOND is cut short, so the flag
+  // lib/checkpoint-timeline.mjs checks flips only after it was called. A value captured at the call
+  // (instead of the `isEnrichmentComplete` getter) would still read "complete" and POST a timeline
+  // the deadline may have stripped of lanes — the Codex zero-lane overwrite.
+  //
+  // The listing judges completeness on the WALL clock (lib/cli-subagents-cursor.mjs
+  // `listingComplete`), so the wall clock is moved past the deadline between the two listings, from
+  // inside `computeDelta`, which runs after the first. The checkpoint's own clock is the real
+  // Date.now, captured before the move, so the POST budget is still open: a captured value
+  // really would POST. An empty chats dir keeps both listings off the developer's real store.
+  const chatsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-empty-chats-'));
+  t.after(() => fs.rmSync(chatsDir, { recursive: true, force: true }));
+  const realDateNow = Date.now;
+  t.after(() => { Date.now = realDateNow; });
+  // The login "switches" at the same moment, which fences the flush's outbox drain: without that,
+  // the drain would rebuild the partial entry against the default chats dir and send it, and the
+  // assertions below could not tell the checkpoint's POST from the drain's.
+  let epoch = 'epoch-1';
+  let deltaCalls = 0;
+  const stub = stubFetch(200);
+
+  await runCheckpoint(
+    { session_id: 'conv-1', cwd: '/repo' },
+    deps({
+      fetchImpl: stub.fetchImpl,
+      chatsDir,
+      auth: auth({ authEpoch: () => epoch }),
+      computeDelta: (...args) => {
+        deltaCalls += 1;
+        Date.now = () => realDateNow() + 10 * 60 * 1000;
+        epoch = 'epoch-2';
+        return realComputeDelta(...args);
+      },
+    }),
+    { emitTimeline: true, budgetMs: 60_000 },
+  );
+  Date.now = realDateNow;
+
+  assert.equal(deltaCalls, 1, 'the clock moved between the two listings');
+  assert.equal(stub.calls.length, 0, 'a timeline whose second listing was cut short is never POSTed');
+  assert.equal(readEntry().partial, true, 'it is parked for the drain to rebuild');
+  assert.equal(stateOf().timelineLastStatus, 'no-budget');
   assert.equal(stateOf().sentTimelineSig, undefined, 'nothing incomplete is ever recorded as sent');
 });
 

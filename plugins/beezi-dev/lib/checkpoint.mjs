@@ -5,7 +5,7 @@ import { claimIntervals, mergeIntervals, subtractIntervals, totalMs } from './ac
 import { correlateSubagents, subagentIntervals } from './subagents-cursor.mjs';
 import { countEvents as _countEvents, readEventsFrom } from './sidecar-read.mjs';
 import { authEpoch as _authEpoch, forceRefresh as _forceRefresh, getAccessToken as _getAccessToken } from './token.mjs';
-import { pendingBatchFile, queueDir, sessionStateFile } from './paths-cursor.mjs';
+import { queueDir, sessionStateFile } from './paths-cursor.mjs';
 import {
   git, currentBranch, resolveOriginRemote, localRemoteFromRoot,
   clampBranch, UNATTRIBUTED_REMOTE,
@@ -13,7 +13,6 @@ import {
 import { currentAccountKey, isLiveTrackingAllowed } from './tracking.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
-import { POST_TIMEOUT_MS } from './http.mjs';
 import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { HOOK_GUARD_MARGIN_MS } from './hook-runner.mjs';
 import { eventsFileFor, safeName } from './sidecar.mjs';
@@ -21,11 +20,8 @@ import { lazyRecordIssue } from './diagnostics-sink.mjs';
 import { sessionLockPath, withLock } from './lock.mjs';
 import { deliverQueue } from './queue-delivery.mjs';
 import { postSessionError } from './session-error-report.mjs';
-import { computeSessionTimeline, postSessionTimeline } from './session-timeline-cursor.mjs';
-import {
-  drainTimelineOutbox, dropTimelineOutbox, readTimelineOutbox, takeAuthSnapshot, timelineSigOf,
-  timelineStatusOf, writeTimelineOutbox,
-} from './timeline-outbox.mjs';
+import { drainTimelineOutbox, takeAuthSnapshot } from './timeline-outbox.mjs';
+import { reconcileSessionTimeline } from './checkpoint-timeline.mjs';
 import { withCliSubagents } from './cli-subagents-cursor.mjs';
 import { classifyCliChat } from './cli-chats-cursor.mjs';
 import { readChildOwner, writeChildOwner } from './cli-child-owner.mjs';
@@ -38,6 +34,9 @@ import {
 import { resolveSessionName } from './session-name-cursor.mjs';
 import { redactDetail } from './redact.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
+import {
+  PENDING, PENDING_VERSION, classifyPendingBatch, dropPendingBatch, loadPendingBatch, savePendingBatch,
+} from './checkpoint-batch.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { resolveFetch } from './fetch-compat.mjs';
 
@@ -125,92 +124,6 @@ function enqueueIfAbsent(payload) {
   if (queuedAlready) return false;
   writeJsonSecure(file, payload);
   return true;
-}
-
-// ── the pending batch
-//
-// `state/<id>.json` is COMMITTED TRUTH — cursor, cursorBytes, usageSnapshot, coveredIntervals,
-// anchor. A pending batch is UNCOMMITTED INTENT. They are two files because one atomic write
-// cannot carry both: a crash between "the batch is durable" and "the state is committed" would be
-// indistinguishable from "neither happened", which is the exact ambiguity this record exists to
-// remove. With it, the disk always says which of the two it is.
-//
-// The ordering contract, and every step of it is load-bearing:
-//
-//   1. build the payloads and the proposed `next`   — nothing durable yet
-//   2. write this record, atomically, BEFORE the first enqueue
-//   3. `enqueueIfAbsent` every item, in order
-//   4. only then apply `next` and save the state
-//   5. only then unlink this record
-//
-// A crash at any point leaves either no record (nothing happened) or a record whose `next.cursor`
-// against the live `state.cursor` says exactly which half landed.
-const PENDING_VERSION = 1;
-
-// What a recovered record means for this run.
-const PENDING = Object.freeze({
-  // No record, or nothing to do.
-  NONE: 'none',
-  // Items may not all be queued and `next` is not committed: replay steps 3-4-5 and STOP. The
-  // frozen window is what gets committed, never a re-read of a sidecar that has grown since.
-  RESUME: 'resume',
-  // `next` is already committed; only the unlink was lost. Delete and carry on normally.
-  DONE: 'done',
-  // Another account's batch, an unknown version, or a malformed record. Do NOT enqueue and do NOT
-  // commit: putting another tenant's payloads on the wire under these credentials, or advancing
-  // this account's cursor over work reported to a different one, are both worse than one orphaned
-  // file. lib/prune.mjs's 14-day sweep collects it.
-  FOREIGN: 'foreign',
-});
-
-function pendingFile(id) {
-  const name = safeName(id);
-  return name === null ? null : pendingBatchFile(name);
-}
-
-function loadPendingBatch(id) {
-  const file = pendingFile(id);
-  return file === null ? null : readJson(file, null);
-}
-
-function savePendingBatch(id, batch) {
-  const file = pendingFile(id);
-  // Unreachable in practice: an id with no safe filename has no session lock either, so the guarded
-  // section this is called from never runs. Here so the writer cannot drift from `loadPendingBatch`.
-  if (file === null) throw new Error('beezi: session id cannot be made into a filename');
-  writeJsonSecure(file, batch);
-}
-
-function dropPendingBatch(id) {
-  const file = pendingFile(id);
-  if (file === null) return;
-  try { fs.unlinkSync(file); } catch { /* already gone — the delete is idempotent by design */ }
-}
-
-// `account` is the stamp THIS run reports under; `cursor` is the live `state.cursor`.
-function classifyPendingBatch(batch, sessionId, account, cursor) {
-  if (batch == null || typeof batch !== 'object') return PENDING.NONE;
-  // Every one of these is "a record this build cannot reason about", and the answer to all of them
-  // is the same: leave it alone. A version bump is how a future shape announces itself.
-  if (batch.version !== PENDING_VERSION) return PENDING.FOREIGN;
-  if (batch.sessionId !== sessionId) return PENDING.FOREIGN;
-  if (!Array.isArray(batch.items)) return PENDING.FOREIGN;
-  if (batch.next == null || typeof batch.next !== 'object') return PENDING.FOREIGN;
-  // A cursor-less commit is legitimate, not malformed: the session-name replay stages the anchor
-  // again with a corrected name and commits `{ sentSessionName }` alone, leaving the cursor exactly
-  // where it was. Reading that as FOREIGN would strand a perfectly ordinary record — never
-  // enqueued, never committed — until the 14-day sweep, and lose the rename with it.
-  if (batch.next.cursor !== undefined && !Number.isFinite(batch.next.cursor)) return PENDING.FOREIGN;
-  // Strict equality, null included: a batch built before any login recorded an email carries
-  // `account: null`, and it is this machine's own only while that is still true.
-  if ((batch.account == null ? null : batch.account) !== (account == null ? null : account)) {
-    return PENDING.FOREIGN;
-  }
-  // With no cursor in the commit there is nothing to compare, so "has this already landed?" cannot
-  // be answered from the cursor. RESUME is the safe answer: `enqueueIfAbsent` will not rewrite a
-  // queue file that is already there, and re-applying a `sentSessionName` is idempotent.
-  if (batch.next.cursor === undefined) return PENDING.RESUME;
-  return cursor >= batch.next.cursor ? PENDING.DONE : PENDING.RESUME;
 }
 
 // The machine's IANA timezone (e.g. Europe/Kyiv). Snapshotted per checkpoint so the server can
@@ -663,7 +576,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // looked for where it could never be written.
   let deltaFailed = false;
   // The session whose timeline POST this run just made and lost (for any reason but a 401), handed
-  // to the flush so its outbox drain does not repeat that POST moments later. See the POST site.
+  // to the flush so its outbox drain does not repeat that POST moments later. See the POST site
+  // (lib/checkpoint-timeline.mjs).
   let timelineOutboxSkip = null;
   const emptyResult = () => ({ enqueued: 0, flush: null, sessionErrors: collectedErrors, deltaFailed });
   // session_id here is Cursor's `conversation_id` — normalizeHookInput maps it. Nothing downstream
@@ -686,7 +600,8 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   // first found nobody), and one cut short by the deadline is enough to make the lanes suspect: it
   // answers exactly like a session with fewer workers. Codex review (DO NOT SHIP): an exhausted
   // checkpoint's zero-lane timeline overwrote a queued one-lane outbox entry, and a later drain
-  // delivered it. See the timeline POST site for what an incomplete run may and may not do.
+  // delivered it. See the timeline POST site (lib/checkpoint-timeline.mjs) for what an incomplete
+  // run may and may not do.
   let enrichmentComplete = true;
   const cliDeps = {
     ...deadlineDeps,
@@ -943,6 +858,9 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // no subagent segments at all.
     // ── C-10 recovery: finish whatever the last run left half-done
     //
+    // The record's format and the five-step ordering contract every "C-10" step below follows live
+    // in lib/checkpoint-batch.mjs.
+    //
     // Inside the session lock and before `computeDelta`, because both halves matter: the lock is
     // what stops two hooks recovering the same batch, and being before the delta is what stops the
     // recovered window being widened by sidecar lines that arrived after the batch was frozen.
@@ -1010,11 +928,12 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     // The server's idempotency contract is that a segmentId names a range of the log rather than a
     // count of what survived analysis, so a collapsed array here would shift every segment boundary.
     //
-    // `computeSessionTimeline` collapses for itself when nobody hands it one; below it is handed
-    // this array with an identity collapse so the second full pass does not happen inside the same
-    // 7.5 s budget. That is "already collapsed", which is a different statement from the explicit
-    // `null` that module accepts to mean "there is no collapse available" — that one withholds the
-    // subagent list entirely rather than risk doubling it.
+    // `computeSessionTimeline` collapses for itself when nobody hands it one;
+    // lib/checkpoint-timeline.mjs hands it this array with an identity collapse so the second full
+    // pass does not happen inside the same 7.5 s budget. That is "already collapsed", which is a
+    // different statement from the explicit `null` that module accepts to mean "there is no
+    // collapse available" — that one withholds the subagent list entirely rather than risk
+    // doubling it.
     //
     // Cursor CLI sessions: the workers come from the CLI's chat store, not from hooks
     // (lib/cli-subagents-cursor.mjs). Added to the collapsed stream so the subagent segments AND the
@@ -1944,96 +1863,21 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       }
       await postSessionError(errorPayload, token, { fetchImpl });
     }
-    // The activity timeline is whole-session, so it's re-derived from the full sidecar and shipped
-    // only at turn-ends (stop / sessionEnd) — not on the frequent afterShellExecution path. Skip the
-    // POST when the derived content is identical to the last one we sent (a stop with no new
-    // activity), so we don't re-upsert the same growing jsonb every turn. Best-effort: a failure must
-    // never break the checkpoint.
-    //
     // Deliberately NOT reached in audit mode, which shares the parse above but ships its timelines
     // in its own chunk payloads: posting here as well would send each one twice, on a route that
     // is tracking-gated and therefore 403s for audit-only tenants anyway.
+    //
+    // The reconciliation itself — derive, compare signatures, outbox, POST — is in
+    // lib/checkpoint-timeline.mjs. `enrichmentComplete` goes over as a getter because that call can
+    // still clear it (see there).
     if (postTimeline) {
-      try {
-        const timeline = computeSessionTimeline(
-          session_id,
-          dedupedEvents
-            // Already collapsed above, so the collapse here is the identity — this hands over the
-            // same array the subagent segments were billed from rather than paying for a second
-            // full pass inside the same 7.5 s budget. NOT `dedupeEvents: null`, which that module
-            // reads as "no collapse is available" and answers by withholding the subagent list
-            // entirely; the two look alike and mean opposite things.
-            //
-            // `cliDeps` carries the deadline (and the store seams) to the CLI subagent enrichment the
-            // timeline runs; on the first branch the array is already enriched and that is a no-op.
-            ? { readEvents: () => dedupedEvents, dedupeEvents: (events) => ({ events }), onSubagentDiagnostics, ...cliDeps }
-            : { onSubagentDiagnostics, ...cliDeps },
-          // GATED (CAPABILITIES.breakState). `false` is what that module already assumes when the
-          // third argument is omitted, so this is a no-op today — the seam is wired now rather than
-          // added later under time pressure.
-          { allowBreakState: CAPABILITIES.breakState },
-        );
-        if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
-          const sig = timelineSigOf(timeline);
-          if (sig !== state.sentTimelineSig && !enrichmentComplete) {
-            // The deadline cut the CLI subagent listing short, so this timeline may be missing
-            // lanes it would otherwise have. It is NEVER POSTed: the server upserts by sessionId,
-            // so a lane-less body would erase lanes an earlier turn-end already delivered, whether
-            // or not an outbox entry exists. It never overwrites an existing entry either (the
-            // Codex reproduction: one lane became zero, and a later drain sent that). With no
-            // entry it is kept flagged `partial`, and the drain rebuilds it with a fresh deadline
-            // and sends only a complete rebuild — for a CLI session this sessionEnd may be the
-            // only turn-end there is. `sentTimelineSig` is untouched: nothing was sent.
-            // An incomplete listing means the deadline has passed, so this is the budget talking.
-            const queued = readTimelineOutbox(session_id);
-            if (queued === null) {
-              writeTimelineOutbox(session_id, { sig, body: { sessionId: session_id, ...timeline }, account: accountStamp, partial: true }, { now });
-            } else if (queued.partial !== true) {
-              // An entry queued by an EARLIER turn keeps its lanes, but it is now older than the
-              // session: this checkpoint saw later activity it could not finish enriching. Left as
-              // it was, the drain would send that stale body and delete it — the final stretch of
-              // the timeline lost (Codex re-review: delivered timeline ended 16 s before the
-              // session did). Marking it partial makes the drain rebuild from the sidecar first.
-              writeTimelineOutbox(session_id, { sig: queued.sig, body: queued.body, account: queued.account, partial: true }, { now });
-            }
-            state.timelineLastStatus = 'no-budget';
-            timelineDirty = true;
-          } else if (sig !== state.sentTimelineSig) {
-            const body = { sessionId: session_id, ...timeline };
-            // The outbox entry goes to disk BEFORE the POST (lib/timeline-outbox.mjs, plan E11).
-            // "Retried at the next turn-end" is no retry at all for a Cursor CLI session, which gets
-            // one sessionEnd at most, so a failed or killed POST must leave the body where ANY later
-            // hook's flush can deliver it. Written even when the budget skips the POST below: a
-            // sessionEnd that ran out of time is exactly the CLI's one chance.
-            writeTimelineOutbox(session_id, { sig, body, account: accountStamp }, { now });
-            let status = 'no-budget';
-            // Skipped rather than started when the budget is already gone. The signature is only
-            // recorded on a confirmed send, so the entry above stays for the next flush.
-            if (timeLeft() === null || timeLeft() > 0) {
-              const remaining = timeLeft();
-              const outcome = await postSessionTimeline(
-                body,
-                token,
-                { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
-              );
-              status = timelineStatusOf(outcome);
-              if (outcome.reported) {
-                state.sentTimelineSig = sig;
-                dropTimelineOutbox(session_id);
-              }
-              // The flush below drains the outbox too. A 401 is the one failure it should retry
-              // straight away, because it can force a token refresh and this POST cannot; anything
-              // else would just repeat against the same unhappy server inside the same budget.
-              if (!outcome.reported && status !== 401) timelineOutboxSkip = session_id;
-            }
-            // Always recorded, the answer as well as the attempt: the status used to be discarded,
-            // which is why E11 ("attempted, never confirmed") took a simulation to diagnose. A local
-            // key only — nothing spreads session state onto a wire payload.
-            state.timelineLastStatus = status;
-            timelineDirty = true;
-          }
-        }
-      } catch { /* best-effort */ }
+      const reconciled = await reconcileSessionTimeline({
+        sessionId: session_id, dedupedEvents, state, accountStamp,
+        isEnrichmentComplete: () => enrichmentComplete, cliDeps, onSubagentDiagnostics, token, fetchImpl,
+        now, timeLeft, allowBreakState: CAPABILITIES.breakState,
+      });
+      timelineDirty = reconciled.timelineDirty;
+      if (reconciled.timelineOutboxSkip !== null) timelineOutboxSkip = reconciled.timelineOutboxSkip;
     }
     // The timeline signature is the only thing below the commit that wants persisting, so it pays
     // for its own write rather than holding the commit open across a network call.

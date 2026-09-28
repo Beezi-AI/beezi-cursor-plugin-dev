@@ -12,11 +12,11 @@
 //
 // THE CONTRACT
 //
-//   write    lib/checkpoint.mjs writes `timelines/<safeName(id)>.json` BEFORE the POST, whenever the
-//            derived signature differs from the last one confirmed. Overwritten, never appended:
-//            the server upserts the timeline by sessionId, so the newest body is the only one worth
-//            delivering. Atomic (temp + rename, via writeJsonSecure), so a hook killed mid-write
-//            leaves the previous entry or the new one, never half of either.
+//   write    lib/checkpoint-timeline.mjs writes `timelines/<safeName(id)>.json` BEFORE the POST,
+//            whenever the derived signature differs from the last one confirmed. Overwritten,
+//            never appended: the server upserts the timeline by sessionId, so the newest body is the
+//            only one worth delivering. Atomic (temp + rename, via writeJsonSecure), so a hook killed
+//            mid-write leaves the previous entry or the new one, never half of either.
 //   confirm  a 2xx at the POST site deletes it.
 //   drain    every flushQueue (every hook, and session start) sends up to OUTBOX_DRAIN_MAX of what
 //            is left, oldest first, inside the same tracking gate, account fence and deadline as the
@@ -165,9 +165,9 @@ function readEntry(filePath) {
   return entry;
 }
 
-// Strict equality with null normalised, exactly as checkpoint's `classifyPendingBatch` compares a
-// pending batch's account: an entry stamped before any login recorded an email carries `null`, and
-// it is this machine's own only while that is still true.
+// Strict equality with null normalised, exactly as lib/checkpoint-batch.mjs's `classifyPendingBatch`
+// compares a pending batch's account: an entry stamped before any login recorded an email carries
+// `null`, and it is this machine's own only while that is still true.
 function sameAccountKey(a, b) {
   return (a == null ? null : a) === (b == null ? null : b);
 }
@@ -415,7 +415,8 @@ export async function drainTimelineOutbox({
       }
       // 401 after the refresh, 403, 5xx, network, timeout: the moment, not the body. Kept, and the
       // state is NOT rewritten: this branch repeats on every hook for as long as the server is down,
-      // and the checkpoint's own POST site already recorded that session's last answer.
+      // and the checkpoint's own POST site (lib/checkpoint-timeline.mjs) already recorded that
+      // session's last answer.
       return KEPT;
     };
 
