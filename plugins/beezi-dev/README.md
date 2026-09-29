@@ -314,7 +314,7 @@ eleven fails silently on whichever one it dropped.
 | `stop` | `stop.mjs` | checkpoint + session timeline | staff-confirmed |
 | `sessionEnd` | `report.mjs` | final checkpoint | staff-confirmed |
 | `afterFileEdit` | `file-edit.mjs` | `edit` lines only — the sole source of `code_changes` without `ai-code-tracking.db` | staff-confirmed |
-| `postToolUseFailure` | `stop-failure.mjs` | session-error report, free text redacted at the transport | unconfirmed |
+| `postToolUseFailure` | `stop-failure.mjs` | session-error report with a precise code (`tool_timeout`, `tool_permission_denied`, `mcp_error`, `tool_error`); interrupts and file/search errors are recorded, not reported | unconfirmed |
 | `beforeMCPExecution` | `mcp-before.mjs` | **permission hook.** one non-countable `mcp_server` identity line | unconfirmed |
 | `subagentStart` | `subagent-start.mjs` | **permission hook.** opens a subagent span | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
 | `subagentStop` | `subagent-stop.mjs` | closes one — carries no `subagent_id`, so the pairing is a read-time heuristic | **no** on 2026.09.18; recovered from `~/.cursor/chats` |
@@ -483,7 +483,7 @@ The event sidecar is the source of truth:
 | `shell` | `command` | `afterShellExecution` | yes, as a shell operation |
 | `mcp_server` | `url` / `command`, via `lib/mcp-identity.mjs` | `beforeMCPExecution` | **no** — identity side channel |
 | `subagent_start` / `subagent_stop` | `hook_event_name`, then `subagent_id` / `subagent_type` | `subagentStart` / `subagentStop` | **no** — timeline spans only |
-| `stop` / `session_end` | nothing — written as bare markers | `stop.mjs` / `report.mjs` | `stop` ends a turn for the timeline and anchors billing; `session_end` is neither |
+| `stop` / `session_end` | `stop`: the payload's `status` (allowlisted) and `loop_count`, via `lib/turn-outcome-cursor.mjs`; `session_end`: nothing | `stop.mjs` / `report.mjs` | `stop` ends a turn for the timeline and anchors billing; `session_end` is neither |
 | `prompt` | `generation_id` only, as `eid` — never the prompt text | `beforeSubmitPrompt` | **no** — a timing anchor, like `stop`; the turn's start for the timeline |
 
 `eventsFromHookPayload` is **field-driven, not event-driven**: it reads whatever keys a payload
@@ -872,7 +872,7 @@ turn into "Hook blocked" on every prompt ([details](../../docs/host-boundaries.m
 3. a shell command, then `git commit` — `afterShellExecution`, and a checkpoint boundary;
 4. one small file edit and one large one (a whole-file rewrite of something generated) —
    `afterFileEdit`, and whether `edits[]` really carries `old_string`/`new_string`;
-5. a command that fails — `postToolUseFailure`, and what `error` / `tool_output` actually hold;
+5. a command that fails, one that times out, one you interrupt and one you deny — `postToolUseFailure`: whether `error_message`, `failure_type`, `duration` and `is_interrupt` arrive as documented, and what `tool_name` an MCP tool carries; then press Stop mid-turn — the `stop` payload's `status`, and the transcript's `turn_ended` line;
 6. an MCP call to a **stdio** server, then one to a **remote** server — `beforeMCPExecution` with
    `command` and with `url`, which are the two shapes `lib/mcp-identity.mjs` is written against;
 7. one foreground subagent;
@@ -894,6 +894,9 @@ turn into "Hook blocked" on every prompt ([details](../../docs/host-boundaries.m
   `parent_conversation_id` are present, absent, or present-and-wrong.
 - Whether the `--via` values are what the two registries were meant to pass. Capture records the flag
   verbatim rather than normalizing it, precisely so an unexpected value is visible.
+- Whether the transcript's `turn_ended` line is on disk before `stop` / `sessionEnd` fires (compare
+  the transcript's mtime with the capture's `iso`). If it lands after, a session's last turn error
+  waits for a later checkpoint or the backfill.
 
 Each answer retires one of the `// TODO(P0): unverified` markers.
 
@@ -1089,8 +1092,10 @@ workarounds are still in the code and read as over-engineering without them:
 
 Also since: `safeName` is applied to state and queue paths (a `session_id` from a hook payload is
 untrusted input on a path, and `lib/sidecar.mjs` had always run the identical value through it), and
-outbound error text is redacted at the transport in `lib/session-error-report.mjs` rather than at
-each call site.
+outbound error text is redacted at the transport in `lib/session-error-report.mjs`, so no caller can
+ship free text past it. The classifiers in `lib/session-error-cursor.mjs` redact their own text too,
+because they must mask before they cut; the transport's pass is idempotent, so running both changes
+nothing.
 
 ## Notes
 

@@ -337,10 +337,11 @@ export function shouldFinalize(result, options = {}) {
 
 // Backfill every past session on this machine into Beezi via the chunked backfill route, then
 // seal the one-time pull. Timelines ride IN the chunk payload (the tracking-gated standalone
-// timeline route is unreachable for audit tenants); only rate-limit error reports remain a
+// timeline route is unreachable for audit tenants); only session error reports remain a
 // live-only follow-up — and only for sessions the server judged accepted, so a failed session
-// stays fully retryable. (Cursor's delta emits no rate-limit events today; the phase is inert
-// but kept so a delta that learns to emit one needs no change here.)
+// stays fully retryable. What that phase carries is the turn errors read from Cursor's agent
+// transcript (every turn-error code: rate_limit, user_aborted, agent_stalled, turn_error), minus
+// the ones the live hooks already sent — see the turn-error scan in lib/checkpoint.mjs.
 export async function runAudit(deps = {}, options = {}) {
   // FIRST statement, before any binding is resolved. Sync and the one-time import share a command
   // vocabulary and almost nothing else, and the split is what makes "sync never seals" structural:
@@ -588,8 +589,9 @@ export async function runAudit(deps = {}, options = {}) {
     return result;
   }
 
-  // Rate-limit error follow-ups hit a tracking-gated route: a dark-mode tenant would take one
-  // 403 per session. Timelines are exempt — they ride inside the backfill chunks themselves.
+  // Session error follow-ups (the transcript's turn errors) hit a tracking-gated route: a
+  // dark-mode tenant would take one 403 per session. Timelines are exempt — they ride inside the
+  // backfill chunks themselves.
   const followupsAllowed = !trackingValid || isLiveTrackingAllowed(tracking);
   result.followupsAllowed = followupsAllowed;
 
@@ -667,7 +669,7 @@ export async function runAudit(deps = {}, options = {}) {
         followups.delete(sessionId);
         if (!followup) return;
         // Fire-and-observe-nothing on purpose: postSessionError never rejects, and the summary
-        // has nothing to say about a rate-limit follow-up that landed — so counting them was a
+        // has nothing to say about a session error follow-up that landed — so counting them was a
         // number written and never read.
         for (const errorPayload of followup.sessionErrors) {
           // The audit's own budget, not postJson's 3s hook default (CONTRACTS ss8: postSessionError

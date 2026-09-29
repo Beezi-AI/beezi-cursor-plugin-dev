@@ -20,6 +20,7 @@ import { lazyRecordIssue } from './diagnostics-sink.mjs';
 import { sessionLockPath, withLock } from './lock.mjs';
 import { deliverQueue } from './queue-delivery.mjs';
 import { postSessionError } from './session-error-report.mjs';
+import { scanTurnErrors } from './transcript-turns-cursor.mjs';
 import { drainTimelineOutbox, takeAuthSnapshot } from './timeline-outbox.mjs';
 import { reconcileSessionTimeline } from './checkpoint-timeline.mjs';
 import { withCliSubagents } from './cli-subagents-cursor.mjs';
@@ -82,6 +83,33 @@ function saveState(id, state) {
   // cannot drift into writing somewhere `loadState` would not read back.
   if (file === null) return;
   writeJsonSecure(file, state);
+}
+
+// The state file AS IT IS ON DISK, for a write that must not stand on a guessed read.
+//
+// `loadState` answers "a brand-new session" for ANY failure — a missing file, but also a parse
+// error, EPERM, or an EBUSY from an antivirus or indexer holding the file. That is the right reading
+// for a run that is about to compute a delta; it is the wrong base for a write whose only job is one
+// extra key, because saving the default back rewinds the cursor to 0 and drops `usageSnapshot`, and
+// the next run re-reports — and re-bills — the whole sidecar. So three answers, not two:
+//   { exists: false }             no file at all (ENOENT): a new session, or one prune removed
+//   { exists: true, state }       read and parsed to a plain object
+//   null                          present but unreadable, or not an object — write nothing over it
+function readStateOnDisk(id) {
+  const file = stateFile(id);
+  if (file === null) return null;
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf-8');
+  } catch (error) {
+    return error != null && error.code === 'ENOENT' ? { exists: false, state: null } : null;
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  // A literal `null`, an array or a number parses cleanly and is still not a state object.
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? { exists: true, state: parsed }
+    : null;
 }
 
 // The one place a queued report's filename is derived, so the writer, the pre-existence check and
@@ -372,6 +400,9 @@ function subagentModelsFrom(entries) {
 // of those matter more than line counts that the next turn-end can fold instead. Below this the row
 // goes out as it always did, carrying the last fold already sent if there is one.
 const FOLD_MIN_BUDGET_MS = 1000;
+// The per-request bound for a turn-error POST: postJson's own hook default, capped further by what is
+// left of the deadline. These go out before the queue flush, so each one is budget the flush loses.
+const TURN_ERROR_POST_MS = 3000;
 
 // Which of the Cursor account's two money streams paid for this segment. Coarser than the per-entry
 // `billing_pool` by construction — one segment can be part seat and part credits, and only the
@@ -556,13 +587,15 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const auditMode = options.mode === CheckpointMode.AUDIT;
   const freshState = auditMode;
   const skipFlush = auditMode;
-  const collectSessionErrors = auditMode;
   // The two halves of what `emitTimeline` used to mean, so the audit can take one without the
   // other. See the options comment above for why that is not an optimisation but the fix for a
   // whole class of missing reports.
   const parseWholeHistory = auditMode || options.emitTimeline === true;
   const postTimeline = !auditMode && options.emitTimeline === true;
   const collectedErrors = [];
+  // Turn errors found INSIDE the lock and posted OUTSIDE it. See the scan in guardedPass and the POST
+  // after withLock returns.
+  const turnErrorPosts = [];
   // The one reason a candidate session can produce no report that is worth reporting: the sidecar
   // could not be parsed. Everything else that yields nothing IS "no usage" — a window with no new
   // lines, or one whose lines carry no billable activity — and the backfill says so.
@@ -837,6 +870,89 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
     const state = freshState
       ? { cursor: options.startCursor == null ? 0 : options.startCursor, sentSessionName: null, anchor: null }
       : loadState(session_id);
+    // ── turn errors, read from Cursor's own agent transcript
+    //
+    // Why a turn ended badly — the usage limit, an abort, a stalled resume — is written in ONE place:
+    // the `turn_ended` line of agent-transcripts/<id>/<id>.jsonl (lib/transcript-turns-cursor.mjs).
+    // No payload carries the text, and the IDE's usage-limit case fires `sessionEnd` with no `stop`,
+    // so every turn-end run reads it: stop, sessionEnd, the pulse and the backfill (the runs that
+    // parse whole history). A git-commit or beezi-track checkpoint does not.
+    //
+    // HERE — inside the lock, straight after the state is read — for three reasons:
+    //   - `stop` and `sessionEnd` land together as separate processes, and the anchor (`turnEndsSeen`,
+    //     how many turn_ended lines have been read) is a read-modify-write like the cursor. Unlocked,
+    //     both read the same count and both report the same abort.
+    //   - ABOVE the pending-batch recovery and the delta: a RESUME returns early and a throwing delta
+    //     returns null, and a usage-limit sessionEnd is exactly the run that often has no work at all.
+    //   - Saved by its OWN write, not through `next`: `next` commits only with a queued segment, and a
+    //     turn error has nothing to do with whether this window billed anything.
+    //
+    // AT MOST ONCE. The count is saved before anything is posted; a failed save posts nothing and
+    // leaves the in-memory count as it was, so the next run sees the same lines again. Posting first
+    // would let a hook killed between the POST and the save report the same turn on every later hook.
+    //
+    // ONE KEY, OVER WHAT IS ON DISK. The live save does not write `state` back: `loadState` returns
+    // its fresh default for an unreadable file as readily as for a missing one, and saving that
+    // default would rewind the cursor and the usage baseline — here, before the delta, on runs that
+    // go on to give up. `readStateOnDisk` tells the two apart: a missing file gets the default plus
+    // the count (a new session), a readable one gets only `turnEndsSeen` set, and an unreadable one
+    // is not scanned at all — nothing saved, nothing posted, and the next run tries again. The count
+    // the scan starts from is the one on disk, so the comparison and the write agree on one source.
+    //
+    // FIRST SIGHT. With no saved count, a live run reports only the newest turn. A session this
+    // build tracked from its start already saved one (even 0) on its first turn-end scan, so a
+    // missing count means this machine has not read the transcript before — and that is NOT proof
+    // the session is new: prune deletes state/<id>.json after 14 days while Cursor keeps the
+    // transcript, a conversation can predate the install or this build, and the backfill never
+    // writes state. Posting that whole history now would stamp months of old aborts with today's
+    // read (the hook fires on new activity, so the transcript's mtime is a new minute and each one
+    // lands as a new server row). Neither the absent file nor a cursor of 0 can tell those apart from
+    // a new session, so none is trusted. The accepted cost: a new session whose first turn-end scan
+    // already sees two or more turn_ended lines reports only the newest.
+    //
+    // THE BACKFILL writes nothing back, so it BORROWS the live count — read-only, and only from a
+    // state stamped with the account this run reports under, the rule `workSource` below applies to
+    // the subagent fold. Lines the live hooks already sent are skipped; the rest are buffered with the
+    // other session errors, and the audit posts them only for sessions the server accepted.
+    if (parseWholeHistory) {
+      let seen;
+      // The live run's base for the key-only save below; null (unreadable) skips the scan outright.
+      let onDisk = null;
+      if (freshState) {
+        let live = null;
+        try { live = loadState(session_id); } catch { live = null; }
+        seen = live != null && live.account != null && accountStamp != null && live.account === accountStamp
+          ? live.turnEndsSeen
+          : undefined;
+      } else {
+        onDisk = readStateOnDisk(session_id);
+        seen = onDisk !== null && onDisk.exists ? onDisk.state.turnEndsSeen : undefined;
+      }
+      let scan = null;
+      if (freshState || onDisk !== null) {
+        try {
+          scan = scanTurnErrors(session_id, {
+            transcriptPath: input.transcript_path,
+            ...(typeof deps.projectsDir === 'string' ? { projectsDir: deps.projectsDir } : {}),
+            seen,
+            priorHistory: !freshState,
+            now,
+          });
+        } catch { scan = null; }
+      }
+      if (scan !== null && freshState) {
+        for (const errorPayload of scan.payloads) collectedErrors.push(errorPayload);
+      } else if (scan !== null && scan.seen !== seen) {
+        const base = onDisk.exists ? onDisk.state : { cursor: 0, sentSessionName: null, anchor: null };
+        let saved = true;
+        try { saveState(session_id, { ...base, turnEndsSeen: scan.seen }); } catch { saved = false; }
+        if (saved) {
+          // Mirrored into memory only once it is on disk, so a later save in this run carries it.
+          state.turnEndsSeen = scan.seen;
+          for (const errorPayload of scan.payloads) turnErrorPosts.push(errorPayload);
+        }
+      }
+    }
     // When the conversation record is unreadable (name resolves to null), keep the last name we sent
     // rather than overwriting the stored name with null. Re-redacted on the way back out: a state
     // file written before credential redaction shipped may still hold the OLD, unmasked name, and
@@ -1837,32 +1953,13 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 
     // ── best-effort network, deliberately BELOW the commit
     //
-    // Both of the calls below can spend the rest of the hook's budget, and a host that kills a hook
+    // The timeline POST below can spend the rest of the hook's budget, and a host that kills a hook
     // at its registered timeout kills it mid-POST. Above the commit that would throw away a window
     // this run had already fully derived; below it, the queue file and the cursor are durable before
     // a single packet leaves, and a killed hook loses only the POST. The cost is one extra state
     // write on the turn-ends where the timeline signature changes — the cheaper side of the trade,
     // because losing the signature costs one duplicate upsert and the server upserts.
-    // postSessionError swallows its own failures (never rejects), so a limit-report problem can't
-    // break the checkpoint. Cursor exposes no rate-limit signal locally today; the loop stays so a
-    // delta that learns to emit one needs no change here.
-    for (const event of delta.rateLimitEvents == null ? [] : delta.rateLimitEvents) {
-      const errorPayload = {
-        sessionId: session_id,
-        error: 'rate_limit',
-        errorDetails: null,
-        lastAssistantMessage: event.text,
-        occurredAt: event.occurredAt == null ? new Date().toISOString() : event.occurredAt,
-      };
-      // The backfill buffers these instead: one awaited POST per event across hundreds of
-      // sessions is minutes of dead time, and follow-ups only make sense for sessions the server
-      // accepted.
-      if (collectSessionErrors) {
-        collectedErrors.push(errorPayload);
-        continue;
-      }
-      await postSessionError(errorPayload, token, { fetchImpl });
-    }
+
     // Deliberately NOT reached in audit mode, which shares the parse above but ships its timelines
     // in its own chunk payloads: posting here as well would send each one twice, on a route that
     // is tracking-gated and therefore 403s for audit-only tenants anyway.
@@ -1898,6 +1995,22 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const guarded = options.lockHeld === true
     ? await guardedPass()
     : await withLock(sessionLockPath(session_id), guardedPass, { now, miss: CONTENDED });
+
+  // Turn errors, posted now the lock is released — for the same reason flushQueue is out here: a POST
+  // against a stalled API must not hold every other hook for this session behind it. BEFORE the
+  // `guarded === null` return, because a throwing delta is no reason to drop an error the scan
+  // already committed to. Their anchor is on disk, so a POST that fails or is cut off by the deadline
+  // is not retried: by the next hook the transcript has usually grown, its mtime has moved, and a
+  // re-sent report would land in a new minute as a second row instead of an upsert of the first.
+  // postSessionError never rejects.
+  for (const errorPayload of turnErrorPosts) {
+    const left = timeLeft();
+    if (left !== null && left <= 0) break;
+    await postSessionError(errorPayload, token, {
+      fetchImpl,
+      ...(left === null ? {} : { timeoutMs: Math.min(left, TURN_ERROR_POST_MS) }),
+    });
+  }
 
   if (guarded === null) return emptyResult();
   const enqueuedCount = guarded === CONTENDED ? 0 : guarded.enqueued;

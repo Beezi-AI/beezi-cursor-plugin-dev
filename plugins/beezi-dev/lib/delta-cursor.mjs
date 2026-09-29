@@ -1480,10 +1480,6 @@ export function computeDelta(conversationId, fromLine, resolvers = {}) {
     repoRoot,
     branch,
     entries,
-    // Cursor exposes no local rate-limit signal today. The key exists so the host's report loop has
-    // something to iterate without a shape check, and so a delta that learns to emit one needs no
-    // change on the consuming side.
-    rateLimitEvents: [],
     operations,
     est_tokens,
     code_changes,

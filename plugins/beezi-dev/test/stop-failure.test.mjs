@@ -11,8 +11,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 //
 // `scripts/stop-failure.mjs` is a script, not a module — its whole body is the wiring under test —
 // so it is run exactly the way Cursor runs it: own process, payload on stdin. The alternative is
-// re-implementing `payload.error ?? payload.tool_output ?? payload.output` in the test and asserting
-// against the copy, which would keep passing after the real script stopped redacting.
+// re-implementing `classifyToolFailure` (lib/session-error-cursor.mjs) in the test and asserting
+// against the copy, which would keep passing after the real classifier changed — what text it picks
+// (`error_message` first, the legacy field names as fallbacks) and which failures it skips (an
+// interrupt, an ordinary error on a file or search tool).
 //
 // lib/redact.mjs's own rules are NOT retested here; test/redact.test.mjs owns that, negative table
 // included. These tests are about the wire: the body the API would have received.
@@ -150,7 +152,9 @@ const payloadWith = (fields) => ({ session_id: 'conv-fail', hook_event_name: 'po
 test('the credential a failed command echoed does not reach the API', async (t) => {
   const run = await harness(t);
   const body = await run(payloadWith({
-    tool_output: [
+    tool_name: 'Shell',
+    failure_type: 'error',
+    error_message: [
       '$ curl -sS -X POST https://api.example.dev/v1/report \\',
       '    -H "Authorization: Bearer sk-live-4f8a2b9c1d3e5f7a0b2c" \\',
       '    -H "Content-Type: application/json"',
@@ -160,7 +164,7 @@ test('the credential a failed command echoed does not reach the API', async (t) 
   }));
 
   assert.ok(body, 'the hook sent no session-error report');
-  assert.equal(body.error, 'tool_failure');
+  assert.equal(body.error, 'tool_error');
   assert.equal(body.sessionId, 'conv-fail');
   assert.ok(!body.errorDetails.includes('sk-live-4f8a2b9c1d3e5f7a0b2c'), body.errorDetails);
   assert.ok(body.errorDetails.includes('[REDACTED]'), body.errorDetails);
@@ -172,9 +176,10 @@ test('the credential a failed command echoed does not reach the API', async (t) 
 
 test('a token in a push URL and a connection string are scrubbed from `error` too', async (t) => {
   const run = await harness(t);
-  // `payload.error` is the first of the three fields the hook reads, so it needs its own coverage:
-  // a hook that redacted only `tool_output` would pass the test above and still ship this.
+  // `error` is the legacy field the classifier still reads after `error_message`, so it keeps its
+  // own coverage.
   const body = await run(payloadWith({
+    tool_name: 'Shell',
     error: [
       "fatal: Authentication failed for 'https://dev:ghp_16C7e42F292c6912E7710c838347Ae178B4a@github.com/acme/app.git'",
       'psql: could not connect to postgres://appuser:hunter2SuperSecret@db.internal:5432/prod',
@@ -188,7 +193,7 @@ test('a token in a push URL and a connection string are scrubbed from `error` to
   assert.ok(body.errorDetails.includes('postgres://appuser:[REDACTED]@db.internal:5432/prod'));
 });
 
-test('an ordinary tool failure reaches the API byte for byte', async (t) => {
+test('an ordinary tool failure reaches the API byte for byte, behind its prefix', async (t) => {
   const run = await harness(t);
   // The failure this whole design is guarded against: a redactor that eats diagnostics leaves the
   // report arriving, well-formed and useless, with nobody in a position to notice.
@@ -205,30 +210,98 @@ test('an ordinary tool failure reaches the API byte for byte', async (t) => {
     'listen EADDRINUSE: address already in use :::3000 after 1500ms',
   ].join('\n');
 
-  const body = await run(payloadWith({ output }));
-  assert.equal(body.errorDetails, output);
+  const body = await run(payloadWith({ tool_name: 'Shell', failure_type: 'error', error_message: output }));
+  assert.equal(body.errorDetails, `Shell · error: ${output}`);
 });
 
 test('errorDetails is redacted before it is cut to the length the server accepts', async (t) => {
   const run = await harness(t);
   // The secret straddles the 1000-character field cap. Cutting first would strand `ghp_0123456789…`
   // past the boundary with its prefix still attached and no rule left able to match it; redacting
-  // first sees the whole value. The 2000-char slice in the script and the 1000-char cap in
-  // lib/session-error-report.mjs are two cuts, and BOTH have to come after the scrub.
+  // first sees the whole value. lib/session-error-cursor.mjs windows the message to 20000 characters
+  // BEFORE it reaches the redactor — that only bounds the cost of a megabyte log, not the wire length
+  // — then redacts and only then cuts to the 1000-character cap the server accepts. The transport's
+  // own 1000-character cap in lib/session-error-report.mjs repeats that same cut, idempotently, on
+  // text that is already redacted. Both real cuts land after the scrub.
   const secret = 'ghp_0123456789abcdefghijklmnopqrstuvwxyzAB';
-  const body = await run(payloadWith({ tool_output: `${'.'.repeat(990)}${secret} and the rest of a very long log` }));
+  // `Shell · error: ` is now a 15-char prefix ahead of the message, so the padding shrinks by that
+  // much (990 -> 970) to keep the secret straddling the same 1000-character field cap.
+  const body = await run(payloadWith({
+    tool_name: 'Shell',
+    failure_type: 'error',
+    error_message: `${'.'.repeat(970)}${secret} and the rest of a very long log`,
+  }));
 
   assert.ok(body.errorDetails.length <= 1000, `errorDetails was ${body.errorDetails.length} chars`);
   assert.ok(!body.errorDetails.includes('ghp_0123456789'), body.errorDetails.slice(-120));
   assert.ok(body.errorDetails.includes('[REDACTED]'));
 });
 
-test('a failure payload carrying no text reports the failure and no details', async (t) => {
+test('a documented shell timeout is reported with its own code and a readable line', async (t) => {
   const run = await harness(t);
-  const body = await run(payloadWith({ tool_name: 'read_file' }));
-  assert.equal(body.error, 'tool_failure');
-  assert.equal(body.errorDetails, null);
+  const secret = 'sk-live-4f8a2b9c1d3e5f7a0b2c';
+  const body = await run(payloadWith({
+    tool_name: 'Shell',
+    tool_use_id: 'toolu_01',
+    // The command line is exactly where a pasted secret sits, and nothing may read it.
+    tool_input: { command: `curl -H "Authorization: Bearer ${secret}" https://api.example.dev` },
+    error_message: 'Command timed out after 30 seconds',
+    failure_type: 'timeout',
+    duration: 30000,
+    is_interrupt: false,
+  }));
+  assert.ok(body, 'the hook sent no session-error report');
+  assert.equal(body.error, 'tool_timeout');
+  assert.equal(body.errorDetails, 'Shell · timeout · 30.0s: Command timed out after 30 seconds');
   assert.equal(body.lastAssistantMessage, null);
+  assert.ok(!JSON.stringify(body).includes(secret), 'tool_input reached the wire');
+  assert.ok(!JSON.stringify(body).includes('curl'), 'tool_input reached the wire');
+});
+
+test('an ordinary error on a file tool is noise: nothing is sent and no credential is read', async (t) => {
+  const run = await harness(t);
+  const body = await run(payloadWith({ tool_name: 'Read', failure_type: 'error', error_message: 'ENOENT: no such file' }));
+  assert.equal(body, null);
+  assert.equal(run.tokenWasRead(), false, 'a skipped failure must not cost a keychain read');
+});
+
+test('an interrupted tool call is recorded locally and not reported', async (t) => {
+  const run = await harness(t);
+  const body = await run(payloadWith({ tool_name: 'Shell', failure_type: 'error', error_message: 'Interrupted', is_interrupt: true }));
+  assert.equal(body, null);
+  assert.equal(run.tokenWasRead(), false);
+  // Still a failed call in the segment: skipping the report is not skipping the collection.
+  const line = JSON.parse(fs.readFileSync(path.join(run.home, 'events', 'conv-fail.jsonl'), 'utf-8').trim());
+  assert.equal(line.ev, 'tool');
+  assert.equal(line.failed, true);
+});
+
+test('a failure with no text still says what failed', async (t) => {
+  const run = await harness(t);
+  const body = await run(payloadWith({ tool_name: 'Shell', failure_type: 'error' }));
+  assert.equal(body.error, 'tool_error');
+  assert.equal(body.errorDetails, 'Shell failed (error)');
+  assert.equal(body.lastAssistantMessage, null);
+});
+
+const FIXTURES = fileURLToPath(new URL('./fixtures/hook-payloads/', import.meta.url));
+
+test('every documented or captured failure payload that is reported carries non-empty details', async (t) => {
+  // The fixtures are real hook stdin (Task B0 captures) plus the documented shape. A captured file
+  // error is legitimately skipped; what may never happen is a report whose details are empty.
+  const files = fs.readdirSync(FIXTURES).filter((name) => /^post-tool-use-failure\..+\.json$/.test(name));
+  assert.ok(files.length > 0, 'no postToolUseFailure fixture: the documented one is committed with the capture task');
+  let reported = 0;
+  for (const file of files) {
+    const run = await harness(t);
+    const body = await run(JSON.parse(fs.readFileSync(path.join(FIXTURES, file), 'utf-8')));
+    if (body === null) continue;
+    reported += 1;
+    assert.equal(typeof body.errorDetails, 'string', file);
+    assert.ok(body.errorDetails.length > 0, `${file}: empty errorDetails`);
+    assert.notEqual(body.error, 'tool_failure', file);
+  }
+  assert.ok(reported > 0, 'not one fixture produced a report, so this test proved nothing');
 });
 
 test('a payload with no session id sends nothing at all', async (t) => {
@@ -275,9 +348,9 @@ for (const mode of ['disabled', 'backfill_only']) {
 test('live tracking on: the report goes out exactly as before', async (t) => {
   const run = await harness(t);
   trackingState(run.home, 'live');
-  const body = await run(payloadWith({ error: 'boom' }));
+  const body = await run(payloadWith({ tool_name: 'Shell', error_message: 'boom' }));
   assert.ok(body);
-  assert.equal(body.error, 'tool_failure');
+  assert.equal(body.error, 'tool_error');
   assert.equal(run.tokenWasRead(), true);
 });
 
@@ -316,7 +389,7 @@ test('the report carries the moment the failure happened, as an ISO instant', as
   const at = Date.parse(payload.occurredAt);
   assert.ok(Number.isFinite(at), payload.occurredAt);
   assert.ok(at >= before - 1000 && at <= Date.now() + 1000, 'the stamp is this run, not send time');
-  assert.equal(payload.error, 'tool_failure', 'still a tool failure, not a guessed rate-limit error');
+  assert.equal(payload.error, 'tool_error', 'a precise tool code, not a guessed rate-limit error');
   assert.equal(payload.lastAssistantMessage, null);
 });
 

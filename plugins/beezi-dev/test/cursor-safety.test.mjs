@@ -49,7 +49,6 @@ function delta(overrides = {}) {
     repoRoot: '/repo',
     branch: 'feature/task-42',
     entries: [{ model: 'm', billing_pool: 'subscription', requests: 1, cost_usd: 0 }],
-    rateLimitEvents: [],
     operations: {},
     est_tokens: 0,
     code_changes: { files_changed: 0, lines_added: 0, lines_removed: 0, by_extension: {} },

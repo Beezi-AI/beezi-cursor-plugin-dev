@@ -362,7 +362,9 @@ test('a reader that throws yields an empty segment rather than breaking the hook
   });
   assert.equal(delta.segmentId, `${CONV}:0-0`);
   assert.deepEqual(delta.entries, []);
-  assert.deepEqual(delta.rateLimitEvents, []);
+  // Turn errors are read from Cursor's transcript by the checkpoint now; the delta no longer
+  // carries an always-empty stand-in for them.
+  assert.equal('rateLimitEvents' in delta, false);
 });
 
 // ---------------------------------------------------------------------------

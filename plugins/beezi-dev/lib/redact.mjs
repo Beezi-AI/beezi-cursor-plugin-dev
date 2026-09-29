@@ -1,12 +1,14 @@
 // Strip credentials out of free-text error output before it leaves the machine.
 //
-// scripts/stop-failure.mjs takes `payload.error ?? payload.tool_output ?? payload.output`, truncates
-// it to 2000 characters and POSTs it verbatim as `errorDetails`. That text is the output of a
-// command that JUST FAILED, which is precisely where credentials surface: the `curl` that 401'd is
-// echoed with its `-H "Authorization: Bearer …"` intact, a failing `psql` prints the connection
-// string it tried, a shell that could not find a binary dumps the environment, and a driver error
-// quotes the DSN it parsed. None of that is hypothetical — it is the normal content of a failed
-// tool call.
+// lib/session-error-cursor.mjs is the caller that matters here: `classifyToolFailure` picks a failed
+// tool call's own message (`error_message` first, legacy field names as fallbacks), and
+// `classifyTurnError` picks the text Cursor's own agent transcript wrote for a turn that ended badly
+// — both hand that text to `redactDetail` below, before it becomes `errorDetails`. That text is the
+// output of a command that JUST FAILED, which is precisely where credentials surface: the `curl`
+// that 401'd is echoed with its `-H "Authorization: Bearer …"` intact, a failing `psql` prints the
+// connection string it tried, a shell that could not find a binary dumps the environment, and a
+// driver error quotes the DSN it parsed. None of that is hypothetical — it is the normal content of
+// a failed tool call.
 //
 // ┌─ THE OTHER HALF OF THE JOB, AND THE EASIER ONE TO GET WRONG ─────────────────────────────────┐
 // │ A redactor that eats diagnostics is WORSE than no redactor, because the error report still    │
@@ -24,8 +26,10 @@
 
 const MASK = '[REDACTED]';
 
-// What stop-failure.mjs already keeps. Exported so the truncation length lives next to the
-// redaction that has to happen before it.
+// The default cap `redactDetail` falls back to when a caller passes none, and the base
+// `WORK_WINDOW_CHARS` below is scaled from. No caller relies on the default today — each one passes
+// its own cap (lib/session-error-cursor.mjs passes `ERROR_DETAILS_CAP`, 1000, for `errorDetails`) —
+// so this is what a new caller gets for free until it decides it needs a different number.
 export const MAX_DETAIL_CHARS = 2000;
 
 // A key name we treat as secret-bearing. The optional lazy prefix/suffix is what makes one word
@@ -137,17 +141,19 @@ export function redact(text) {
   return out;
 }
 
-// The stop-failure call site in one function: non-strings become null, the text is redacted, and
-// ONLY THEN truncated.
+// `redactDetail` in one function: non-strings become null, the text is redacted, and ONLY THEN
+// truncated.
 //
 // The order is not cosmetic. Truncating first can slice a credential in half and leave the surviving
 // half in the report with its anchor gone — a `Bearer` cut from its token, a key name cut from its
 // `=`. Redacting first cannot: every rule sees the whole value it is matching.
 //
-// The working window bounds the cost of that choice. `tool_output` from a failed command can be
-// megabytes (a test runner's full log), and a hook has 7500ms for everything it does; the caller
-// keeps 2000 characters, so a window 20x larger than the keep runs the rules over everything that
-// could possibly survive plus a wide margin, and stops.
+// The working window bounds the cost of that choice. A failed command's output can be megabytes (a
+// test runner's full log), and a hook has 7500ms for everything it does; the default cap is 2000
+// characters, so a window 20x larger than that runs the rules over everything that could possibly
+// survive any caller's cap, plus a wide margin, and stops. lib/session-error-cursor.mjs additionally
+// windows its own input to 20000 characters before it ever reaches here, for the same reason with a
+// tighter number.
 const WORK_WINDOW_CHARS = 20 * MAX_DETAIL_CHARS;
 
 export function redactDetail(value, maxChars = MAX_DETAIL_CHARS) {

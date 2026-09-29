@@ -95,6 +95,31 @@ test('a failed tool call is marked, so postToolUseFailure is distinguishable', (
   assert.equal(ok.failed, undefined);
 });
 
+test('a documented postToolUseFailure payload is marked failed, whatever its failure kind', () => {
+  // Cursor's documented shape: error_message / failure_type / duration / is_interrupt. The old flag
+  // read `status`, `error` and `success`, none of which this payload has, so every real failure was
+  // written as a successful call.
+  const base = { hook_event_name: 'postToolUseFailure', tool_name: 'Shell', tool_use_id: 't1', duration: 30000 };
+  for (const extra of [
+    { error_message: 'Command timed out', failure_type: 'timeout' },
+    { failure_type: 'error' },
+    { error_message: 'stopped', failure_type: 'error', is_interrupt: true },
+  ]) {
+    const [event] = eventsFromHookPayload({ ...base, ...extra });
+    assert.equal(event.ev, 'tool');
+    assert.equal(event.failed, true, JSON.stringify(extra));
+    assert.equal(event.ms, 30000);
+    assert.equal(event.eid, 't1');
+  }
+});
+
+test('the hook name alone marks a failure; a successful postToolUse never is', () => {
+  const [named] = eventsFromHookPayload({ hook_event_name: 'postToolUseFailure', tool_name: 'Read' });
+  assert.equal(named.failed, true);
+  const [ok] = eventsFromHookPayload({ hook_event_name: 'postToolUse', tool_name: 'Read', tool_output: 'fine', error_message: null });
+  assert.equal(ok.failed, undefined);
+});
+
 test('afterFileEdit edits[] become one edit line per file', () => {
   const events = eventsFromHookPayload(
     {

@@ -7,7 +7,7 @@ import {
   runCheckpoint, createCheckpointCaches, CheckpointMode, extractAuditReports,
 } from '../lib/checkpoint.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-cursor.mjs';
-import { TrackingMode, writeTrackingState } from '../lib/tracking.mjs';
+import { TrackingMode, writeTrackingState, accountKey } from '../lib/tracking.mjs';
 import { sessionLockPath, withLock } from '../lib/lock.mjs';
 import { queueDir, stateDir } from '../lib/paths-cursor.mjs';
 
@@ -48,7 +48,6 @@ function delta(overrides = {}) {
       { model: 'claude-4.5-sonnet', billing_pool: 'credits', requests: 2, cost_usd: 0.34 },
       { model: 'claude-4.5-sonnet', billing_pool: 'subscription', requests: 5, cost_usd: 0 },
     ],
-    rateLimitEvents: [],
     operations: { file: { count: 1, est_tokens: 10 } },
     est_tokens: 10,
     code_changes: { files_changed: 1, lines_added: 12, lines_removed: 3, by_extension: { '.ts': 1 } },
@@ -62,10 +61,13 @@ function delta(overrides = {}) {
 }
 
 // Never flush: the assertions are about what was queued, and a real POST is not this test's job.
+// `projectsDir` keeps the turn-error scan inside the test's own temp home: without it a turn-end
+// checkpoint would list the developer's real ~/.cursor/projects.
 const deps = (over = {}) => ({
   getAccessToken: async () => 'tok',
   gitImpl: fakeGit,
   fetchImpl: async () => { throw new Error('network disabled in test'); },
+  projectsDir: path.join(process.env.BEEZI_CURSOR_HOME == null ? os.tmpdir() : process.env.BEEZI_CURSOR_HOME, 'cursor-projects'),
   ...over,
 });
 
@@ -453,22 +455,238 @@ test('audit mode: leaves no state file behind', async (t) => {
   assert.throws(() => stateOf('conv-1'), 'no state file may be written for an audited session');
 });
 
-test('audit mode: rate-limit reports are buffered instead of posted', async (t) => {
-  tmpHome(t);
+// ── turn errors, from Cursor's agent transcript ────────────────────────────────────────────
+
+const INPUT = Object.freeze({ session_id: 'conv-1', cwd: '/repo' });
+const USAGE_LIMIT = "You've hit your usage limit Get Cursor Pro for more Agent usage, unlimited Tab, and more.";
+const TRANSCRIPT_AT = Date.parse('2026-07-31T10:05:00.000Z');
+
+// conv-1's transcript under the temp home's projects root, stamped TRANSCRIPT_AT.
+function writeTranscript(home, turns) {
+  const dir = path.join(home, 'cursor-projects', 'c-Users-dev-repo', 'agent-transcripts', 'conv-1');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'conv-1.jsonl');
+  const lines = [JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: 'hi' }] } })];
+  for (const turn of turns) lines.push(JSON.stringify({ type: 'turn_ended', ...turn }));
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  fs.utimesSync(file, TRANSCRIPT_AT / 1000, TRANSCRIPT_AT / 1000);
+}
+
+// Records every /sessions/errors body; everything else stays offline, as in `deps()`.
+function errorRecorder() {
+  const bodies = [];
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/sessions/errors')) {
+      bodies.push(JSON.parse(init.body));
+      return { status: 201, ok: true };
+    }
+    throw new Error('network disabled in test');
+  };
+  return { bodies, fetchImpl };
+}
+
+const WORK = () => {
+  const t0 = Date.parse('2026-07-31T10:00:00.000Z');
+  return [
+    { ts: t0, ev: 'gen', model: 'claude-4.5-sonnet', gen_id: 'g1' },
+    { ts: t0 + 1000, ev: 'tool', tool: 'read_file', bytes: 10, ms: 5, eid: 't1' },
+    { ts: t0 + 2000, ev: 'stop' },
+  ];
+};
+
+test('a turn that hit the usage limit is reported as rate_limit, with the host text as details', async (t) => {
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'success' }, { status: 'error', error: USAGE_LIMIT }]);
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+
+  assert.deepEqual(bodies, [{
+    sessionId: 'conv-1',
+    error: 'rate_limit',
+    errorDetails: USAGE_LIMIT,
+    lastAssistantMessage: null,
+    occurredAt: new Date(TRANSCRIPT_AT).toISOString(),
+  }]);
+  assert.equal(stateOf('conv-1').turnEndsSeen, 2);
+});
+
+test('the same turn_ended is posted once, however many turn-end hooks read it', async (t) => {
+  // stop, then sessionEnd: two checkpoints over one unchanged transcript.
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'error', error: 'User aborted request' }]);
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+
+  assert.deepEqual(bodies.map((b) => b.error), ['user_aborted']);
+});
+
+test('a session tracked before this build reports only its latest turn on first sight', async (t) => {
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  fs.mkdirSync(stateDir(), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(), 'conv-1.json'), JSON.stringify({ cursor: 3, sentSessionName: null, anchor: null }));
+  writeTranscript(home, [
+    { status: 'error', error: 'User aborted request' },
+    { status: 'error', error: '[resource_exhausted] Error' },
+  ]);
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+
+  assert.deepEqual(bodies.map((b) => b.error), ['rate_limit']);
+  assert.equal(stateOf('conv-1').turnEndsSeen, 2);
+});
+
+test('a session with no state file reports only its newest turn on first sight', async (t) => {
+  // No state file is not proof of a new session: prune removes state after 14 days while Cursor keeps
+  // the transcript, a conversation can predate the install, and the backfill never writes state. A
+  // session tracked from its start saved a count (even 0) on its first turn-end scan instead.
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [
+    { status: 'error', error: 'User aborted request' },
+    { status: 'error', error: '[resource_exhausted] Error' },
+  ]);
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+
+  assert.deepEqual(bodies.map((b) => b.error), ['rate_limit']);
+  assert.equal(stateOf('conv-1').turnEndsSeen, 2);
+});
+
+test('when the anchor cannot be saved nothing is posted, and the next run posts it', async (t) => {
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'error', error: 'User aborted request' }]);
+  // A directory where the state file belongs: it exists but cannot be read (EISDIR), so the scan
+  // declines to write over it and posts nothing. The failed WRITE itself is the next test.
+  const blocker = path.join(stateDir(), 'conv-1.json');
+  fs.mkdirSync(path.join(blocker, 'inside'), { recursive: true });
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+  assert.deepEqual(bodies, [], 'posted without a saved anchor');
+
+  // The control: the same transcript, once the anchor CAN be saved, is posted. Without this, "nothing
+  // was posted" would pass just as well if the scan had never run.
+  fs.rmSync(blocker, { recursive: true, force: true });
+  await runCheckpoint(INPUT, deps({ fetchImpl }), { emitTimeline: true });
+  assert.deepEqual(bodies.map((b) => b.error), ['user_aborted']);
+});
+
+test('when the anchor save itself fails nothing is posted, and the next run posts it', async (t) => {
+  // The state file is fine; the WRITE is what fails. writeFileAtomic stages through
+  // `.conv-1.json.<pid>.tmp` beside the target, and this test runs in-process, so a non-empty
+  // directory there makes the write throw (and survives the writer's non-recursive cleanup).
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'error', error: 'User aborted request' }]);
+  const blocker = path.join(stateDir(), `.conv-1.json.${process.pid}.tmp`);
+  fs.mkdirSync(path.join(blocker, 'inside'), { recursive: true });
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl, computeDelta: () => null }), { emitTimeline: true });
+  assert.deepEqual(bodies, [], 'posted without a saved anchor');
+
+  fs.rmSync(blocker, { recursive: true, force: true });
+  await runCheckpoint(INPUT, deps({ fetchImpl, computeDelta: () => null }), { emitTimeline: true });
+  assert.deepEqual(bodies.map((b) => b.error), ['user_aborted']);
+});
+
+test('an unreadable state file is never replaced by the turn-error scan, and nothing is posted', async (t) => {
+  // `loadState` reads ANY failure — a parse error, EPERM, EBUSY — as a brand-new session. Saving
+  // that default back to record the anchor would rewind the cursor to 0 and drop the usage baseline,
+  // and the next run would re-report the whole sidecar. The null delta is the point: the scan runs
+  // before the delta, so even a run that gives up must not write.
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'error', error: 'User aborted request' }]);
+  fs.mkdirSync(stateDir(), { recursive: true });
+  const file = path.join(stateDir(), 'conv-1.json');
+  const unparseable = Buffer.from('{"cursor": 41, "usageSnapshot": {"claude-4.5-sonnet": {"amount": 9');
+  fs.writeFileSync(file, unparseable);
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl, computeDelta: () => null }), { emitTimeline: true });
+
+  assert.ok(fs.readFileSync(file).equals(unparseable), `state file rewritten: ${fs.readFileSync(file, 'utf-8')}`);
+  assert.deepEqual(bodies, [], 'posted without a saved anchor');
+});
+
+test('the anchor is saved as one key over the state on disk, and the turn error is posted', async (t) => {
+  // The control for the test above, and the proof the write is key-only: a run that computes no
+  // delta still records the anchor, and every other key on disk survives it untouched.
+  const home = tmpHome(t);
+  writeSidecar(home, WORK());
+  writeTranscript(home, [{ status: 'error', error: 'User aborted request' }]);
+  fs.mkdirSync(stateDir(), { recursive: true });
+  const original = {
+    cursor: 41,
+    sentSessionName: 'fix the build',
+    anchor: null,
+    account: accountKey('me@example.com'),
+    usageSnapshot: { 'claude-4.5-sonnet': { amount: 9, costInCents: 1 } },
+    turnEndsSeen: 0,
+  };
+  fs.writeFileSync(path.join(stateDir(), 'conv-1.json'), JSON.stringify(original));
+  const { bodies, fetchImpl } = errorRecorder();
+
+  await runCheckpoint(INPUT, deps({ fetchImpl, computeDelta: () => null }), { emitTimeline: true });
+
+  assert.deepEqual(stateOf('conv-1'), { ...original, turnEndsSeen: 1 });
+  assert.deepEqual(bodies.map((b) => b.error), ['user_aborted']);
+});
+
+test('audit mode buffers only the turn errors the live hooks have not already sent', async (t) => {
+  const home = tmpHome(t);
+  writeTrackingState({ trackingMode: TrackingMode.LIVE, email: 'me@example.com' });
+  fs.mkdirSync(stateDir(), { recursive: true });
+  const live = { cursor: 3, sentSessionName: null, anchor: null, account: accountKey('me@example.com'), turnEndsSeen: 1 };
+  fs.writeFileSync(path.join(stateDir(), 'conv-1.json'), JSON.stringify(live));
+  writeTranscript(home, [
+    { status: 'error', error: 'User aborted request' },
+    { status: 'error', error: USAGE_LIMIT },
+  ]);
   let posted = 0;
+
   const res = await runCheckpoint(
-    { session_id: 'conv-1', cwd: '/repo' },
-    deps({
-      computeDelta: () => delta({ rateLimitEvents: [{ text: 'limit hit', occurredAt: '2026-07-31T10:00:00.000Z' }] }),
-      fetchImpl: async () => { posted += 1; return { status: 200, json: async () => ({}) }; },
-    }),
+    INPUT,
+    deps({ computeDelta: () => delta(), fetchImpl: async () => { posted += 1; return { status: 200 }; } }),
     audit(),
   );
 
-  assert.equal(posted, 0, 'no network call may happen for a buffered error');
-  assert.equal(res.sessionErrors.length, 1);
-  assert.equal(res.sessionErrors[0].error, 'rate_limit');
-  assert.equal(res.sessionErrors[0].sessionId, 'conv-1');
+  assert.equal(posted, 0, 'the backfill posts its follow-ups itself, and only for accepted sessions');
+  assert.deepEqual(res.sessionErrors, [{
+    sessionId: 'conv-1',
+    error: 'rate_limit',
+    errorDetails: USAGE_LIMIT,
+    lastAssistantMessage: null,
+    occurredAt: new Date(TRANSCRIPT_AT).toISOString(),
+  }]);
+  assert.deepEqual(stateOf('conv-1'), live, 'the live state is read, never written');
+});
+
+test('audit mode ignores a live anchor stamped by another account', async (t) => {
+  const home = tmpHome(t);
+  writeTrackingState({ trackingMode: TrackingMode.LIVE, email: 'me@example.com' });
+  fs.mkdirSync(stateDir(), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(), 'conv-1.json'), JSON.stringify({
+    cursor: 3, sentSessionName: null, anchor: null, account: accountKey('someone-else@example.com'), turnEndsSeen: 2,
+  }));
+  writeTranscript(home, [
+    { status: 'error', error: 'User aborted request' },
+    { status: 'error', error: USAGE_LIMIT },
+  ]);
+
+  const res = await runCheckpoint(INPUT, deps({ computeDelta: () => delta() }), audit());
+
+  assert.deepEqual(res.sessionErrors.map((e) => e.error), ['user_aborted', 'rate_limit']);
 });
 
 // A backfill candidate either was never tracked here or was tracked under a DIFFERENT account:

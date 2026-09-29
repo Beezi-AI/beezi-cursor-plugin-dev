@@ -70,6 +70,15 @@ test('the stop hook records the turn boundary in the sidecar', (t) => {
   assert.equal(typeof lines[0].ts, 'number');
 });
 
+test('the stop hook records how the turn ended on its boundary line', (t) => {
+  const home = tmpHome(t);
+  runHook(SCRIPTS.stop, { conversation_id: 'conv-outcome', cwd: home, status: 'aborted', loop_count: 2 }, home);
+  const lines = readLines('conv-outcome');
+  assert.deepEqual(lines.map((l) => l.ev), ['stop']);
+  assert.equal(lines[0].status, 'aborted');
+  assert.equal(lines[0].loop_count, 2);
+});
+
 test('the sessionEnd hook records the closing boundary in the sidecar', (t) => {
   const home = tmpHome(t);
   runHook(SCRIPTS.sessionEnd, { conversation_id: 'conv-end', cwd: home }, home);

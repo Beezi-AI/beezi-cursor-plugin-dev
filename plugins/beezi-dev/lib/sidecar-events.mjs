@@ -147,6 +147,21 @@ const MCP_EXECUTION_EVENT = 'beforeMCPExecution';
 const SUBAGENT_START_EVENT = 'subagentStart';
 const SUBAGENT_STOP_EVENT = 'subagentStop';
 
+// The failure hook, named: its payload is the one place a tool line must say `failed`, and the
+// name is the only signal that survives Cursor renaming the failure fields again.
+const TOOL_FAILURE_EVENT = 'postToolUseFailure';
+
+// Whether a tool payload describes a call that failed. The documented `postToolUseFailure` fields
+// first (`error_message`, `failure_type`), then the host's own event name, then the three spellings
+// this read before any payload had been captured — kept so an older build's lines mean what they did.
+// `!= null` rather than truthiness: an empty `error_message` is still a failure report.
+function isFailedToolPayload(payload) {
+  return payload.error_message != null || payload.errorMessage != null
+    || payload.failure_type != null || payload.failureType != null
+    || pickString(payload, HOOK_EVENT_FIELDS) === TOOL_FAILURE_EVENT
+    || payload.status === 'error' || payload.error != null || payload.success === false;
+}
+
 const SUBAGENT_ID_FIELDS = ['subagent_id', 'subagentId'];
 const SUBAGENT_TYPE_FIELDS = ['subagent_type', 'subagentType'];
 const SUBAGENT_TASK_FIELDS = ['task'];
@@ -548,11 +563,11 @@ export function eventsFromHookPayload(payload, options = {}) {
       bytes: byteLengthOf(output),
       ms: nonNegativeInt(ms),
       ...(toolId === null ? {} : { eid: toolId }),
-      // Only stamped when the payload says so, so `postToolUseFailure` is distinguishable from a
-      // successful call without inventing a second event kind.
-      ...(payload.status === 'error' || payload.error != null || payload.success === false
-        ? { failed: true }
-        : {}),
+      // Stamped only when the payload describes a failure, so `postToolUseFailure` is distinguishable
+      // from a successful call without inventing a second event kind — and stamped for EVERY failure,
+      // interrupted and noisy ones included: which failures deserve a report is the error path's
+      // question (lib/session-error-cursor.mjs), not the sidecar's.
+      ...(isFailedToolPayload(payload) ? { failed: true } : {}),
     });
   }
 

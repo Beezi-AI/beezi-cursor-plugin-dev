@@ -1,0 +1,18 @@
+{
+  "session_id": "conv-fail",
+  "conversation_id": "conv-fail",
+  "generation_id": "gen-documented-1",
+  "hook_event_name": "postToolUseFailure",
+  "cursor_version": "3.14.0",
+  "workspace_roots": ["/c:/Users/dev/project"],
+  "user_email": "user@example.com",
+  "transcript_path": "C:/Users/dev/.cursor/projects/c-Users-dev-project/agent-transcripts/conv-fail/conv-fail.jsonl",
+  "cwd": "C:/Users/dev/project",
+  "tool_name": "Shell",
+  "tool_input": { "command": "npm test" },
+  "tool_use_id": "toolu_documented_1",
+  "error_message": "Command failed with exit code 1",
+  "failure_type": "error",
+  "duration": 4210,
+  "is_interrupt": false
+}

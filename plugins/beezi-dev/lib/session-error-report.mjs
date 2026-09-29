@@ -6,14 +6,16 @@ import { resolveFetch } from './fetch-compat.mjs';
 // The two free-text fields on this payload, with the length the server accepts for each.
 //
 // The scrub lives HERE, at the transport, and not at each call site. There are two call sites and
-// they carry text from completely different places — scripts/stop-failure.mjs sends a failed tool's
-// own output, lib/checkpoint.mjs sends the assistant text of a rate-limit event — and a rule that
-// has to be remembered at every new call site is a rule that gets forgotten at the third one. This
-// function is the last thing that touches the payload before it becomes a request body, so putting
-// it here means a caller cannot ship free text past it by accident. `redactDetail` is idempotent
-// (see lib/redact.mjs), so a caller that scrubs its own text first — stop-failure does, because it
-// needs the redact-before-truncate order for a 2000-character slice — costs a second pass over at
-// most a few kilobytes and changes nothing.
+// they carry text from completely different places — scripts/stop-failure.mjs sends a failed tool
+// call's own message (or, absent one, its raw output), lib/checkpoint.mjs sends a turn error read
+// from Cursor's own agent transcript (lib/transcript-turns-cursor.mjs) — and a rule that has to be
+// remembered at every new call site is a rule that gets forgotten at the third one. This function is
+// the last thing that touches the payload before it becomes a request body, so putting it here means
+// a caller cannot ship free text past it by accident. `redactDetail` is idempotent (see
+// lib/redact.mjs), so a caller that scrubs its own text first — both do, via the classifiers in
+// lib/session-error-cursor.mjs, which need the redact-before-truncate order for their own
+// 1000-character cap (`ERROR_DETAILS_CAP`) — costs a second pass over at most a few kilobytes and
+// changes nothing.
 //
 // The caps are the server's, not ours: `SessionErrorRequestDto` declares 1000 and 4000, and Nest's
 // ValidationPipe rejects the WHOLE request with a 400 when either is exceeded. Nothing on this path

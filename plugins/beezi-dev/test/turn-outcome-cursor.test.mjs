@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeTurnOutcome, TURN_STATUS } from '../lib/turn-outcome-cursor.mjs';
+import { normalizeTurnOutcome, stopEventFrom, TURN_STATUS } from '../lib/turn-outcome-cursor.mjs';
 
 // DATA-08: the `stop` payload says how the turn ended and how many loops it took, and the bare stop
 // marker threw both away.
@@ -84,4 +84,16 @@ test('nothing but the two allowlisted fields ever comes out', () => {
 test('normalizing the same stop twice gives the same answer — a duplicate stop is idempotent', () => {
   const payload = { status: 'completed', loop_count: 4 };
   assert.deepEqual(normalizeTurnOutcome(payload), normalizeTurnOutcome({ ...payload }));
+});
+
+test('the stop line carries the outcome, and is bare when the payload has none', () => {
+  // Only the two outcome fields: the payload's token counts and user_email stay where they are.
+  assert.deepEqual(
+    stopEventFrom({ status: 'error', loop_count: 3, input_tokens: 10, user_email: 'a@b.c' }),
+    { ev: 'stop', status: 'error', loop_count: 3 },
+  );
+  assert.deepEqual(stopEventFrom({ status: 'completed' }), { ev: 'stop', status: 'completed' });
+  assert.deepEqual(stopEventFrom({ status: 'weird' }), { ev: 'stop', status: 'unknown' });
+  assert.deepEqual(stopEventFrom({ session_id: 'c' }), { ev: 'stop' });
+  assert.deepEqual(stopEventFrom(null), { ev: 'stop' });
 });

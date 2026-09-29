@@ -35,9 +35,10 @@ runHook({
     import('../lib/sidecar.mjs'),
     import('../lib/checkpoint.mjs'),
     import('../lib/stop-account-change.mjs'),
+    import('../lib/turn-outcome-cursor.mjs'),
   ]),
   handle: async (mods, ctx) => {
-    const [events, sidecar, engine, account] = mods;
+    const [events, sidecar, engine, account, outcome] = mods;
 
     // The turn's generation, with the model and the token counts Cursor puts on this payload and on
     // no other event this plugin registers. Without it a turn that ran no tools — a plain question,
@@ -62,7 +63,11 @@ runHook({
     //     window and bill the user's think-time gap as that segment's duration;
     //   - `runCheckpoint` may reject, be budget-truncated or be killed at the host's hook deadline,
     //     and a boundary written after it would then be lost for good.
-    sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd({ ev: 'stop' }, ctx.cwd));
+    //
+    // With the turn's outcome on it — `status` narrowed to an allowlist and `loop_count` when the
+    // payload has one (lib/turn-outcome-cursor.mjs). Import-free, so it adds nothing to the graph a
+    // broken module could take down.
+    sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd(outcome.stopEventFrom(ctx.payload), ctx.cwd));
 
     // Cursor subscription change detection (plan §4 Phase C). Reads Cursor's own account tuple out
     // of state.vscdb, compares it against billing.json's anchor and, when something moved,

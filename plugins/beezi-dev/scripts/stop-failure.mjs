@@ -34,7 +34,7 @@ enterProjectDir();
 runHook({
   name: 'stop-failure',
   stdin,
-  // The transport, the credential store and the redactor all arrive here rather than at the top of
+  // The transport, the credential store and the classifier all arrive here rather than at the top of
   // the file: a payload we cannot attribute should cost one short-lived process, not a module graph
   // — and any of these can throw while being evaluated, which used to exit the hook non-zero.
   load: () => Promise.all([
@@ -43,10 +43,10 @@ runHook({
     import('../lib/tracking.mjs'),
     import('../lib/token.mjs'),
     import('../lib/session-error-report.mjs'),
-    import('../lib/redact.mjs'),
+    import('../lib/session-error-cursor.mjs'),
   ]),
   handle: (mods, ctx) => {
-    const [events, sidecar, tracking, tokens, transport, redact] = mods;
+    const [events, sidecar, tracking, tokens, transport, classifier] = mods;
     for (const event of events.eventsFromHookPayload(ctx.payload)) {
       sidecar.appendEvent(ctx.input.session_id, sidecar.withCwd(event, ctx.cwd));
     }
@@ -65,42 +65,31 @@ runHook({
     // install until its first whoami.
     if (!tracking.isLiveTrackingAllowed()) return null;
 
-    // The output of a command that JUST FAILED — which is exactly where credentials surface. The
-    // `curl` that 401'd is echoed with its `-H "Authorization: Bearer …"` intact; a `git push` that
-    // was refused quotes the remote URL with the token still in its userinfo; a driver that could not
-    // connect prints the DSN it parsed; a shell that could not find a binary dumps the environment.
-    // This used to be `detail.slice(0, 2000)` and went to the API verbatim.
+    // WHICH FAILURES DESERVE A REPORT, AND WHAT EACH IS CALLED — lib/session-error-cursor.mjs, which
+    // also owns the precedence. An interrupted call and an ordinary file/search error answer null:
+    // the sidecar line above already recorded them, and a report nobody would act on is not worth a
+    // keychain read, so this is asked BEFORE the credential is touched.
     //
-    // `redactDetail` is that slice with the scrubbing in front of it, and the order matters:
-    // truncating first can cut a credential away from the anchor that identifies it — a `Bearer`
-    // separated from its token, a key name separated from its `=` — and leave the surviving half in
-    // the report with nothing left to match it. See lib/redact.mjs, and test/redact.test.mjs for the
-    // negative table that keeps this off ordinary diagnostics.
-    //
-    // First field actually present wins, and `null`/`undefined` is the only thing that counts as
-    // absent: an empty-string `error` is a real (if unhelpful) report and must not fall through to
-    // `tool_output`.
-    const payload = ctx.payload;
-    const detail =
-      payload == null ? null
-        : payload.error != null ? payload.error
-          : payload.tool_output != null ? payload.tool_output
-            : payload.output != null ? payload.output
-              : null;
+    // The scrub moved with the text. A failed command's message is exactly where credentials surface
+    // — the `curl` that 401'd echoed with its `-H "Authorization: Bearer …"`, a refused `git push`
+    // quoting its remote with the token in the userinfo — and the classifier redacts it before it cuts
+    // it, for the reason lib/redact.mjs gives. The transport scrubs again; that pass is idempotent.
+    // `tool_input` is never read by either.
+    const report = classifier.classifyToolFailure(ctx.payload);
+    if (report === null) return null;
 
     // WHEN IT HAPPENED, captured now rather than at send time. The queue, a slow credential store
     // and a retried POST all sit between this moment and the request, and a timestamp taken at the
-    // transport would quietly describe the delivery instead of the failure. `ctx.occurredAt` prefers
-    // a validated instant from the normalized host payload and falls back to this run's clock — see
-    // hookOccurredAt in lib/hook-runner.mjs, and the handoff for the normalization field it wants.
+    // transport would quietly describe the delivery instead of the failure. See hookOccurredAt in
+    // lib/hook-runner.mjs.
     const occurredAt = ctx.occurredAt;
     return tokens.getAccessToken().then((token) =>
       token
         ? transport.postSessionError(
             {
               sessionId: ctx.input.session_id,
-              error: 'tool_failure',
-              errorDetails: redact.redactDetail(detail),
+              error: report.error,
+              errorDetails: report.errorDetails,
               lastAssistantMessage: null,
               occurredAt,
             },

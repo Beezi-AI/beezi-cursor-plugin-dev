@@ -50,3 +50,23 @@ export function normalizeTurnOutcome(stopPayload) {
     ...(loopCount === null ? {} : { loopCount }),
   };
 }
+
+// The sidecar `stop` line for one turn-end payload: the boundary marker, plus how the turn ended when
+// the host said. Written by scripts/stop.mjs, and the reason this module exists — the bare marker
+// used to throw both fields away.
+//
+// `loop_count` in snake_case, like the `subagent_stop` line's: the sidecar keeps the host's spelling.
+// Both hook registries build this from the same payload, so their two copies stay byte-identical and
+// dedupeEvents (lib/delta-cursor.mjs) still collapses them to one.
+//
+// LOCAL ONLY, and NOT an error source. No reader sends these fields, and turn errors are reported
+// from the transcript's `turn_ended` line (lib/transcript-turns-cursor.mjs) alone: a second path to
+// the same fact is how one abort becomes two rows.
+export function stopEventFrom(stopPayload) {
+  const line = { ev: 'stop' };
+  const outcome = normalizeTurnOutcome(stopPayload);
+  if (outcome === null) return line;
+  line.status = outcome.status;
+  if (outcome.loopCount !== undefined) line.loop_count = outcome.loopCount;
+  return line;
+}
